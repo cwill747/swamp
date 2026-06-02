@@ -195,6 +195,10 @@ fn write_multi_tab_layout(
     cfg: &ConfigPaths,
     git_dir: &Path,
 ) -> Result<PathBuf> {
+    let swamp_bin = std::env::current_exe()
+        .context("resolve current executable")?
+        .display()
+        .to_string();
     let tmp = std::env::temp_dir().join(format!("swamp-layout-{}.kdl", std::process::id()));
     let mut s = String::new();
     s.push_str("layout {\n");
@@ -210,7 +214,7 @@ fn write_multi_tab_layout(
             "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
             session_cwd(worktrees, git_dir),
         ));
-        push_dashboard_panes(&mut s, cfg);
+        push_dashboard_panes(&mut s, cfg, &swamp_bin);
         s.push_str("  }\n");
     }
 
@@ -222,7 +226,7 @@ fn write_multi_tab_layout(
             focus,
             wt.path.display()
         ));
-        push_worktree_panes(&mut s, cfg);
+        push_worktree_panes(&mut s, cfg, &swamp_bin);
         s.push_str("  }\n");
     }
     s.push_str("}\n");
@@ -325,49 +329,48 @@ mod tests {
             !content.contains("cwd=\"/repo/talks\""),
             "dashboard tab must NOT use bare container as cwd; got:\n{content}"
         );
-        // No references to old hardcoded config paths.
+        // Dashboard tab should have the four swamp TUI view panes.
+        for view_name in &["worktrees", "ai-status", "resources", "pr-status"] {
+            assert!(
+                content.contains(&format!("\"--view\" \"{}\"", view_name)),
+                "dashboard tab should have --view {view_name} pane; got:\n{content}"
+            );
+        }
+        // The layout should use the current binary, not a bare "swamp" command.
         assert!(
-            !content.contains("starship-compact.toml"),
-            "layout must not reference starship-compact.toml; got:\n{content}"
-        );
-        assert!(
-            !content.contains(".config/lazygit/swamp.yml"),
-            "layout must not reference ~/.config/lazygit/swamp.yml; got:\n{content}"
-        );
-        // Swamp-managed paths must appear.
-        assert!(
-            content.contains("/tmp/swamp/starship.toml"),
-            "layout should use swamp-managed starship path; got:\n{content}"
-        );
-        assert!(
-            content.contains("/tmp/swamp/lazygit.yml"),
-            "layout should use swamp-managed lazygit path; got:\n{content}"
+            !content.contains("command=\"swamp\""),
+            "layout should use resolved binary path, not bare 'swamp'; got:\n{content}"
         );
     }
 }
 
-fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths) {
-    let lazygit_cfg = cfg.lazygit.display();
+fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="35%" {{
-        pane command="fish" size="65%" {{
-          args "-C" "set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit"
-          name "lazygit"
+      pane split_direction="horizontal" size="50%" {{
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "worktrees"
+          name "worktrees"
         }}
-        pane command="swamp" size="35%" {{
-          args "tui"
-          name "swamp"
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "resources"
+          name "resources"
         }}
       }}
-      pane command="fish" size="65%" {{
-        args "-C" "exec fish"
-        name "shell"
+      pane split_direction="horizontal" size="50%" {{
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "ai-status"
+          name "ai-status"
+        }}
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "pr-status"
+          name "pr-status"
+        }}
       }}
     }}
 "#));
 }
 
-fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths) {
+fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
     let lazygit_cfg = cfg.lazygit.display();
     let starship_cfg = cfg.starship.display();
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
@@ -376,7 +379,7 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths) {
           args "-C" "set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit"
           name "lazygit"
         }}
-        pane command="swamp" size="35%" {{
+        pane command="{swamp_bin}" size="35%" {{
           args "tui"
           name "swamp"
         }}
