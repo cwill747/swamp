@@ -13,6 +13,7 @@ pub enum ClientMsg {
     Subscribe,
     Hook { worktree: String, status: String },
     GetVersion,
+    Refresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub enum ServerMsg {
     Ok,
     Err { message: String },
     Version { version: String },
+    RefreshDone { worktree_names: Vec<String> },
 }
 
 pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
@@ -46,6 +48,12 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     }
                     ClientMsg::GetVersion => {
                         write_msg(&mut stream, &ServerMsg::Version { version: env!("CARGO_PKG_VERSION").to_string() }).await?;
+                    }
+                    ClientMsg::Refresh => {
+                        daemon.fetch_and_refresh().await;
+                        let snap = daemon.state.read().await.snapshot();
+                        let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
+                        write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
                     }
                 }
             }
@@ -145,6 +153,7 @@ mod tests {
                 status: "working".into(),
             },
             ClientMsg::GetVersion,
+            ClientMsg::Refresh,
         ];
         for msg in &msgs {
             let json = serde_json::to_vec(msg).unwrap();

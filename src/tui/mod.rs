@@ -4,6 +4,7 @@ mod view;
 
 use crate::cli::TuiView;
 use crate::daemon::socket::{read_server_msg, write_client_msg, ClientMsg, ServerMsg};
+use crate::kill;
 use crate::daemon::state::Snapshot;
 use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
@@ -80,6 +81,7 @@ enum AppEvent {
     Snapshot(Snapshot),
     Input(Event),
     Tick,
+    RefreshDone(Vec<String>),
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -153,6 +155,18 @@ async fn event_loop<B: ratatui::backend::Backend>(
             AppEvent::Tick => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
+            AppEvent::RefreshDone(wt_names) => {
+                if let Ok(tabs) = zellij::list_tab_names() {
+                    for tab in &tabs {
+                        if tab == "dashboard" {
+                            continue;
+                        }
+                        if !wt_names.iter().any(|n| n == tab) {
+                            let _ = zellij::close_tab_by_name(tab);
+                        }
+                    }
+                }
+            }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
                     continue;
@@ -181,12 +195,38 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             let _ = zellij::go_to_tab_name(&row.name);
                         }
                     }
+                    KeyCode::Char('r') => {
+                        let tx = tx.clone();
+                        let common = common.to_path_buf();
+                        tokio::spawn(async move {
+                            if let Err(e) = send_refresh(&common, tx).await {
+                                tracing::warn!("refresh: {e:?}");
+                            }
+                        });
+                    }
+                    KeyCode::Char('K') => {
+                        return kill::run(Some(
+                            common.parent().unwrap_or(common).to_path_buf(),
+                        ));
+                    }
                     _ => {}
                 }
             }
             AppEvent::Input(_) => {}
         }
         terminal.draw(|f| view::render(f, &app))?;
+    }
+    Ok(())
+}
+
+async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Result<()> {
+    let sock = daemon::socket_path(common);
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(&mut stream, &ClientMsg::Refresh).await?;
+    if let Some(msg) = read_server_msg(&mut stream).await? {
+        if let ServerMsg::RefreshDone { worktree_names } = msg {
+            let _ = tx.send(AppEvent::RefreshDone(worktree_names)).await;
+        }
     }
     Ok(())
 }

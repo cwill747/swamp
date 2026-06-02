@@ -68,7 +68,7 @@ fn render_all(f: &mut Frame, app: &AppState) {
 
     // Footer.
     let footer = Line::from(vec![Span::styled(
-        "j/k move · enter jump · q quit",
+        "j/k move · enter jump · r refresh · K kill · q quit",
         Theme::muted(),
     )]);
     f.render_widget(Paragraph::new(footer), outer[2]);

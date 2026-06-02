@@ -164,6 +164,26 @@ impl Daemon {
         Ok(())
     }
 
+    pub async fn fetch_and_refresh(&self) {
+        let result = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.common_dir)
+            .args(["fetch", "--all", "--prune"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        match result {
+            Ok(s) if s.success() => {
+                if let Err(e) = self.refresh_all().await {
+                    tracing::warn!("post-fetch refresh: {e:?}");
+                }
+            }
+            Ok(s) => tracing::warn!("git fetch exited {s}"),
+            Err(e) => tracing::warn!("git fetch failed: {e}"),
+        }
+    }
+
     pub async fn apply_hook(&self, wt_name: &str, status: &str) -> Result<()> {
         let mut s = self.state.write().await;
         s.apply_hook(wt_name, status)?;

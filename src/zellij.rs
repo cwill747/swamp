@@ -40,6 +40,22 @@ pub fn go_to_tab_name(name: &str) -> Result<()> {
     action(&["go-to-tab-name", name])
 }
 
+pub fn close_tab_by_name(name: &str) -> Result<()> {
+    go_to_tab_name(name)?;
+    action(&["close-tab"])
+}
+
+pub fn list_tab_names() -> Result<Vec<String>> {
+    let out = Command::new("zellij")
+        .args(["action", "query-tab-names"])
+        .output()
+        .context("zellij action query-tab-names")?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect())
+}
+
 /// Launch a brand-new zellij session attached to `layout`, with `cwd` and `session`.
 pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str) -> Result<()> {
     let layout = layout.to_string_lossy();
