@@ -380,7 +380,7 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
           name "lazygit"
         }}
         pane command="{swamp_bin}" size="35%" {{
-          args "tui"
+          args "tui" "--view" "worktrees"
           name "swamp"
         }}
       }}
