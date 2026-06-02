@@ -1,0 +1,11 @@
+# swamp default lazygit config
+gui:
+  theme:
+    activeBorderColor:
+      - cyan
+      - bold
+  showIcons: true
+  nerdFontsVersion: "3"
+git:
+  autoFetch: false
+  fetchAll: false

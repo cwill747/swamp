@@ -1,0 +1,25 @@
+# swamp default starship config — compact single-line prompt
+format = "$directory$git_branch$git_status$character"
+
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+repo_root_format = ""
+
+[git_branch]
+format = "[$branch]($style) "
+style = "bold cyan"
+
+[git_status]
+format = '([$all_status$ahead_behind]($style) )'
+style = "bold yellow"
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"
+
+[hostname]
+disabled = true
+
+[username]
+disabled = true

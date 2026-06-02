@@ -1,0 +1,27 @@
+mod cli;
+mod config;
+mod daemon;
+mod hook;
+mod kill;
+mod launch;
+mod tui;
+mod util;
+mod worktree;
+mod zellij;
+
+use anyhow::Result;
+use clap::Parser;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = cli::Cli::parse();
+
+    match args.command {
+        None => launch::run(None),
+        Some(cli::Cmd::Launch { dir }) => launch::run(dir),
+        Some(cli::Cmd::Serve { dir, foreground }) => daemon::serve(dir, foreground).await,
+        Some(cli::Cmd::Tui { dir }) => tui::run(dir).await,
+        Some(cli::Cmd::Hook { status, dir }) => hook::run(status, dir).await,
+        Some(cli::Cmd::Kill { dir }) => kill::run(dir),
+    }
+}

@@ -1,0 +1,208 @@
+use crate::util::now_unix;
+use crate::worktree::{self, GitInfo, Worktree};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentStatus {
+    Working,
+    Waiting,
+    Idle,
+}
+
+impl Default for AgentStatus {
+    fn default() -> Self {
+        AgentStatus::Idle
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub status: AgentStatus,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRow {
+    pub name: String,
+    pub path: PathBuf,
+    pub branch: String,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub staged: u32,
+    pub unstaged: u32,
+    pub untracked: u32,
+    pub conflict: bool,
+    pub rebase: bool,
+    pub agent: AgentStatus,
+    pub agent_ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub rows: Vec<WorktreeRow>,
+}
+
+pub struct DaemonState {
+    pub rows: HashMap<String, WorktreeRow>,
+    pub agents: HashMap<String, AgentRecord>,
+}
+
+impl DaemonState {
+    pub async fn load(_common_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+        })
+    }
+
+    pub async fn persist(&self, common_dir: &Path) -> Result<()> {
+        let path = common_dir.join(".swamp-status.json");
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&self.agents)?;
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(())
+    }
+
+    pub fn refresh_git(&mut self, common_dir: &Path) -> Result<()> {
+        let wts = worktree::list_worktrees(common_dir)?;
+        let mut new_rows = HashMap::new();
+        for wt in wts {
+            let info = worktree::git_info(&wt.path).unwrap_or_default();
+            let agent = self.agents.get(&wt.name()).cloned().unwrap_or_default();
+            new_rows.insert(wt.name(), build_row(&wt, &info, &agent));
+        }
+        self.rows = new_rows;
+        Ok(())
+    }
+
+    pub fn apply_hook(&mut self, wt_name: &str, status: &str) -> Result<()> {
+        let agent_status = match status.to_lowercase().as_str() {
+            "working" => AgentStatus::Working,
+            "waiting" => AgentStatus::Waiting,
+            "idle" | "done" | "stop" => AgentStatus::Idle,
+            other => anyhow::bail!("unknown status: {}", other),
+        };
+        let rec = AgentRecord {
+            status: agent_status,
+            ts: now_unix(),
+        };
+        self.agents.insert(wt_name.to_string(), rec.clone());
+        if let Some(row) = self.rows.get_mut(wt_name) {
+            row.agent = rec.status;
+            row.agent_ts = rec.ts;
+        }
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let mut rows: Vec<WorktreeRow> = self.rows.values().cloned().collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Snapshot { rows }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_row(name: &str) -> WorktreeRow {
+        WorktreeRow {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/repo/{}", name)),
+            branch: name.to_string(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            conflict: false,
+            rebase: false,
+            agent: AgentStatus::Idle,
+            agent_ts: 0,
+        }
+    }
+
+    /// `snapshot()` must return rows sorted by name regardless of insertion
+    /// order (HashMap iteration order is non-deterministic).
+    #[test]
+    fn snapshot_rows_sorted_by_name() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+        };
+        state.rows.insert("zebra".into(), make_row("zebra"));
+        state.rows.insert("alpha".into(), make_row("alpha"));
+        state.rows.insert("main".into(), make_row("main"));
+        state.rows.insert("beta".into(), make_row("beta"));
+
+        let snap = state.snapshot();
+        let names: Vec<&str> = snap.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "main", "zebra"]);
+    }
+
+    /// `apply_hook` must update an existing row's agent status in-place so the
+    /// next snapshot reflects it — the row must not disappear from the snapshot.
+    #[test]
+    fn apply_hook_updates_existing_row() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+        };
+        state.rows.insert("main".into(), make_row("main"));
+
+        state.apply_hook("main", "working").unwrap();
+        let snap = state.snapshot();
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].agent, AgentStatus::Working);
+    }
+
+    /// `apply_hook` with an unknown worktree name must still succeed (the agent
+    /// record is stored) but the snapshot rows must remain unchanged.
+    #[test]
+    fn apply_hook_unknown_worktree_is_ignored_in_rows() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+        };
+        state.rows.insert("main".into(), make_row("main"));
+
+        // "ghost" does not exist in rows; apply_hook must not crash.
+        state.apply_hook("ghost", "working").unwrap();
+        let snap = state.snapshot();
+        // "main" row is untouched; no new row for "ghost".
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].name, "main");
+        assert_eq!(snap.rows[0].agent, AgentStatus::Idle);
+    }
+}
+
+fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
+    let branch = if info.branch.is_empty() || info.branch == "(detached)" {
+        wt.branch.clone()
+    } else {
+        info.branch.clone()
+    };
+    WorktreeRow {
+        name: wt.name(),
+        path: wt.path.clone(),
+        branch,
+        upstream: info.upstream.clone(),
+        ahead: info.ahead,
+        behind: info.behind,
+        staged: info.staged,
+        unstaged: info.unstaged,
+        untracked: info.untracked,
+        conflict: info.conflict,
+        rebase: info.rebase,
+        agent: agent.status,
+        agent_ts: agent.ts,
+    }
+}
