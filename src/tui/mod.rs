@@ -27,6 +27,7 @@ pub struct AppState {
     pub repo_name: String,
     pub view: TuiView,
     pub refreshing: bool,
+    pub pending_delete: Option<String>,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -142,6 +143,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         repo_name,
         view,
         refreshing: false,
+        pending_delete: None,
     };
 
     terminal.draw(|f| view::render(f, &app))?;
@@ -152,6 +154,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 app.snapshot = s;
                 if app.selected >= app.snapshot.rows.len() {
                     app.selected = app.snapshot.rows.len().saturating_sub(1);
+                }
+                if let Some(ref name) = app.pending_delete {
+                    if !app.snapshot.rows.iter().any(|r| &r.name == name) {
+                        let _ = zellij::close_tab_by_name(name);
+                        app.pending_delete = None;
+                    }
                 }
             }
             AppEvent::Tick => {
@@ -196,6 +204,17 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Enter => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
                             let _ = zellij::go_to_tab_name(&row.name);
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(row) = app.snapshot.rows.get(app.selected) {
+                            let name = row.name.clone();
+                            app.pending_delete = Some(name.clone());
+                            let _ = zellij::run_floating(
+                                "git",
+                                &["wt", "remove", &name],
+                                "60%", "40%",
+                            );
                         }
                     }
                     KeyCode::Char('r') if !app.refreshing => {

@@ -14,11 +14,26 @@ use std::time::{Duration, SystemTime};
 pub fn render(f: &mut Frame, app: &AppState) {
     match app.view {
         TuiView::All => render_all(f, app),
-        TuiView::Worktrees => render_worktree_table(f, app, f.area()),
-        TuiView::AiStatus => render_ai_status(f, app, f.area()),
-        TuiView::Resources => render_resources(f, f.area()),
-        TuiView::PrStatus => render_pr_status(f, f.area()),
+        _ => render_single_panel(f, app),
     }
+}
+
+fn render_single_panel(f: &mut Frame, app: &AppState) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    match app.view {
+        TuiView::Worktrees => render_worktree_table(f, app, chunks[0]),
+        TuiView::AiStatus => render_ai_status(f, app, chunks[0]),
+        TuiView::Resources => render_resources(f, chunks[0]),
+        TuiView::PrStatus => render_pr_status(f, chunks[0]),
+        TuiView::All => unreachable!(),
+    }
+
+    render_footer(f, app, chunks[1]);
 }
 
 fn render_all(f: &mut Frame, app: &AppState) {
@@ -66,20 +81,23 @@ fn render_all(f: &mut Frame, app: &AppState) {
     render_ai_status(f, app, right[0]);
     render_pr_status(f, right[1]);
 
-    // Footer.
-    let mut footer_spans = Vec::new();
+    render_footer(f, app, outer[2]);
+}
+
+fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let mut spans = Vec::new();
     if app.refreshing {
         let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];
-        footer_spans.push(Span::styled(
+        spans.push(Span::styled(
             format!("{frame} Refreshing… "),
             Style::default().fg(Theme::WORKING),
         ));
     }
-    footer_spans.push(Span::styled(
-        "j/k move · enter jump · r refresh · K kill · q quit",
+    spans.push(Span::styled(
+        "j/k move · enter jump · d delete · r refresh · K kill · q quit",
         Theme::muted(),
     ));
-    f.render_widget(Paragraph::new(Line::from(footer_spans)), outer[2]);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
@@ -104,20 +122,12 @@ fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::R
             Constraint::Length(5),  // age
         ],
     )
-    .block({
-        let mut title_spans = vec![Span::styled(" Worktrees ", Theme::accent_bold())];
-        if app.refreshing {
-            let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];
-            title_spans.push(Span::styled(
-                format!("{frame} Refreshing… "),
-                Style::default().fg(Theme::WORKING),
-            ));
-        }
+    .block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Theme::MUTED))
-            .title(Line::from(title_spans))
-    })
+            .title(Span::styled(" Worktrees ", Theme::accent_bold())),
+    )
     .column_spacing(1);
 
     f.render_widget(table, area);

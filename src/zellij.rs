@@ -40,6 +40,16 @@ pub fn go_to_tab_name(name: &str) -> Result<()> {
     action(&["go-to-tab-name", name])
 }
 
+pub fn run_floating(cmd: &str, args: &[&str], width: &str, height: &str) -> Result<()> {
+    let mut full = vec![
+        "action", "new-pane", "--floating", "--close-on-exit",
+        "--width", width, "--height", height,
+        "--", cmd,
+    ];
+    full.extend_from_slice(args);
+    zellij(&full)
+}
+
 pub fn close_tab_by_name(name: &str) -> Result<()> {
     go_to_tab_name(name)?;
     action(&["close-tab"])
