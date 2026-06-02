@@ -26,6 +26,7 @@ pub struct AppState {
     pub spinner_frame: usize,
     pub repo_name: String,
     pub view: TuiView,
+    pub refreshing: bool,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -140,6 +141,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         spinner_frame: 0,
         repo_name,
         view,
+        refreshing: false,
     };
 
     terminal.draw(|f| view::render(f, &app))?;
@@ -156,6 +158,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             AppEvent::RefreshDone(wt_names) => {
+                app.refreshing = false;
                 if let Ok(tabs) = zellij::list_tab_names() {
                     for tab in &tabs {
                         if tab == "dashboard" {
@@ -195,7 +198,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             let _ = zellij::go_to_tab_name(&row.name);
                         }
                     }
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r') if !app.refreshing => {
+                        app.refreshing = true;
                         let tx = tx.clone();
                         let common = common.to_path_buf();
                         tokio::spawn(async move {
