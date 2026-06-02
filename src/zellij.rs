@@ -6,10 +6,6 @@ pub fn in_zellij() -> bool {
     std::env::var("ZELLIJ").is_ok()
 }
 
-pub fn session_name() -> Option<String> {
-    std::env::var("ZELLIJ_SESSION_NAME").ok()
-}
-
 fn zellij(args: &[&str]) -> Result<()> {
     let status = Command::new("zellij")
         .args(args)

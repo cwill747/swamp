@@ -21,30 +21,21 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
 
     // Debounce: collect bursts, then refresh once.
     loop {
-        let mut got_event = false;
-        tokio::select! {
-            ev = rx.recv() => {
-                if ev.is_some() {
-                    got_event = true;
-                } else {
-                    return Ok(());
+        if rx.recv().await.is_none() {
+            return Ok(());
+        }
+        // Drain any further events within a short window.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                ev = rx.recv() => {
+                    if ev.is_none() { return Ok(()); }
                 }
             }
         }
-        if got_event {
-            // Drain any further events within a short window.
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    ev = rx.recv() => {
-                        if ev.is_none() { return Ok(()); }
-                    }
-                }
-            }
-            if let Err(e) = daemon.refresh_all().await {
-                tracing::warn!("watcher refresh: {e:?}");
-            }
+        if let Err(e) = daemon.refresh_all().await {
+            tracing::warn!("watcher refresh: {e:?}");
         }
     }
 }
