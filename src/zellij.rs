@@ -9,6 +9,8 @@ pub fn in_zellij() -> bool {
 fn zellij(args: &[&str]) -> Result<()> {
     let status = Command::new("zellij")
         .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .with_context(|| format!("spawn zellij {:?}", args))?;
     if !status.success() {
