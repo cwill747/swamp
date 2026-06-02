@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -6,6 +6,21 @@ use std::path::PathBuf;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum TuiView {
+    /// Show all panels (default for worktree tabs).
+    #[default]
+    All,
+    /// Worktree list only.
+    Worktrees,
+    /// AI / Claude agent status only.
+    AiStatus,
+    /// Resource usage only.
+    Resources,
+    /// PR & CI status only.
+    PrStatus,
 }
 
 #[derive(Subcommand)]
@@ -26,6 +41,9 @@ pub enum Cmd {
     Tui {
         /// Path inside the repo (default: cwd).
         dir: Option<PathBuf>,
+        /// Which panel to render (default: all).
+        #[arg(long, value_enum, default_value_t = TuiView::All)]
+        view: TuiView,
     },
 
     /// Record an agent status update (called from Claude Code hooks).

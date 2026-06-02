@@ -1,6 +1,7 @@
 use super::icons;
 use super::theme::Theme;
 use super::AppState;
+use crate::cli::TuiView;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
 use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -11,6 +12,16 @@ use ratatui::Frame;
 use std::time::{Duration, SystemTime};
 
 pub fn render(f: &mut Frame, app: &AppState) {
+    match app.view {
+        TuiView::All => render_all(f, app),
+        TuiView::Worktrees => render_worktree_table(f, app, f.area()),
+        TuiView::AiStatus => render_ai_status(f, app, f.area()),
+        TuiView::Resources => render_resources(f, f.area()),
+        TuiView::PrStatus => render_pr_status(f, f.area()),
+    }
+}
+
+fn render_all(f: &mut Frame, app: &AppState) {
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)

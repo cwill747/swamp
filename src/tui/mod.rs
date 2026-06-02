@@ -2,6 +2,7 @@ mod icons;
 mod theme;
 mod view;
 
+use crate::cli::TuiView;
 use crate::daemon::socket::{read_server_msg, write_client_msg, ClientMsg, ServerMsg};
 use crate::daemon::state::Snapshot;
 use crate::daemon::{self};
@@ -23,9 +24,10 @@ pub struct AppState {
     pub selected: usize,
     pub spinner_frame: usize,
     pub repo_name: String,
+    pub view: TuiView,
 }
 
-pub async fn run(dir: Option<PathBuf>) -> Result<()> {
+pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
     let start = resolve_git_dir(&dir.unwrap_or(std::env::current_dir()?));
     let common = git_common_dir(&start).context("not inside a git repo")?;
     let repo_name = common
@@ -43,7 +45,7 @@ pub async fn run(dir: Option<PathBuf>) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, &common, repo_name).await;
+    let res = event_loop(&mut terminal, &common, repo_name, view).await;
 
     disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -84,6 +86,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     common: &std::path::Path,
     repo_name: String,
+    view: TuiView,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
@@ -134,6 +137,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         selected: 0,
         spinner_frame: 0,
         repo_name,
+        view,
     };
 
     terminal.draw(|f| view::render(f, &app))?;

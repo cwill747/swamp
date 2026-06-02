@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         None => launch::run(None),
         Some(cli::Cmd::Launch { dir }) => launch::run(dir),
         Some(cli::Cmd::Serve { dir, foreground }) => daemon::serve(dir, foreground).await,
-        Some(cli::Cmd::Tui { dir }) => tui::run(dir).await,
+        Some(cli::Cmd::Tui { dir, view }) => tui::run(dir, view).await,
         Some(cli::Cmd::Hook { status, dir }) => hook::run(status, dir).await,
         Some(cli::Cmd::Kill { dir }) => kill::run(dir),
     }
