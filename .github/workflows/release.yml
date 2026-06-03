@@ -16,10 +16,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-linux
-          - os: ubuntu-24.04-arm
+            package: static
+          - os: ubuntu-latest
             target: aarch64-linux
+            package: static-aarch64-linux
           - os: macos-latest
             target: aarch64-darwin
+            package: static
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +37,7 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Build static binary
-        run: nix build --print-build-logs .#static
+        run: nix build --print-build-logs .#${{ matrix.package }}
 
       - name: Prepare artifact
         run: cp result/bin/swamp swamp-${{ matrix.target }}
