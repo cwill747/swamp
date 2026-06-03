@@ -13,14 +13,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 use std::time::{Duration, SystemTime};
 
-pub fn render(f: &mut Frame, app: &AppState) {
+pub fn render(f: &mut Frame, app: &mut AppState) {
     match app.view {
         TuiView::All => render_all(f, app),
         _ => render_single_panel(f, app),
     }
 }
 
-fn render_single_panel(f: &mut Frame, app: &AppState) {
+fn render_single_panel(f: &mut Frame, app: &mut AppState) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -38,7 +38,7 @@ fn render_single_panel(f: &mut Frame, app: &AppState) {
     render_footer(f, app, chunks[1]);
 }
 
-fn render_all(f: &mut Frame, app: &AppState) {
+fn render_all(f: &mut Frame, app: &mut AppState) {
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -289,7 +289,7 @@ fn render_ai_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     f.render_widget(table, area);
 }
 
-fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Rect) {
     let res = &app.resources;
     let title = Span::styled(
         " Resources ",
@@ -391,17 +391,27 @@ fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
         ]));
     }
 
+    let viewport_height = area.height.saturating_sub(2);
+    app.resource_viewport_height = viewport_height;
+    let max = max_resource_scroll(&app.resources, viewport_height);
+    app.resource_scroll = app.resource_scroll.min(max);
+
     f.render_widget(
         Paragraph::new(lines).block(block).scroll((app.resource_scroll, 0)),
         area,
     );
 }
 
-pub fn resource_line_count(res: &resources::Snapshot) -> u16 {
+pub fn resource_content_height(res: &resources::Snapshot) -> u16 {
     if res.session_pid.is_none() && res.procs.is_empty() {
         return 0;
     }
     (4 + res.procs.len()) as u16
+}
+
+pub fn max_resource_scroll(res: &resources::Snapshot, viewport_height: u16) -> u16 {
+    let content = resource_content_height(res);
+    content.saturating_sub(viewport_height)
 }
 
 fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {

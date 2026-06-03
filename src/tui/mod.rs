@@ -32,6 +32,7 @@ pub struct AppState {
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
+    pub resource_viewport_height: u16,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -153,9 +154,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
+        resource_viewport_height: 0,
     };
 
-    terminal.draw(|f| view::render(f, &app))?;
+    terminal.draw(|f| view::render(f, &mut app))?;
 
     while let Some(evt) = rx.recv().await {
         match evt {
@@ -204,7 +206,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
                         if app.view == TuiView::Resources {
-                            let max = view::resource_line_count(&app.resources);
+                            let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
                             app.resource_scroll = (app.resource_scroll + 1).min(max);
                         } else if !app.snapshot.rows.is_empty() {
                             app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
@@ -226,7 +228,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Char('G') => {
                         if app.view == TuiView::Resources {
-                            let max = view::resource_line_count(&app.resources);
+                            let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
                             app.resource_scroll = max;
                         } else if !app.snapshot.rows.is_empty() {
                             app.selected = app.snapshot.rows.len() - 1;
@@ -268,7 +270,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
             }
             AppEvent::Input(Event::Mouse(m)) => match m.kind {
                 MouseEventKind::ScrollDown => {
-                    let max = view::resource_line_count(&app.resources);
+                    let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
                     app.resource_scroll = (app.resource_scroll + 3).min(max);
                 }
                 MouseEventKind::ScrollUp => {
@@ -278,7 +280,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
             },
             AppEvent::Input(_) => {}
         }
-        terminal.draw(|f| view::render(f, &app))?;
+        terminal.draw(|f| view::render(f, &mut app))?;
     }
     Ok(())
 }
