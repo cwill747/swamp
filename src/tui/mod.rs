@@ -5,6 +5,7 @@ mod view;
 use crate::cli::TuiView;
 use crate::daemon::socket::{read_server_msg, write_client_msg, ClientMsg, ServerMsg};
 use crate::kill;
+use crate::daemon::resources;
 use crate::daemon::state::Snapshot;
 use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
@@ -28,6 +29,7 @@ pub struct AppState {
     pub view: TuiView,
     pub refreshing: bool,
     pub pending_delete: Option<String>,
+    pub resources: resources::Snapshot,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -83,6 +85,7 @@ enum AppEvent {
     Snapshot(Snapshot),
     Input(Event),
     Tick,
+    Resources(resources::Snapshot),
     RefreshDone(Vec<String>),
 }
 
@@ -144,6 +147,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         view,
         refreshing: false,
         pending_delete: None,
+        resources: resources::Snapshot::default(),
     };
 
     terminal.draw(|f| view::render(f, &app))?;
@@ -164,6 +168,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
             }
             AppEvent::Tick => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            }
+            AppEvent::Resources(snap) => {
+                app.resources = snap;
             }
             AppEvent::RefreshDone(wt_names) => {
                 app.refreshing = false;
@@ -259,10 +266,18 @@ async fn subscribe_loop(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) ->
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Subscribe).await?;
     while let Some(msg) = read_server_msg(&mut stream).await? {
-        if let ServerMsg::Snapshot(s) = msg {
-            if tx.send(AppEvent::Snapshot(s)).await.is_err() {
-                break;
+        match msg {
+            ServerMsg::Snapshot(s) => {
+                if tx.send(AppEvent::Snapshot(s)).await.is_err() {
+                    break;
+                }
             }
+            ServerMsg::Resources(r) => {
+                if tx.send(AppEvent::Resources(r)).await.is_err() {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())

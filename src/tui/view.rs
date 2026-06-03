@@ -1,6 +1,7 @@
 use super::icons;
 use super::theme::Theme;
 use super::AppState;
+use crate::daemon::resources;
 use crate::cli::TuiView;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
 use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
@@ -28,7 +29,7 @@ fn render_single_panel(f: &mut Frame, app: &AppState) {
     match app.view {
         TuiView::Worktrees => render_worktree_table(f, app, chunks[0]),
         TuiView::AiStatus => render_ai_status(f, app, chunks[0]),
-        TuiView::Resources => render_resources(f, chunks[0]),
+        TuiView::Resources => render_resources(f, app, chunks[0]),
         TuiView::PrStatus => render_pr_status(f, chunks[0]),
         TuiView::All => unreachable!(),
     }
@@ -77,7 +78,7 @@ fn render_all(f: &mut Frame, app: &AppState) {
         .split(columns[1]);
 
     render_worktree_table(f, app, left[0]);
-    render_resources(f, left[1]);
+    render_resources(f, app, left[1]);
     render_ai_status(f, app, right[0]);
     render_pr_status(f, right[1]);
 
@@ -215,15 +216,109 @@ fn render_ai_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_resources(f: &mut Frame, area: ratatui::layout::Rect) {
-    let lines = vec![
-        Line::from(Span::styled("No resource data", Theme::muted())),
-    ];
-
+fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let res = &app.resources;
+    let title = Span::styled(
+        " Resources ",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::MUTED))
-        .title(Span::styled(" Resources ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        .title(title);
+
+    if res.session_pid.is_none() && res.procs.is_empty() {
+        let lines = vec![Line::from(Span::styled(
+            "sampling…",
+            Theme::muted(),
+        ))];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header row 1: session totals.
+    let session_label = match res.session_pid {
+        Some(pid) => format!("session pid {pid}"),
+        None => "session: not found".to_string(),
+    };
+    lines.push(Line::from(vec![
+        Span::styled("CPU ", Theme::muted()),
+        Span::styled(
+            format!("{:>5.1}%", res.total_cpu),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("RSS ", Theme::muted()),
+        Span::styled(
+            format!("{:>6}", resources::fmt_bytes(res.total_rss_bytes)),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled("time ", Theme::muted()),
+        Span::styled(
+            resources::fmt_duration(res.total_user_time_secs),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("({} procs · {session_label})", res.procs.len()), Theme::muted()),
+    ]));
+
+    // Header row 2: system memory + load.
+    let mem_pct = if res.mem_total_bytes > 0 {
+        (res.mem_used_bytes as f64 / res.mem_total_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    lines.push(Line::from(vec![
+        Span::styled("mem ", Theme::muted()),
+        Span::styled(
+            format!(
+                "{}/{} ({:.0}%)",
+                resources::fmt_bytes(res.mem_used_bytes),
+                resources::fmt_bytes(res.mem_total_bytes),
+                mem_pct
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled("load ", Theme::muted()),
+        Span::styled(
+            format!("{:.2} {:.2} {:.2}", res.load1, res.load5, res.load15),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Column header.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:>6}  {:>5}  {:>6}  {:>7}  ", "PID", "CPU%", "RSS", "TIME"),
+            Theme::muted(),
+        ),
+        Span::styled("COMMAND", Theme::muted()),
+    ]));
+
+    // Per-process rows (top N by CPU; cap to area height).
+    let max_rows = area.height.saturating_sub(2 /* borders */ + 4 /* header lines */) as usize;
+    for p in res.procs.iter().take(max_rows) {
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:>6}  ", p.pid)),
+            Span::styled(
+                format!("{:>5.1}  ", p.cpu),
+                if p.cpu > 10.0 {
+                    Style::default().fg(Theme::WORKING).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(format!("{:>6}  ", resources::fmt_bytes(p.rss_kb * 1024))),
+            Span::raw(format!("{:>7}  ", resources::fmt_duration(p.time_secs))),
+            Span::styled(p.comm.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

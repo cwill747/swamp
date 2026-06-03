@@ -1,3 +1,4 @@
+pub mod resources;
 pub mod socket;
 pub mod state;
 pub mod watcher;
@@ -16,7 +17,9 @@ use self::state::DaemonState;
 
 pub struct Daemon {
     pub common_dir: PathBuf,
+    pub session_name: String,
     pub state: Arc<RwLock<DaemonState>>,
+    pub resources: Arc<RwLock<resources::Snapshot>>,
     pub tx: broadcast::Sender<ServerMsg>,
 }
 
@@ -76,9 +79,23 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     let state = Arc::new(RwLock::new(DaemonState::load(&common).await?));
     let (tx, _) = broadcast::channel::<ServerMsg>(64);
 
+    // Session name matches launch::run's derivation: the file_name of the dir
+    // that contains the bare repo / .git. Prefer the ZELLIJ_SESSION_NAME env if
+    // present (set inside any zellij pane), so the daemon agrees with zellij
+    // even when started from an unusual cwd.
+    let session_name = std::env::var("ZELLIJ_SESSION_NAME").ok().unwrap_or_else(|| {
+        common
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "swamp".into())
+    });
+
     let daemon = Arc::new(Daemon {
         common_dir: common.clone(),
+        session_name,
         state: state.clone(),
+        resources: Arc::new(RwLock::new(resources::Snapshot::default())),
         tx: tx.clone(),
     });
 
@@ -91,6 +108,36 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = watcher::run(d).await {
                 tracing::error!("watcher exited: {e:?}");
+            }
+        });
+    }
+
+    // Resource sampler (1Hz). Uses spawn_blocking to run ps/sysctl shell-outs
+    // off the async runtime and stores results back in the daemon's cache,
+    // broadcasting a Resources message to subscribers.
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            let mut roots: Vec<u32> = Vec::new();
+            loop {
+                let session = d.session_name.clone();
+                let roots_in = roots.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut r = roots_in;
+                    let snap = resources::sample(&session, &mut r);
+                    (snap, r)
+                })
+                .await;
+                match result {
+                    Ok((Ok(snap), new_roots)) => {
+                        roots = new_roots;
+                        *d.resources.write().await = snap.clone();
+                        let _ = d.tx.send(ServerMsg::Resources(snap));
+                    }
+                    Ok((Err(e), _)) => tracing::debug!("resource sample: {e:?}"),
+                    Err(e) => tracing::warn!("resource sampler join: {e:?}"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }

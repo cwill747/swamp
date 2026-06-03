@@ -1,3 +1,4 @@
+use super::resources;
 use super::state::Snapshot;
 use super::Daemon;
 use anyhow::Result;
@@ -21,6 +22,7 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Pong,
     Snapshot(Snapshot),
+    Resources(resources::Snapshot),
     Ok,
     Err { message: String },
     Version { version: String },
@@ -39,6 +41,8 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     ClientMsg::Subscribe => {
                         let snap = daemon.state.read().await.snapshot();
                         write_msg(&mut stream, &ServerMsg::Snapshot(snap)).await?;
+                        let res = daemon.resources.read().await.clone();
+                        write_msg(&mut stream, &ServerMsg::Resources(res)).await?;
                     }
                     ClientMsg::Hook { worktree, status } => {
                         match daemon.apply_hook(&worktree, &status).await {
