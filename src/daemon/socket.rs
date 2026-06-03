@@ -1,5 +1,5 @@
 use super::resources;
-use super::state::Snapshot;
+use super::state::{PrSnapshot, Snapshot};
 use super::Daemon;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub enum ServerMsg {
     Pong,
     Snapshot(Snapshot),
     Resources(resources::Snapshot),
+    PrStatus(PrSnapshot),
     Ok,
     Err { message: String },
     Version { version: String },
@@ -43,6 +44,8 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         write_msg(&mut stream, &ServerMsg::Snapshot(snap)).await?;
                         let res = daemon.resources.read().await.clone();
                         write_msg(&mut stream, &ServerMsg::Resources(res)).await?;
+                        let pr_snap = daemon.state.read().await.pr_snapshot();
+                        write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
                     ClientMsg::Hook { worktree, status } => {
                         match daemon.apply_hook(&worktree, &status).await {

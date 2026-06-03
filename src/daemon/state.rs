@@ -1,3 +1,4 @@
+use crate::github::PrSummary;
 use crate::util::now_unix;
 use crate::worktree::{self, GitInfo, Worktree};
 use anyhow::Result;
@@ -47,9 +48,15 @@ pub struct Snapshot {
     pub rows: Vec<WorktreeRow>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrSnapshot {
+    pub prs: HashMap<String, PrSummary>,
+}
+
 pub struct DaemonState {
     pub rows: HashMap<String, WorktreeRow>,
     pub agents: HashMap<String, AgentRecord>,
+    pub prs: HashMap<String, PrSummary>,
 }
 
 impl DaemonState {
@@ -57,6 +64,7 @@ impl DaemonState {
         Ok(Self {
             rows: HashMap::new(),
             agents: HashMap::new(),
+            prs: HashMap::new(),
         })
     }
 
@@ -105,6 +113,16 @@ impl DaemonState {
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         Snapshot { rows }
     }
+
+    pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>) {
+        self.prs = prs;
+    }
+
+    pub fn pr_snapshot(&self) -> PrSnapshot {
+        PrSnapshot {
+            prs: self.prs.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +155,7 @@ mod tests {
         let mut state = DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
+            prs: HashMap::new(),
         };
         state.rows.insert("zebra".into(), make_row("zebra"));
         state.rows.insert("alpha".into(), make_row("alpha"));
@@ -155,6 +174,7 @@ mod tests {
         let mut state = DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
+            prs: HashMap::new(),
         };
         state.rows.insert("main".into(), make_row("main"));
 
@@ -171,6 +191,7 @@ mod tests {
         let mut state = DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
+            prs: HashMap::new(),
         };
         state.rows.insert("main".into(), make_row("main"));
 

@@ -36,3 +36,23 @@ pub fn dirty_marker() -> &'static str {
 pub fn current_marker() -> &'static str {
     if ascii_mode() { ">" } else { "▸" }
 }
+
+pub fn pr_icon(state: &str, is_draft: bool) -> &'static str {
+    if is_draft {
+        return if ascii_mode() { "d" } else { "\u{f0124}" };
+    }
+    match state {
+        "OPEN" => if ascii_mode() { "o" } else { "\u{f0408}" },
+        "MERGED" => if ascii_mode() { "m" } else { "\u{f0409}" },
+        "CLOSED" => if ascii_mode() { "x" } else { "\u{f040a}" },
+        _ => "?",
+    }
+}
+
+pub fn check_success() -> &'static str {
+    if ascii_mode() { "v" } else { "\u{f058}" }
+}
+
+pub fn check_failure() -> &'static str {
+    if ascii_mode() { "x" } else { "\u{f057}" }
+}

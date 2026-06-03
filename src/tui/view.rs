@@ -4,6 +4,7 @@ use super::AppState;
 use crate::daemon::resources;
 use crate::cli::TuiView;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
+use crate::github::{CheckState, PrSummary};
 use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,7 +31,7 @@ fn render_single_panel(f: &mut Frame, app: &AppState) {
         TuiView::Worktrees => render_worktree_table(f, app, chunks[0]),
         TuiView::AiStatus => render_ai_status(f, app, chunks[0]),
         TuiView::Resources => render_resources(f, app, chunks[0]),
-        TuiView::PrStatus => render_pr_status(f, chunks[0]),
+        TuiView::PrStatus => render_pr_status(f, app, chunks[0]),
         TuiView::All => unreachable!(),
     }
 
@@ -80,7 +81,7 @@ fn render_all(f: &mut Frame, app: &AppState) {
     render_worktree_table(f, app, left[0]);
     render_resources(f, app, left[1]);
     render_ai_status(f, app, right[0]);
-    render_pr_status(f, right[1]);
+    render_pr_status(f, app, right[1]);
 
     render_footer(f, app, outer[2]);
 }
@@ -323,17 +324,116 @@ fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_pr_status(f: &mut Frame, area: ratatui::layout::Rect) {
-    let lines = vec![
-        Line::from(Span::styled("No open PRs for any worktree branch", Theme::muted())),
-    ];
-
+fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::MUTED))
-        .title(Span::styled(" PR & CI Status ", Style::default().fg(Theme::BRANCH).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " PR & CI Status ",
+            Style::default()
+                .fg(Theme::BRANCH)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let mut pr_rows: Vec<(&str, &PrSummary)> = Vec::new();
+    for row in &app.snapshot.rows {
+        if let Some(pr) = app.pr_snapshot.prs.get(&row.branch) {
+            pr_rows.push((&row.branch, pr));
+        }
+    }
+
+    if pr_rows.is_empty() {
+        let lines = vec![Line::from(Span::styled(
+            "No PRs for any worktree branch",
+            Theme::muted(),
+        ))];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    pr_rows.sort_by(|a, b| {
+        let a_open = a.1.state == "OPEN";
+        let b_open = b.1.state == "OPEN";
+        b_open.cmp(&a_open).then(b.1.number.cmp(&a.1.number))
+    });
+
+    let max_rows = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (branch, pr) in pr_rows.iter().take(max_rows) {
+        let mut spans = Vec::new();
+
+        let (icon, color) = pr_state_icon_color(pr);
+        spans.push(Span::styled(icon, Style::default().fg(color)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("#{:<5}", pr.number),
+            Style::default().fg(color),
+        ));
+
+        if let Some(ref checks) = pr.checks {
+            let (check_icon, check_color) =
+                check_state_icon_color(checks, app.spinner_frame);
+            spans.push(Span::styled(check_icon, Style::default().fg(check_color)));
+            match checks {
+                CheckState::Failure { passed, total }
+                | CheckState::Pending { passed, total } => {
+                    spans.push(Span::styled(
+                        format!(" {}/{}", passed, total),
+                        Style::default().fg(check_color),
+                    ));
+                }
+                CheckState::Success => {}
+            }
+            spans.push(Span::raw(" "));
+        }
+
+        spans.push(Span::styled(
+            truncate(branch, 20),
+            Style::default().fg(Theme::BRANCH),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(truncate(&pr.title, 40), Theme::muted()));
+
+        lines.push(Line::from(spans));
+    }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
+    let icon = icons::pr_icon(&pr.state, pr.is_draft);
+    let color = if pr.is_draft {
+        Color::DarkGray
+    } else {
+        match pr.state.as_str() {
+            "OPEN" => Color::Green,
+            "MERGED" => Color::Magenta,
+            "CLOSED" => Color::Red,
+            _ => Color::DarkGray,
+        }
+    };
+    (icon, color)
+}
+
+fn check_state_icon_color(checks: &CheckState, spinner_frame: usize) -> (String, Color) {
+    match checks {
+        CheckState::Success => (icons::check_success().to_string(), Color::Green),
+        CheckState::Failure { .. } => (icons::check_failure().to_string(), Color::Red),
+        CheckState::Pending { .. } => {
+            let frame =
+                icons::SPINNER_FRAMES[spinner_frame % icons::SPINNER_FRAMES.len()];
+            (frame.to_string(), Color::Cyan)
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let end = max.saturating_sub(1);
+        format!("{}…", &s[..end])
+    }
 }
 
 fn build_row<'a>(

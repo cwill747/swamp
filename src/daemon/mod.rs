@@ -186,6 +186,37 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         });
     }
 
+    // PR status poller (60s interval).
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            loop {
+                let common_dir = d.common_dir.clone();
+                let branches: Vec<String> = {
+                    let s = d.state.read().await;
+                    s.rows.values().map(|r| r.branch.clone()).collect()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::github::list_prs_for_branches(&common_dir, &branches)
+                })
+                .await;
+                match result {
+                    Ok(Ok(prs)) => {
+                        let mut s = d.state.write().await;
+                        s.update_prs(prs);
+                        let pr_snap = s.pr_snapshot();
+                        drop(s);
+                        let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
+                    }
+                    Ok(Err(e)) => tracing::debug!("pr status poll: {e:?}"),
+                    Err(e) => tracing::warn!("pr status poll join: {e:?}"),
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
     let listener = UnixListener::bind(&sock).context("bind socket")?;
     std::fs::write(pid_path(&common), std::process::id().to_string())?;
     tracing::info!("swamp daemon listening on {}", sock.display());

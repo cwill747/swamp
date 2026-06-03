@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod daemon;
+mod github;
 mod hook;
 mod kill;
 mod launch;

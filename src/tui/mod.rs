@@ -6,7 +6,7 @@ use crate::cli::TuiView;
 use crate::daemon::socket::{read_server_msg, write_client_msg, ClientMsg, ServerMsg};
 use crate::kill;
 use crate::daemon::resources;
-use crate::daemon::state::Snapshot;
+use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use crate::zellij;
@@ -30,6 +30,7 @@ pub struct AppState {
     pub refreshing: bool,
     pub pending_delete: Option<String>,
     pub resources: resources::Snapshot,
+    pub pr_snapshot: PrSnapshot,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -86,6 +87,7 @@ enum AppEvent {
     Input(Event),
     Tick,
     Resources(resources::Snapshot),
+    PrStatus(PrSnapshot),
     RefreshDone(Vec<String>),
 }
 
@@ -148,6 +150,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         refreshing: false,
         pending_delete: None,
         resources: resources::Snapshot::default(),
+        pr_snapshot: PrSnapshot::default(),
     };
 
     terminal.draw(|f| view::render(f, &app))?;
@@ -171,6 +174,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
             }
             AppEvent::Resources(snap) => {
                 app.resources = snap;
+            }
+            AppEvent::PrStatus(pr) => {
+                app.pr_snapshot = pr;
             }
             AppEvent::RefreshDone(wt_names) => {
                 app.refreshing = false;
@@ -274,6 +280,11 @@ async fn subscribe_loop(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) ->
             }
             ServerMsg::Resources(r) => {
                 if tx.send(AppEvent::Resources(r)).await.is_err() {
+                    break;
+                }
+            }
+            ServerMsg::PrStatus(pr) => {
+                if tx.send(AppEvent::PrStatus(pr)).await.is_err() {
                     break;
                 }
             }
