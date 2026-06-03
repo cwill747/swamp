@@ -6,6 +6,8 @@ gui:
       - bold
   showIcons: true
   nerdFontsVersion: "3"
+  expandFocusedSidePanel: true
+  expandedSidePanelWeight: 10
 git:
   autoFetch: false
   fetchAll: false
