@@ -96,7 +96,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
         ));
     }
     spans.push(Span::styled(
-        "j/k move · enter jump · d delete · r refresh · K kill · q quit",
+        "j/k move · enter jump · c create · d delete · r refresh · K kill · q quit",
         Theme::muted(),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
