@@ -503,7 +503,7 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             Constraint::Min(6),    // #number
             Constraint::Min(7),    // checks
             Constraint::Min(10),   // branch
-            Constraint::Min(10),   // title
+            Constraint::Fill(1),   // title
         ],
     )
     .block(block)
