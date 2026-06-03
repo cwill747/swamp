@@ -144,6 +144,7 @@ mod tests {
                     agent: AgentStatus::Idle,
                     agent_ts: 0,
                     session_name: None,
+                    head_ts: 0,
                 })
                 .collect(),
         }

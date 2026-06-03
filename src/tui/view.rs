@@ -104,13 +104,15 @@ fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
 
 fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let now = now_unix();
-    let current_tab = std::env::var("ZELLIJ_TAB_NAME").ok();
+    let current_tab = app.current_tab.as_deref();
+    let pin_current = app.view == TuiView::Worktrees;
+
     let rows: Vec<Row> = app
         .snapshot
         .rows
         .iter()
         .enumerate()
-        .map(|(i, r)| build_row(i, r, app, now, current_tab.as_deref()))
+        .map(|(i, r)| build_row(i, r, app, now, current_tab, pin_current))
         .collect();
 
     let table = Table::new(
@@ -533,13 +535,22 @@ fn build_row<'a>(
     app: &AppState,
     now: u64,
     current_tab: Option<&str>,
+    pin_current: bool,
 ) -> Row<'a> {
     let is_current = current_tab.map(|t| t == r.name).unwrap_or(false);
+    let is_pinned = pin_current && is_current;
     let recent = now.saturating_sub(r.agent_ts) < 300;
 
     let idx_cell = {
         let mut spans = Vec::new();
-        if is_current {
+        if is_pinned {
+            spans.push(Span::styled(
+                format!("{}{} ", icons::current_marker(), i + 1),
+                Style::default()
+                    .fg(Theme::ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+        } else if is_current {
             spans.push(Span::styled(
                 format!("{}{} ", icons::current_marker(), i + 1),
                 Theme::accent_bold(),
@@ -570,7 +581,11 @@ fn build_row<'a>(
         Cell::from(Span::raw(" "))
     };
 
-    let name_style = if is_current {
+    let name_style = if is_pinned {
+        Style::default()
+            .fg(Theme::ACCENT)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else if is_current {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
