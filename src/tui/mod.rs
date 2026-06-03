@@ -31,6 +31,7 @@ pub struct AppState {
     pub refreshing: bool,
     pub pending_delete: Option<String>,
     pub pending_create: bool,
+    pub create_input_received: bool,
     pub pre_create_names: HashSet<String>,
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
@@ -170,6 +171,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         refreshing: false,
         pending_delete: None,
         pending_create: false,
+        create_input_received: false,
         pre_create_names: HashSet::new(),
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
@@ -210,6 +212,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             let _ = zellij::go_to_tab_name(&last.name);
                         }
                         app.pending_create = false;
+                    } else if app.create_input_received {
+                        app.pending_create = false;
                     }
                 }
             }
@@ -238,6 +242,14 @@ async fn event_loop<B: ratatui::backend::Backend>(
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
                     continue;
+                }
+                if app.pending_create && !app.create_input_received {
+                    app.create_input_received = true;
+                    let tx = tx.clone();
+                    let common = common.to_path_buf();
+                    tokio::spawn(async move {
+                        let _ = send_refresh(&common, tx).await;
+                    });
                 }
                 match k.code {
                     KeyCode::Char('q') => return Ok(()),
@@ -284,6 +296,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             .map(|r| r.name.clone())
                             .collect();
                         app.pending_create = true;
+                        app.create_input_received = false;
                         let _ = zellij::run_floating(
                             "git",
                             &["wt", "add"],
