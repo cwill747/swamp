@@ -120,7 +120,7 @@ fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::R
         [
             Constraint::Length(3),  // # + caret
             Constraint::Length(2),  // agent icon
-            Constraint::Length(2),  // PR icon
+            Constraint::Length(1),  // PR icon
             Constraint::Min(8),     // worktree name
             Constraint::Min(10),    // branch
             Constraint::Min(12),    // git
@@ -503,9 +503,9 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
         rows,
         [
             Constraint::Length(2),  // PR state icon
-            Constraint::Min(6),    // #number
-            Constraint::Min(7),    // checks
-            Constraint::Length(2),  // review
+            Constraint::Length(7), // #number
+            Constraint::Length(7), // checks
+            Constraint::Length(2), // review
             Constraint::Min(10),   // branch
             Constraint::Fill(1),   // title
         ],
@@ -616,30 +616,23 @@ fn build_row<'a>(
     };
 
     let pr_cell = if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
-        let (icon, color) = pr_state_icon_color(pr);
-        let mut spans = vec![Span::styled(icon, Style::default().fg(color))];
-        match &pr.review {
-            Some(ReviewDecision::ChangesRequested) => {
-                spans.push(Span::styled(
-                    icons::review_changes(),
-                    Style::default().fg(Color::Red),
-                ));
+        let (icon, color) = if pr.state == "OPEN" && !pr.is_draft {
+            match &pr.review {
+                Some(ReviewDecision::ChangesRequested) => {
+                    (icons::review_changes(), Color::Red)
+                }
+                Some(ReviewDecision::Commented) => {
+                    (icons::review_commented(), Color::Yellow)
+                }
+                Some(ReviewDecision::Approved) => {
+                    (icons::review_approved(), Color::Green)
+                }
+                _ => pr_state_icon_color(pr),
             }
-            Some(ReviewDecision::Commented) => {
-                spans.push(Span::styled(
-                    icons::review_commented(),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            Some(ReviewDecision::Approved) => {
-                spans.push(Span::styled(
-                    icons::review_approved(),
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            _ => {}
-        }
-        Cell::from(Line::from(spans))
+        } else {
+            pr_state_icon_color(pr)
+        };
+        Cell::from(Span::styled(icon, Style::default().fg(color)))
     } else {
         Cell::from(Span::raw(" "))
     };
