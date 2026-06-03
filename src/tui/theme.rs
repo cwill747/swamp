@@ -12,6 +12,7 @@ impl Theme {
     pub const MUTED: Color = Color::DarkGray;
     pub const BRANCH: Color = Color::Magenta;
     pub const SELECTED_BG: Color = Color::Indexed(236);
+    pub const CURRENT_BG: Color = Color::Indexed(235);
 
     pub fn accent_bold() -> Style {
         Style::default().fg(Self::ACCENT).add_modifier(Modifier::BOLD)
@@ -23,5 +24,8 @@ impl Theme {
         Style::default()
             .bg(Self::SELECTED_BG)
             .add_modifier(Modifier::BOLD)
+    }
+    pub fn current() -> Style {
+        Style::default().bg(Self::CURRENT_BG)
     }
 }
