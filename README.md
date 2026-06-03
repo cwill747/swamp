@@ -405,9 +405,13 @@ This repo uses Nix for reproducible builds. **Always verify changes with
 `nix build`**, not raw `cargo build`:
 
 ```bash
-nix build
+nix build path:.
 ./result/bin/swamp --help
 ```
+
+> **Why `path:.`?** In a bare-repo worktree layout, each worktree's `.git` is a
+> relative file, not a directory. Nix can't resolve the flake through it, so
+> `path:.` tells Nix to treat the current directory as the flake root.
 
 For an interactive dev shell with `cargo`, `rustc`, `clippy`, `rustfmt`, and
 `rust-analyzer`:
