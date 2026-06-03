@@ -451,22 +451,20 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     });
 
     let max_rows = area.height.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     for (branch, pr) in pr_rows.iter().take(max_rows) {
-        let mut spans = Vec::new();
-
         let (icon, color) = pr_state_icon_color(pr);
-        spans.push(Span::styled(icon, Style::default().fg(color)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("#{:<5}", pr.number),
+        let state_cell = Cell::from(Span::styled(icon, Style::default().fg(color)));
+
+        let number_cell = Cell::from(Span::styled(
+            format!("#{}", pr.number),
             Style::default().fg(color),
         ));
 
-        if let Some(ref checks) = pr.checks {
+        let checks_cell = if let Some(ref checks) = pr.checks {
             let (check_icon, check_color) =
                 check_state_icon_color(checks, app.spinner_frame);
-            spans.push(Span::styled(check_icon, Style::default().fg(check_color)));
+            let mut spans = vec![Span::styled(check_icon, Style::default().fg(check_color))];
             match checks {
                 CheckState::Failure { passed, total }
                 | CheckState::Pending { passed, total } => {
@@ -477,20 +475,41 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
                 }
                 CheckState::Success => {}
             }
-            spans.push(Span::raw(" "));
-        }
+            Cell::from(Line::from(spans))
+        } else {
+            Cell::from("")
+        };
 
-        spans.push(Span::styled(
+        let branch_cell = Cell::from(Span::styled(
             truncate(branch, 20),
             Style::default().fg(Theme::BRANCH),
         ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(truncate(&pr.title, 40), Theme::muted()));
 
-        lines.push(Line::from(spans));
+        let title_cell = Cell::from(Span::styled(truncate(&pr.title, 40), Theme::muted()));
+
+        rows.push(Row::new(vec![
+            state_cell,
+            number_cell,
+            checks_cell,
+            branch_cell,
+            title_cell,
+        ]));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),  // PR state icon
+            Constraint::Length(6),  // #number
+            Constraint::Length(7),  // checks
+            Constraint::Min(10),   // branch
+            Constraint::Min(10),   // title
+        ],
+    )
+    .block(block)
+    .column_spacing(1);
+
+    f.render_widget(table, area);
 }
 
 fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
