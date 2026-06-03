@@ -344,9 +344,10 @@ mod tests {
     }
 }
 
-fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
+fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
+    let starship_cfg = cfg.starship.display();
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="50%" {{
+      pane split_direction="horizontal" size="33%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "worktrees"
           name "worktrees"
@@ -356,7 +357,7 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
           name "resources"
         }}
       }}
-      pane split_direction="horizontal" size="50%" {{
+      pane split_direction="horizontal" size="34%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "ai-status"
           name "ai-status"
@@ -365,6 +366,10 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
           args "tui" "--view" "pr-status"
           name "pr-status"
         }}
+      }}
+      pane command="fish" size="33%" {{
+        args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command bash -c 'exec fish'; else; exec nix develop --command bash -c 'exec fish'; end; else; exec fish; end"
+        name "shell"
       }}
     }}
 "#));
