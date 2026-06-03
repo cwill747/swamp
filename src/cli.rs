@@ -8,7 +8,7 @@ pub struct Cli {
     pub command: Option<Cmd>,
 }
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum TuiView {
     /// Show all panels (default for worktree tabs).
     #[default]
