@@ -385,7 +385,7 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
         }}
       }}
       pane split_direction="horizontal" size="70%" {{
-        pane command="fish" size="60%" {{
+        pane command="fish" size="60%" start_suspended=true {{
           args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; set -l cp (command -s claude); if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command $cp; else; exec nix develop --command $cp; end; else; exec $cp; end"
           name "claude"
         }}
