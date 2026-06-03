@@ -41,12 +41,15 @@
                   || (pkgs.lib.hasSuffix ".toml" path)
                   || (craneLibStatic.filterCargoSources path type);
               };
+              target = crossPkgs.stdenv.hostPlatform.rust.rustcTarget;
               staticArgs = {
                 src = staticSrc;
                 pname = "swamp";
                 version = self.shortRev or self.dirtyShortRev or "dev";
                 nativeBuildInputs = [ pkgs.pkg-config ];
                 strictDeps = true;
+                CARGO_BUILD_TARGET = target;
+                CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               };
               staticCargoArtifacts = craneLibStatic.buildDepsOnly staticArgs;
             in
