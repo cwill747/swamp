@@ -118,6 +118,7 @@ fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::R
         [
             Constraint::Length(3),  // # + caret
             Constraint::Length(2),  // agent icon
+            Constraint::Length(2),  // PR icon
             Constraint::Min(8),     // worktree name
             Constraint::Min(10),    // branch
             Constraint::Min(12),    // git
@@ -544,6 +545,13 @@ fn build_row<'a>(
         Cell::from(Span::styled(glyph, style))
     };
 
+    let pr_cell = if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
+        let (icon, color) = pr_state_icon_color(pr);
+        Cell::from(Span::styled(icon, Style::default().fg(color)))
+    } else {
+        Cell::from(Span::raw(" "))
+    };
+
     let name_style = if is_current {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -572,7 +580,7 @@ fn build_row<'a>(
         Cell::from(Span::styled(txt, style))
     };
 
-    let row = Row::new(vec![idx_cell, agent_cell, name_cell, branch_cell, git_cell, age_cell]);
+    let row = Row::new(vec![idx_cell, agent_cell, pr_cell, name_cell, branch_cell, git_cell, age_cell]);
     if i == app.selected {
         row.style(Theme::selected())
     } else {
