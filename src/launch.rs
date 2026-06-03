@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-const LAYOUT_WORKTREE: &str = "swamp";
+pub(crate) const LAYOUT_WORKTREE: &str = "swamp";
 
 /// Returns `true` when `running` differs from `mine` (i.e. the daemon was
 /// started by a different swamp build).  Simple equality for now; unit-tested
