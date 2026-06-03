@@ -30,6 +30,7 @@ pub struct GitInfo {
     pub untracked: u32,
     pub conflict: bool,
     pub rebase: bool,
+    pub head_ts: u64,
 }
 
 /// Resolve the effective directory for git commands.
@@ -192,6 +193,9 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
     }
     if info.branch.is_empty() {
         info.branch = "(detached)".into();
+    }
+    if let Ok(ts_str) = git(dir, &["log", "-1", "--format=%ct"]) {
+        info.head_ts = ts_str.trim().parse().unwrap_or(0);
     }
     Ok(info)
 }

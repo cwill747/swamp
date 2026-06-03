@@ -45,6 +45,8 @@ pub struct WorktreeRow {
     pub agent_ts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    #[serde(default)]
+    pub head_ts: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +123,7 @@ impl DaemonState {
 
     pub fn snapshot(&self) -> Snapshot {
         let mut rows: Vec<WorktreeRow> = self.rows.values().cloned().collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.sort_by(|a, b| b.head_ts.cmp(&a.head_ts).then(a.name.cmp(&b.name)));
         Snapshot { rows }
     }
 
@@ -142,6 +144,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_row(name: &str) -> WorktreeRow {
+        make_row_with_ts(name, 0)
+    }
+
+    fn make_row_with_ts(name: &str, head_ts: u64) -> WorktreeRow {
         WorktreeRow {
             name: name.to_string(),
             path: PathBuf::from(format!("/repo/{}", name)),
@@ -157,13 +163,13 @@ mod tests {
             agent: AgentStatus::Idle,
             agent_ts: 0,
             session_name: None,
+            head_ts,
         }
     }
 
-    /// `snapshot()` must return rows sorted by name regardless of insertion
-    /// order (HashMap iteration order is non-deterministic).
+    /// With equal head_ts, snapshot falls back to alphabetical name order.
     #[test]
-    fn snapshot_rows_sorted_by_name() {
+    fn snapshot_rows_sorted_by_name_when_same_ts() {
         let mut state = DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
@@ -177,6 +183,23 @@ mod tests {
         let snap = state.snapshot();
         let names: Vec<&str> = snap.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta", "main", "zebra"]);
+    }
+
+    /// snapshot() sorts by head_ts descending (most recently updated first).
+    #[test]
+    fn snapshot_rows_sorted_by_head_ts_descending() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+            prs: HashMap::new(),
+        };
+        state.rows.insert("old".into(), make_row_with_ts("old", 100));
+        state.rows.insert("newest".into(), make_row_with_ts("newest", 300));
+        state.rows.insert("middle".into(), make_row_with_ts("middle", 200));
+
+        let snap = state.snapshot();
+        let names: Vec<&str> = snap.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["newest", "middle", "old"]);
     }
 
     /// `apply_hook` must update an existing row's agent status in-place so the
@@ -238,5 +261,6 @@ fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow 
         agent: agent.status,
         agent_ts: agent.ts,
         session_name: agent.session_name.clone(),
+        head_ts: info.head_ts,
     }
 }
