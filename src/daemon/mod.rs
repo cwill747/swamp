@@ -262,9 +262,9 @@ impl Daemon {
         }
     }
 
-    pub async fn apply_hook(&self, wt_name: &str, status: &str) -> Result<()> {
+    pub async fn apply_hook(&self, wt_name: &str, status: &str, session_name: Option<&str>) -> Result<()> {
         let mut s = self.state.write().await;
-        s.apply_hook(wt_name, status)?;
+        s.apply_hook(wt_name, status, session_name)?;
         s.persist(&self.common_dir).await?;
         let snap = s.snapshot();
         drop(s);

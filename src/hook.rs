@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
-pub async fn run(status: String, dir: Option<PathBuf>) -> Result<()> {
+pub async fn run(status: String, dir: Option<PathBuf>, session_name: Option<String>) -> Result<()> {
     let start = dir.unwrap_or(std::env::current_dir()?);
     let common = git_common_dir(&start).context("not inside a git repo")?;
     let wt_name = start
@@ -27,6 +27,7 @@ pub async fn run(status: String, dir: Option<PathBuf>) -> Result<()> {
                 &ClientMsg::Hook {
                     worktree: wt_name.clone(),
                     status: status.clone(),
+                    session_name: session_name.clone(),
                 },
             )
             .await;
@@ -41,10 +42,13 @@ pub async fn run(status: String, dir: Option<PathBuf>) -> Result<()> {
     } else {
         Default::default()
     };
-    map.insert(
-        wt_name,
-        json!({ "status": status.to_lowercase(), "ts": now_unix() }),
-    );
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".into(), json!(status.to_lowercase()));
+    entry.insert("ts".into(), json!(now_unix()));
+    if let Some(ref name) = session_name {
+        entry.insert("session_name".into(), json!(name));
+    }
+    map.insert(wt_name, json!(entry));
     let tmp = path.with_extension("json.tmp");
     tokio::fs::write(&tmp, serde_json::to_vec_pretty(&map)?).await?;
     tokio::fs::rename(&tmp, &path).await?;

@@ -47,7 +47,7 @@ Unix-socket daemon — no plugins, no shell hooks beyond Claude's.
 - One Zellij tab per git worktree, with a layout containing lazygit, Claude, a
   shell, and a swamp status sidebar
 - Live status TUI ([`swamp tui`](#swamp-tui)) listing every worktree with
-  branch, ahead/behind, dirty state, and agent status
+  branch, ahead/behind, dirty state, agent status, and conversation title
 - Per-worktree agent status reporting via [`swamp hook`](#swamp-hook) +
   [Claude Code hooks](#claude-code-hooks)
 - Auto-detection of bare clones (adds a "dashboard" tab with lazygit + swamp
@@ -194,10 +194,15 @@ swamp hook working
 swamp hook waiting
 swamp hook idle
 swamp hook working --dir /path/to/worktree
+swamp hook working --session-name "Fix auth bug"
 ```
 
 `--dir` overrides the inferred worktree. Without it, the worktree name is
 derived from `$PWD`'s basename.
+
+`--session-name` sets the Claude Code conversation title for display in the AI
+status panel. When omitted, the previously recorded session name (if any) is
+preserved.
 
 The hook prefers the daemon socket (200 ms timeout) and falls back to writing
 `.swamp-status.json` in the git common dir if the daemon is unreachable.
@@ -218,7 +223,15 @@ and removes the socket and PID files.
 
 swamp tracks agent status per worktree via `swamp hook <status>`. To have
 Claude Code report its status automatically, add the following to
-`~/.claude/settings.json` (or a project-local `.claude/settings.json`):
+`~/.claude/settings.json` (or a project-local `.claude/settings.json`).
+
+The hooks parse Claude Code's JSON stdin to extract the conversation title
+(`session_name`) and pass it to `swamp hook --session-name`, so the AI status
+panel can show what each agent is working on. This requires `jq` on `PATH`.
+
+### Basic (status only)
+
+If you don't need session names in the dashboard, the minimal config is:
 
 ```json
 {
@@ -226,14 +239,14 @@ Claude Code report its status automatically, add the following to
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "swamp hook working" }
+          { "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "swamp hook working" }
+          { "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }
         ]
       }
     ],
@@ -241,14 +254,78 @@ Claude Code report its status automatically, add the following to
       {
         "matcher": "permission_prompt|elicitation_dialog",
         "hooks": [
-          { "type": "command", "command": "swamp hook waiting" }
+          { "type": "command", "command": "swamp hook waiting >/dev/null 2>&1 || true" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "swamp hook idle" }
+          { "type": "command", "command": "swamp hook idle >/dev/null 2>&1 || true" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Recommended (status + session name)
+
+This version extracts the Claude conversation title from the hook's JSON stdin
+and displays it in the AI status panel:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); swamp hook waiting --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); swamp hook idle --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+          }
         ]
       }
     ]

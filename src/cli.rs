@@ -53,6 +53,9 @@ pub enum Cmd {
         /// Path inside the worktree (default: cwd).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Claude Code session/conversation name.
+        #[arg(long)]
+        session_name: Option<String>,
     },
 
     /// Kill the swamp daemon and zellij session for this repo.

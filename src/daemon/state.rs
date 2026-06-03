@@ -24,6 +24,8 @@ impl Default for AgentStatus {
 pub struct AgentRecord {
     pub status: AgentStatus,
     pub ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,8 @@ pub struct WorktreeRow {
     pub rebase: bool,
     pub agent: AgentStatus,
     pub agent_ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,21 +93,28 @@ impl DaemonState {
         Ok(())
     }
 
-    pub fn apply_hook(&mut self, wt_name: &str, status: &str) -> Result<()> {
+    pub fn apply_hook(&mut self, wt_name: &str, status: &str, session_name: Option<&str>) -> Result<()> {
         let agent_status = match status.to_lowercase().as_str() {
             "working" => AgentStatus::Working,
             "waiting" => AgentStatus::Waiting,
             "idle" | "done" | "stop" => AgentStatus::Idle,
             other => anyhow::bail!("unknown status: {}", other),
         };
+        let existing = self.agents.get(wt_name);
+        let session = session_name
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| existing.and_then(|r| r.session_name.clone()));
         let rec = AgentRecord {
             status: agent_status,
             ts: now_unix(),
+            session_name: session,
         };
         self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
             row.agent = rec.status;
             row.agent_ts = rec.ts;
+            row.session_name = rec.session_name;
         }
         Ok(())
     }
@@ -145,6 +156,7 @@ mod tests {
             rebase: false,
             agent: AgentStatus::Idle,
             agent_ts: 0,
+            session_name: None,
         }
     }
 
@@ -178,7 +190,7 @@ mod tests {
         };
         state.rows.insert("main".into(), make_row("main"));
 
-        state.apply_hook("main", "working").unwrap();
+        state.apply_hook("main", "working", None).unwrap();
         let snap = state.snapshot();
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].agent, AgentStatus::Working);
@@ -196,7 +208,7 @@ mod tests {
         state.rows.insert("main".into(), make_row("main"));
 
         // "ghost" does not exist in rows; apply_hook must not crash.
-        state.apply_hook("ghost", "working").unwrap();
+        state.apply_hook("ghost", "working", None).unwrap();
         let snap = state.snapshot();
         // "main" row is untouched; no new row for "ghost".
         assert_eq!(snap.rows.len(), 1);
@@ -225,5 +237,6 @@ fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow 
         rebase: info.rebase,
         agent: agent.status,
         agent_ts: agent.ts,
+        session_name: agent.session_name.clone(),
     }
 }
