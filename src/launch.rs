@@ -211,6 +211,9 @@ fn write_multi_tab_layout(
     s.push_str("      plugin location=\"tab-bar\"\n");
     s.push_str("    }\n");
     s.push_str("    children\n");
+    s.push_str("    pane size=2 borderless=true {\n");
+    s.push_str("      plugin location=\"status-bar\"\n");
+    s.push_str("    }\n");
     s.push_str("  }\n");
 
     if bare {
@@ -358,6 +361,9 @@ fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     s.push_str("layout {\n");
     s.push_str("  pane_template name=\"default\" {\n");
     s.push_str("    children\n");
+    s.push_str("    pane size=2 borderless=true {\n");
+    s.push_str("      plugin location=\"status-bar\"\n");
+    s.push_str("    }\n");
     s.push_str("  }\n");
     s.push_str("  default {\n");
     push_dashboard_panes(&mut s, cfg, &swamp_bin);
