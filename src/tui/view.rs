@@ -672,6 +672,8 @@ fn build_row<'a>(
     let row = Row::new(vec![idx_cell, agent_cell, pr_cell, name_cell, branch_cell, git_cell, age_cell]);
     if i == app.selected {
         row.style(Theme::selected())
+    } else if is_current {
+        row.style(Theme::current())
     } else {
         row
     }
