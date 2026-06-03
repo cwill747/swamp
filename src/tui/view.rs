@@ -500,8 +500,8 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
         rows,
         [
             Constraint::Length(2),  // PR state icon
-            Constraint::Length(6),  // #number
-            Constraint::Length(7),  // checks
+            Constraint::Min(6),    // #number
+            Constraint::Min(7),    // checks
             Constraint::Min(10),   // branch
             Constraint::Min(10),   // title
         ],
