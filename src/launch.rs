@@ -8,7 +8,6 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 const LAYOUT_WORKTREE: &str = "swamp";
-const LAYOUT_DASHBOARD: &str = "swamp-dashboard";
 
 /// Returns `true` when `running` differs from `mine` (i.e. the daemon was
 /// started by a different swamp build).  Simple equality for now; unit-tested
@@ -80,7 +79,7 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
     let cfg = config::ensure_configs()?;
 
     if zellij::in_zellij() {
-        spawn_into_existing(&target, bare, &worktrees, &session, &git_dir)
+        spawn_into_existing(&target, bare, &worktrees, &session, &git_dir, &cfg)
     } else {
         spawn_new_session(&target, bare, &worktrees, &session, &cfg)
     }
@@ -92,12 +91,17 @@ fn spawn_into_existing(
     worktrees: &[Worktree],
     _session: &str,
     git_dir: &Path,
+    cfg: &ConfigPaths,
 ) -> Result<()> {
     if bare {
         let dashboard_cwd = find_default_worktree(worktrees, git_dir)
             .map(|w| w.path.as_path())
             .unwrap_or(target);
-        zellij::new_tab(LAYOUT_DASHBOARD, dashboard_cwd, "dashboard")?;
+        let layout = write_dashboard_layout(cfg)?;
+        let layout_str = layout.to_string_lossy().to_string();
+        let res = zellij::new_tab(&layout_str, dashboard_cwd, "dashboard");
+        let _ = std::fs::remove_file(&layout);
+        res?;
     }
     for wt in worktrees {
         zellij::new_tab(LAYOUT_WORKTREE, &wt.path, &wt.name())?;
@@ -344,9 +348,29 @@ mod tests {
     }
 }
 
-fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
+fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
+    let swamp_bin = std::env::current_exe()
+        .context("resolve current executable")?
+        .display()
+        .to_string();
+    let tmp = std::env::temp_dir().join(format!("swamp-dashboard-{}.kdl", std::process::id()));
+    let mut s = String::new();
+    s.push_str("layout {\n");
+    s.push_str("  pane_template name=\"default\" {\n");
+    s.push_str("    children\n");
+    s.push_str("  }\n");
+    s.push_str("  default {\n");
+    push_dashboard_panes(&mut s, cfg, &swamp_bin);
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    std::fs::write(&tmp, s)?;
+    Ok(tmp)
+}
+
+fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
+    let starship_cfg = cfg.starship.display();
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="50%" {{
+      pane split_direction="horizontal" size="33%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "worktrees"
           name "worktrees"
@@ -356,7 +380,7 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
           name "resources"
         }}
       }}
-      pane split_direction="horizontal" size="50%" {{
+      pane split_direction="horizontal" size="34%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "ai-status"
           name "ai-status"
@@ -365,6 +389,10 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
           args "tui" "--view" "pr-status"
           name "pr-status"
         }}
+      }}
+      pane command="fish" size="33%" {{
+        args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command bash -c 'exec fish'; else; exec nix develop --command bash -c 'exec fish'; end; else; exec fish; end"
+        name "shell"
       }}
     }}
 "#));
