@@ -63,7 +63,7 @@ fn render_all(f: &mut Frame, app: &mut AppState) {
     // Main content: two columns.
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(outer[1]);
 
     // Left column: worktree table (top) + resources (bottom).
