@@ -374,9 +374,7 @@ fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
         Span::styled("COMMAND", Theme::muted()),
     ]));
 
-    // Per-process rows (top N by CPU; cap to area height).
-    let max_rows = area.height.saturating_sub(2 /* borders */ + 4 /* header lines */) as usize;
-    for p in res.procs.iter().take(max_rows) {
+    for p in &res.procs {
         lines.push(Line::from(vec![
             Span::raw(format!("{:>6}  ", p.pid)),
             Span::styled(
@@ -393,7 +391,17 @@ fn render_resources(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
         ]));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(
+        Paragraph::new(lines).block(block).scroll((app.resource_scroll, 0)),
+        area,
+    );
+}
+
+pub fn resource_line_count(res: &resources::Snapshot) -> u16 {
+    if res.session_pid.is_none() && res.procs.is_empty() {
+        return 0;
+    }
+    (4 + res.procs.len()) as u16
 }
 
 fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {

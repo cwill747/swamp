@@ -11,7 +11,7 @@ use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -31,6 +31,7 @@ pub struct AppState {
     pub pending_delete: Option<String>,
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
+    pub resource_scroll: u16,
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -47,14 +48,14 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
 
     enable_raw_mode()?;
     let mut out = stdout();
-    crossterm::execute!(out, EnterAlternateScreen)?;
+    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
     let res = event_loop(&mut terminal, &common, repo_name, view).await;
 
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
 }
@@ -151,6 +152,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         pending_delete: None,
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
+        resource_scroll: 0,
     };
 
     terminal.draw(|f| view::render(f, &app))?;
@@ -201,16 +203,32 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         return Ok(());
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
-                        if !app.snapshot.rows.is_empty() {
+                        if app.view == TuiView::Resources {
+                            let max = view::resource_line_count(&app.resources);
+                            app.resource_scroll = (app.resource_scroll + 1).min(max);
+                        } else if !app.snapshot.rows.is_empty() {
                             app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        app.selected = app.selected.saturating_sub(1);
+                        if app.view == TuiView::Resources {
+                            app.resource_scroll = app.resource_scroll.saturating_sub(1);
+                        } else {
+                            app.selected = app.selected.saturating_sub(1);
+                        }
                     }
-                    KeyCode::Char('g') => app.selected = 0,
+                    KeyCode::Char('g') => {
+                        if app.view == TuiView::Resources {
+                            app.resource_scroll = 0;
+                        } else {
+                            app.selected = 0;
+                        }
+                    }
                     KeyCode::Char('G') => {
-                        if !app.snapshot.rows.is_empty() {
+                        if app.view == TuiView::Resources {
+                            let max = view::resource_line_count(&app.resources);
+                            app.resource_scroll = max;
+                        } else if !app.snapshot.rows.is_empty() {
                             app.selected = app.snapshot.rows.len() - 1;
                         }
                     }
@@ -248,6 +266,16 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     _ => {}
                 }
             }
+            AppEvent::Input(Event::Mouse(m)) => match m.kind {
+                MouseEventKind::ScrollDown => {
+                    let max = view::resource_line_count(&app.resources);
+                    app.resource_scroll = (app.resource_scroll + 3).min(max);
+                }
+                MouseEventKind::ScrollUp => {
+                    app.resource_scroll = app.resource_scroll.saturating_sub(3);
+                }
+                _ => {}
+            },
             AppEvent::Input(_) => {}
         }
         terminal.draw(|f| view::render(f, &app))?;
