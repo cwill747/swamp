@@ -94,7 +94,7 @@ mod tests {
     fn ensure_configs_returns_expected_paths() {
         // Point XDG_CONFIG_HOME at a temp dir so we don't pollute the real one.
         let base = tmp_dir();
-        std::env::set_var("XDG_CONFIG_HOME", &base);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let paths = ensure_configs().unwrap();
         assert_eq!(paths.starship, base.join("swamp").join("starship.toml"));
         assert_eq!(paths.lazygit, base.join("swamp").join("lazygit.yml"));
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn ensure_configs_idempotent() {
         let base = tmp_dir();
-        std::env::set_var("XDG_CONFIG_HOME", &base);
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         ensure_configs().unwrap();
         // Second call must not error and paths must still exist.
         let paths = ensure_configs().unwrap();
