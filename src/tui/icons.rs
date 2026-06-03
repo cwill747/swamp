@@ -56,3 +56,15 @@ pub fn check_success() -> &'static str {
 pub fn check_failure() -> &'static str {
     if ascii_mode() { "x" } else { "\u{f057}" }
 }
+
+pub fn review_commented() -> &'static str {
+    if ascii_mode() { "c" } else { "\u{f075}" }
+}
+
+pub fn review_changes() -> &'static str {
+    if ascii_mode() { "!" } else { "\u{f075}" }
+}
+
+pub fn review_approved() -> &'static str {
+    if ascii_mode() { "A" } else { "\u{f00c}" }
+}

@@ -13,6 +13,14 @@ pub enum CheckState {
     Pending { passed: u32, total: u32 },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    Commented,
+    ReviewRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct CheckMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +44,8 @@ pub struct PrSummary {
     pub check_meta: Option<CheckMeta>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewDecision>,
 }
 
 // --- Internal types ---
@@ -74,6 +84,8 @@ struct PrBatchItem {
     #[serde(rename = "headRefName")]
     head_ref_name: String,
     url: String,
+    #[serde(rename = "reviewDecision", default)]
+    review_decision: Option<String>,
     #[serde(rename = "statusCheckRollup", default)]
     status_check_rollup: Vec<CheckRollupItem>,
 }
@@ -111,7 +123,21 @@ struct GraphqlPrNode {
     #[serde(rename = "headRefName")]
     head_ref_name: String,
     url: String,
+    #[serde(rename = "reviewDecision")]
+    review_decision: Option<String>,
+    #[serde(rename = "latestReviews")]
+    latest_reviews: Option<GraphqlReviews>,
     commits: GraphqlCommits,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlReviews {
+    nodes: Vec<GraphqlReviewNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlReviewNode {
+    state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,7 +272,8 @@ fn build_branch_fragment(alias: &str, branch: &str) -> String {
     format!(
         r#"    {alias}: pullRequests(headRefName: "{escaped}", first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
-        number title state isDraft headRefName url
+        number title state isDraft headRefName url reviewDecision
+        latestReviews(first: 10) {{ nodes {{ state }} }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{
           nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt }} ... on StatusContext {{ context state createdAt }} }}
         }} }} }} }} }}
@@ -343,6 +370,10 @@ fn list_prs_for_branches_graphql(
                 .unwrap_or_default();
 
             let (checks, check_meta) = aggregate_checks(&check_items);
+            let review = compute_review(
+                node.review_decision.as_deref(),
+                node.latest_reviews.as_ref(),
+            );
             map.insert(
                 node.head_ref_name,
                 PrSummary {
@@ -353,6 +384,7 @@ fn list_prs_for_branches_graphql(
                     checks,
                     check_meta,
                     url: Some(node.url),
+                    review,
                 },
             );
         }
@@ -378,7 +410,7 @@ fn list_prs_for_branches_rest(
                 "--state",
                 "all",
                 "--json",
-                "number,title,state,isDraft,headRefName,url,statusCheckRollup",
+                "number,title,state,isDraft,headRefName,url,statusCheckRollup,reviewDecision",
                 "--limit",
                 "1",
             ])
@@ -399,6 +431,7 @@ fn list_prs_for_branches_rest(
 
         if let Some(pr) = prs.into_iter().next() {
             let (checks, check_meta) = aggregate_checks(&pr.status_check_rollup);
+            let review = parse_review_decision(pr.review_decision.as_deref());
             map.insert(
                 pr.head_ref_name,
                 PrSummary {
@@ -409,6 +442,7 @@ fn list_prs_for_branches_rest(
                     checks,
                     check_meta,
                     url: Some(pr.url),
+                    review,
                 },
             );
         }
@@ -460,6 +494,56 @@ fn parse_github_timestamp(s: &str) -> Option<u64> {
 
 fn is_leap_year(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn compute_review(
+    decision: Option<&str>,
+    latest_reviews: Option<&GraphqlReviews>,
+) -> Option<ReviewDecision> {
+    match decision {
+        Some("APPROVED") => return Some(ReviewDecision::Approved),
+        Some("CHANGES_REQUESTED") => return Some(ReviewDecision::ChangesRequested),
+        _ => {}
+    }
+
+    if let Some(reviews) = latest_reviews {
+        let mut has_approved = false;
+        let mut has_changes = false;
+        let mut has_commented = false;
+
+        for r in &reviews.nodes {
+            match r.state.as_deref() {
+                Some("APPROVED") => has_approved = true,
+                Some("CHANGES_REQUESTED") => has_changes = true,
+                Some("COMMENTED" | "DISMISSED") => has_commented = true,
+                _ => {}
+            }
+        }
+
+        if has_changes {
+            return Some(ReviewDecision::ChangesRequested);
+        }
+        if has_approved {
+            return Some(ReviewDecision::Approved);
+        }
+        if has_commented {
+            return Some(ReviewDecision::Commented);
+        }
+    }
+
+    match decision {
+        Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
+}
+
+fn parse_review_decision(s: Option<&str>) -> Option<ReviewDecision> {
+    match s? {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
 }
 
 fn aggregate_checks(checks: &[CheckRollupItem]) -> (Option<CheckState>, Option<CheckMeta>) {

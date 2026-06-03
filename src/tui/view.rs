@@ -4,7 +4,7 @@ use super::AppState;
 use crate::daemon::resources;
 use crate::cli::TuiView;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
-use crate::github::{CheckState, PrSummary};
+use crate::github::{CheckState, PrSummary, ReviewDecision};
 use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -480,6 +480,8 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             Cell::from("")
         };
 
+        let review_cell = review_status_cell(&pr.review);
+
         let branch_cell = Cell::from(Span::styled(
             truncate(branch, 20),
             Style::default().fg(Theme::BRANCH),
@@ -491,6 +493,7 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             state_cell,
             number_cell,
             checks_cell,
+            review_cell,
             branch_cell,
             title_cell,
         ]));
@@ -502,6 +505,7 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             Constraint::Length(2),  // PR state icon
             Constraint::Min(6),    // #number
             Constraint::Min(7),    // checks
+            Constraint::Length(2),  // review
             Constraint::Min(10),   // branch
             Constraint::Min(10),   // title
         ],
@@ -525,6 +529,24 @@ fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
         }
     };
     (icon, color)
+}
+
+fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
+    match review {
+        Some(ReviewDecision::Approved) => Cell::from(Span::styled(
+            icons::review_approved(),
+            Style::default().fg(Color::Green),
+        )),
+        Some(ReviewDecision::ChangesRequested) => Cell::from(Span::styled(
+            icons::review_changes(),
+            Style::default().fg(Color::Red),
+        )),
+        Some(ReviewDecision::Commented) => Cell::from(Span::styled(
+            icons::review_commented(),
+            Style::default().fg(Color::Yellow),
+        )),
+        _ => Cell::from(""),
+    }
 }
 
 fn check_state_icon_color(checks: &CheckState, spinner_frame: usize) -> (String, Color) {
@@ -595,7 +617,29 @@ fn build_row<'a>(
 
     let pr_cell = if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
         let (icon, color) = pr_state_icon_color(pr);
-        Cell::from(Span::styled(icon, Style::default().fg(color)))
+        let mut spans = vec![Span::styled(icon, Style::default().fg(color))];
+        match &pr.review {
+            Some(ReviewDecision::ChangesRequested) => {
+                spans.push(Span::styled(
+                    icons::review_changes(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Some(ReviewDecision::Commented) => {
+                spans.push(Span::styled(
+                    icons::review_commented(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Some(ReviewDecision::Approved) => {
+                spans.push(Span::styled(
+                    icons::review_approved(),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            _ => {}
+        }
+        Cell::from(Line::from(spans))
     } else {
         Cell::from(Span::raw(" "))
     };
