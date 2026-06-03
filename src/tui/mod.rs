@@ -33,6 +33,21 @@ pub struct AppState {
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
     pub resource_viewport_height: u16,
+    pub current_tab: Option<String>,
+}
+
+impl AppState {
+    fn pin_snapshot(&mut self) {
+        if self.view != TuiView::Worktrees {
+            return;
+        }
+        if let Some(ref tab) = self.current_tab {
+            if let Some(pos) = self.snapshot.rows.iter().position(|r| &r.name == tab) {
+                let row = self.snapshot.rows.remove(pos);
+                self.snapshot.rows.insert(0, row);
+            }
+        }
+    }
 }
 
 pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
@@ -155,6 +170,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
         resource_viewport_height: 0,
+        current_tab: std::env::var("ZELLIJ_TAB_NAME").ok(),
     };
 
     terminal.draw(|f| view::render(f, &mut app))?;
@@ -163,6 +179,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         match evt {
             AppEvent::Snapshot(s) => {
                 app.snapshot = s;
+                app.pin_snapshot();
                 if app.selected >= app.snapshot.rows.len() {
                     app.selected = app.snapshot.rows.len().saturating_sub(1);
                 }

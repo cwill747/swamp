@@ -104,29 +104,15 @@ fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
 
 fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let now = now_unix();
-    let current_tab = std::env::var("ZELLIJ_TAB_NAME").ok();
+    let current_tab = app.current_tab.as_deref();
     let pin_current = app.view == TuiView::Worktrees;
 
-    let ordered: Vec<&WorktreeRow> = if pin_current {
-        let ct = current_tab.as_deref();
-        let mut pinned: Vec<&WorktreeRow> = Vec::new();
-        let mut rest: Vec<&WorktreeRow> = Vec::new();
-        for r in &app.snapshot.rows {
-            if ct.map(|t| t == r.name).unwrap_or(false) {
-                pinned.push(r);
-            } else {
-                rest.push(r);
-            }
-        }
-        pinned.into_iter().chain(rest).collect()
-    } else {
-        app.snapshot.rows.iter().collect()
-    };
-
-    let rows: Vec<Row> = ordered
+    let rows: Vec<Row> = app
+        .snapshot
+        .rows
         .iter()
         .enumerate()
-        .map(|(i, r)| build_row(i, r, app, now, current_tab.as_deref(), pin_current))
+        .map(|(i, r)| build_row(i, r, app, now, current_tab, pin_current))
         .collect();
 
     let table = Table::new(
