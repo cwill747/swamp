@@ -35,6 +35,39 @@
           default = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          static =
+            if pkgs.stdenv.isLinux then
+              let
+                craneLibStatic = crane.mkLib pkgs.pkgsStatic;
+                staticSrc = pkgs.lib.cleanSourceWith {
+                  src = ./.;
+                  filter = path: type:
+                    (pkgs.lib.hasSuffix ".yml" path)
+                    || (pkgs.lib.hasSuffix ".toml" path)
+                    || (craneLibStatic.filterCargoSources path type);
+                };
+                staticArgs = {
+                  src = staticSrc;
+                  pname = "swamp";
+                  version = self.shortRev or self.dirtyShortRev or "dev";
+                  nativeBuildInputs = [ pkgs.pkg-config ];
+                  strictDeps = true;
+                };
+                staticCargoArtifacts = craneLibStatic.buildDepsOnly staticArgs;
+              in
+              craneLibStatic.buildPackage (staticArgs // {
+                cargoArtifacts = staticCargoArtifacts;
+              })
+            else
+              craneLib.buildPackage (commonArgs // {
+                inherit cargoArtifacts;
+                postFixup = ''
+                  for lib in $(otool -L $out/bin/swamp | awk '/\/nix\/store.*libiconv/ {print $1}'); do
+                    install_name_tool -change "$lib" /usr/lib/libiconv.2.dylib $out/bin/swamp
+                  done
+                '';
+              });
         });
 
       devShells = forAllSystems (_: pkgs: {
