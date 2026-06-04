@@ -99,8 +99,12 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         tx: tx.clone(),
     });
 
-    // Initial scan.
-    daemon.refresh_all().await?;
+    // Bind the control socket *before* the first state scan. The TUI waits
+    // only ~2s for this socket to appear; gating it behind a full worktree scan
+    // (slow on a cold cache or a large monorepo) makes every dashboard pane time
+    // out at once. Binding first also lets concurrent `swamp serve` spawns lose
+    // immediately via EADDRINUSE instead of each grinding through a scan.
+    let listener = bind_and_kickoff(&daemon, &common, &sock)?;
 
     // Watcher task.
     {
@@ -217,10 +221,6 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         });
     }
 
-    let listener = UnixListener::bind(&sock).context("bind socket")?;
-    std::fs::write(pid_path(&common), std::process::id().to_string())?;
-    tracing::info!("swamp daemon listening on {}", sock.display());
-
     loop {
         let (stream, _) = listener.accept().await?;
         let d = daemon.clone();
@@ -230,6 +230,28 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             }
         });
     }
+}
+
+/// Bind the daemon's control socket, record the pid, and kick off the first
+/// state scan in the background. The scan is deliberately *not* awaited here so
+/// the socket is reachable the instant this returns; see the call site in
+/// `serve` for why that ordering matters.
+fn bind_and_kickoff(daemon: &Arc<Daemon>, common: &Path, sock: &Path) -> Result<UnixListener> {
+    let listener = UnixListener::bind(sock).context("bind socket")?;
+    let pid = pid_path(common);
+    if let Some(parent) = pid.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(pid, std::process::id().to_string())?;
+    tracing::info!("swamp daemon listening on {}", sock.display());
+
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = d.refresh_all().await {
+            tracing::warn!("initial refresh: {e:?}");
+        }
+    });
+    Ok(listener)
 }
 
 impl Daemon {
@@ -282,4 +304,92 @@ async fn probe(sock: &Path) -> Result<()> {
     s.write_all(&(msg.len() as u32).to_be_bytes()).await?;
     s.write_all(&msg).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::state::DaemonState;
+    use std::process::Command as StdCommand;
+
+    fn git_available() -> bool {
+        StdCommand::new("git").arg("--version").output().is_ok()
+    }
+
+    fn git_init_repo() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("swamp-bind-test-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let ok = StdCommand::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    async fn build_daemon(common: &Path) -> Arc<Daemon> {
+        Arc::new(Daemon {
+            common_dir: common.to_path_buf(),
+            session_name: "test".into(),
+            state: Arc::new(RwLock::new(DaemonState::load(common).await.unwrap())),
+            resources: Arc::new(RwLock::new(resources::Snapshot::default())),
+            tx: broadcast::channel(64).0,
+        })
+    }
+
+    /// The control socket must come up before the initial git scan runs, so the
+    /// TUI's ~2s readiness wait can't trip on a slow scan. We prove the scan is
+    /// deferred (rows are still empty the instant the socket is bound) and that
+    /// it later populates in the background. A current-thread runtime guarantees
+    /// the spawned scan can't have run before the synchronous `try_read`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_happens_before_initial_scan() {
+        if !git_available() {
+            eprintln!("skipping bind_happens_before_initial_scan: git not on PATH");
+            return;
+        }
+        let repo = git_init_repo();
+        let common = git_common_dir(&repo).unwrap();
+        let daemon = build_daemon(&common).await;
+        let sock = repo.join("test.sock");
+
+        let listener = bind_and_kickoff(&daemon, &common, &sock).unwrap();
+
+        assert!(sock.exists(), "socket should be bound immediately");
+        assert!(
+            daemon.state.try_read().unwrap().rows.is_empty(),
+            "initial scan must be deferred, not awaited before bind"
+        );
+        // A racing second `serve` loses fast instead of running its own scan.
+        assert!(UnixListener::bind(&sock).is_err(), "second bind must fail");
+
+        let mut populated = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !daemon.state.read().await.rows.is_empty() {
+                populated = true;
+                break;
+            }
+        }
+        assert!(populated, "background scan should populate the worktree row");
+
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(pid_path(&common));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }
