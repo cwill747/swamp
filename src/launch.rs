@@ -6,6 +6,7 @@ use crate::zellij;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Returns `true` when `running` differs from `mine` (i.e. the daemon was
 /// started by a different swamp build).  Simple equality for now; unit-tested
@@ -179,6 +180,7 @@ fn write_multi_tab_layout(
         .display()
         .to_string();
     let tmp = std::env::temp_dir().join(format!("swamp-layout-{}.kdl", std::process::id()));
+    let nix = nix_available();
     let mut s = String::new();
     s.push_str("layout {\n");
     s.push_str("  default_tab_template {\n");
@@ -196,7 +198,7 @@ fn write_multi_tab_layout(
             "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
             session_cwd(worktrees, git_dir),
         ));
-        push_dashboard_panes(&mut s, cfg, &swamp_bin);
+        push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
         s.push_str("  }\n");
     }
 
@@ -208,7 +210,7 @@ fn write_multi_tab_layout(
             focus,
             wt.path.display()
         ));
-        push_worktree_panes(&mut s, cfg, &swamp_bin);
+        push_worktree_panes(&mut s, cfg, &swamp_bin, nix);
         s.push_str("  }\n");
     }
     s.push_str("}\n");
@@ -339,13 +341,21 @@ mod tests {
         let fish = Shell { path: "/usr/bin/fish".into(), run_flag: "-C", is_fish: true };
         let bash = Shell { path: "/bin/bash".into(), run_flag: "-c", is_fish: false };
 
-        let f = nix_entry(&fish, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
+        let f = nix_entry(&fish, true, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
         assert!(f.contains("if test -f flake.nix") && f.trim_end().ends_with("end"), "fish dialect; got:\n{f}");
         assert!(!f.contains("STARSHIP"), "starship glue is gone; got:\n{f}");
 
-        let b = nix_entry(&bash, "bash -c 'exec /bin/bash'", "/bin/bash");
+        let b = nix_entry(&bash, true, "bash -c 'exec /bin/bash'", "/bin/bash");
         assert!(b.contains("if [ -f flake.nix ]") && b.trim_end().ends_with("fi"), "posix dialect; got:\n{b}");
         assert!(!b.contains("set -gx") && !b.contains("STARSHIP"), "no fish syntax / no starship; got:\n{b}");
+
+        // With nix absent from PATH (`nix=false`), no detection is emitted —
+        // just a bare direct exec, in either dialect (#34).
+        let nf = nix_entry(&fish, false, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
+        assert_eq!(nf, "exec /usr/bin/fish", "no-nix fish glue is a bare exec; got:\n{nf}");
+        let nb = nix_entry(&bash, false, "bash -c 'exec /bin/bash'", "/bin/bash");
+        assert_eq!(nb, "exec /bin/bash", "no-nix posix glue is a bare exec; got:\n{nb}");
+        assert!(!nf.contains("nix develop") && !nb.contains("nix develop"), "no nix develop when nix absent");
     }
 
     #[test]
@@ -354,14 +364,20 @@ mod tests {
         // SAFETY: single-threaded test; no other thread reads the environment here.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
-        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp");
+        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp", true);
         assert!(s.contains("command=\"/bin/bash\""), "panes should launch $SHELL; got:\n{s}");
         assert!(!s.contains("command=\"fish\""), "no hardcoded fish command; got:\n{s}");
         assert!(!s.contains("STARSHIP"), "starship injection is gone; got:\n{s}");
         // The interactive panes (lazygit, claude, shell) all run via `-c`.
         assert!(s.contains("args \"-c\""), "bash panes use -c; got:\n{s}");
-        // nix auto-entry is preserved for the shell/claude panes.
+        // nix auto-entry is preserved for the shell/claude panes when nix is present.
         assert!(s.contains("nix develop"), "nix auto-entry retained; got:\n{s}");
+
+        // With nix absent (`nix=false`), no pane emits nix-entry glue (#34).
+        let mut sn = String::new();
+        push_worktree_panes(&mut sn, &dummy_cfg(), "/usr/bin/swamp", false);
+        assert!(!sn.contains("nix develop"), "no nix develop when nix absent; got:\n{sn}");
+        assert!(sn.contains("exec /bin/bash"), "shell pane execs $SHELL directly; got:\n{sn}");
     }
 }
 
@@ -391,7 +407,7 @@ fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     s.push_str("    }\n");
     s.push_str("  }\n");
     s.push_str("  tab {\n");
-    push_worktree_panes(&mut s, cfg, &swamp_bin);
+    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available());
     s.push_str("  }\n");
     s.push_str("}\n");
     std::fs::write(&tmp, s)?;
@@ -424,10 +440,36 @@ fn user_shell() -> Shell {
     }
 }
 
+/// Whether a `nix` executable is resolvable on `$PATH`. Checked once per
+/// process and cached — "decide once when the session spins up" (#34). On a
+/// host without nix we skip the `nix develop` glue entirely rather than emit
+/// shell that would fail with `nix: command not found` inside any repo that
+/// happens to carry a `flake.nix`.
+fn nix_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|d| {
+                // `metadata()` follows symlinks, so a `~/.nix-profile/bin/nix`
+                // link resolves; require a regular-ish file with an execute bit
+                // so a stale non-executable `nix` placeholder isn't mistaken for
+                // a usable install.
+                std::fs::metadata(d.join("nix"))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+        })
+    })
+}
+
 /// Glue that drops into the nix dev shell when a flake/shell.nix/default.nix is
 /// present and `exec`s `in_nix` there, otherwise `exec`s `direct` directly.
-/// Written in `shell`'s dialect (fish vs POSIX).
-fn nix_entry(shell: &Shell, in_nix: &str, direct: &str) -> String {
+/// Written in `shell`'s dialect (fish vs POSIX). When `nix` is `false` (no nix
+/// on `$PATH`) the whole detection is skipped and we just `exec` `direct`.
+fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
+    if !nix {
+        return format!("exec {direct}");
+    }
     if shell.is_fish {
         format!(
             "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
@@ -445,9 +487,9 @@ fn nix_entry(shell: &Shell, in_nix: &str, direct: &str) -> String {
     }
 }
 
-fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
+fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
     let sh = user_shell();
-    let shell_glue = nix_entry(&sh, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="33%" {{
         pane command="{swamp_bin}" size="50%" {{
@@ -477,7 +519,7 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
 "#, shell_path = sh.path, run_flag = sh.run_flag));
 }
 
-fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
+fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
     let lazygit_cfg = cfg.lazygit.display().to_string();
     let sh = user_shell();
 
@@ -494,9 +536,9 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
     } else {
         "cp=$(command -v claude); "
     };
-    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, "$cp", "$cp"));
+    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, nix, "$cp", "$cp"));
 
-    let shell_glue = nix_entry(&sh, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
 
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="50%" {{
