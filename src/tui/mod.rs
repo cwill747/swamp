@@ -297,9 +297,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             .collect();
                         app.pending_create = true;
                         app.create_input_received = false;
+                        let cwd = app.snapshot.rows.first()
+                            .map(|r| r.path.clone())
+                            .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
                         let _ = zellij::run_floating(
                             "git",
                             &["wt", "add"],
+                            &cwd,
                             "60%", "40%",
                         );
                     }
@@ -307,9 +311,16 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
                             let name = row.name.clone();
                             app.pending_delete = Some(name.clone());
+                            // Run from a *different* worktree — removing the one
+                            // we're cd'd into would yank the shell's cwd.
+                            let cwd = app.snapshot.rows.iter()
+                                .find(|r| r.name != name)
+                                .map(|r| r.path.clone())
+                                .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
                             let _ = zellij::run_floating(
                                 "git",
                                 &["wt", "remove", &name],
+                                &cwd,
                                 "60%", "40%",
                             );
                         }
