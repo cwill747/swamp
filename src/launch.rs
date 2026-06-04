@@ -76,41 +76,11 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
 
     let cfg = config::ensure_configs()?;
 
-    if zellij::in_zellij() {
-        spawn_into_existing(&target, bare, &worktrees, &session, &git_dir, &cfg)
-    } else {
-        spawn_new_session(&target, bare, &worktrees, &session, &cfg)
-    }
-}
-
-fn spawn_into_existing(
-    target: &Path,
-    bare: bool,
-    worktrees: &[Worktree],
-    _session: &str,
-    git_dir: &Path,
-    cfg: &ConfigPaths,
-) -> Result<()> {
-    if bare {
-        let dashboard_cwd = find_default_worktree(worktrees, git_dir)
-            .map(|w| w.path.as_path())
-            .unwrap_or(target);
-        let layout = write_dashboard_layout(cfg)?;
-        let layout_str = layout.to_string_lossy().to_string();
-        let res = zellij::new_tab(&layout_str, dashboard_cwd, "dashboard");
-        let _ = std::fs::remove_file(&layout);
-        res?;
-    }
-    let wt_layout = write_worktree_layout(cfg)?;
-    let wt_layout_str = wt_layout.to_string_lossy().to_string();
-    let res = (|| {
-        for wt in worktrees {
-            zellij::new_tab(&wt_layout_str, &wt.path, &wt.name())?;
-        }
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(&wt_layout);
-    res
+    // When launched from inside an existing zellij session, create a *nested*
+    // session rather than dumping tabs into the host session. `nested` causes
+    // the spawned zellij to have ZELLIJ unset so it doesn't refuse to nest.
+    let nested = zellij::in_zellij();
+    spawn_new_session(&target, bare, &worktrees, &session, &cfg, nested)
 }
 
 fn spawn_new_session(
@@ -119,6 +89,7 @@ fn spawn_new_session(
     worktrees: &[Worktree],
     session: &str,
     cfg: &ConfigPaths,
+    nested: bool,
 ) -> Result<()> {
     // Reuse an existing session if one already matches this repo's name —
     // but first check whether the running daemon is stale.
@@ -174,14 +145,14 @@ fn spawn_new_session(
                 crate::kill::run(Some(target.to_path_buf()))?;
                 // Fall through to fresh launch below.
             } else {
-                return zellij::attach(session);
+                return zellij::attach(session, nested);
             }
         }
     }
 
     let git_dir = resolve_git_dir(target);
     let layout_path = write_multi_tab_layout(bare, worktrees, session, cfg, &git_dir)?;
-    let res = zellij::new_session_with_layout(&layout_path, target, session);
+    let res = zellij::new_session_with_layout(&layout_path, target, session, nested);
     let _ = std::fs::remove_file(&layout_path);
     res
 }
@@ -392,28 +363,6 @@ mod tests {
         // nix auto-entry is preserved for the shell/claude panes.
         assert!(s.contains("nix develop"), "nix auto-entry retained; got:\n{s}");
     }
-}
-
-fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
-    let swamp_bin = std::env::current_exe()
-        .context("resolve current executable")?
-        .display()
-        .to_string();
-    let tmp = std::env::temp_dir().join(format!("swamp-dashboard-{}.kdl", std::process::id()));
-    let mut s = String::new();
-    s.push_str("layout {\n");
-    s.push_str("  pane_template name=\"default\" {\n");
-    s.push_str("    children\n");
-    s.push_str("    pane size=2 borderless=true {\n");
-    s.push_str("      plugin location=\"status-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("  }\n");
-    s.push_str("  default {\n");
-    push_dashboard_panes(&mut s, cfg, &swamp_bin);
-    s.push_str("  }\n");
-    s.push_str("}\n");
-    std::fs::write(&tmp, s)?;
-    Ok(tmp)
 }
 
 /// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
