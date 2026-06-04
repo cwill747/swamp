@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-const STARSHIP_CONFIG: &str = include_str!("config/starship.toml");
 const LAZYGIT_CONFIG: &str = include_str!("config/lazygit.yml");
 
 /// Resolved paths to the swamp-managed config files.
 pub struct ConfigPaths {
-    pub starship: PathBuf,
     pub lazygit: PathBuf,
 }
 
@@ -42,13 +40,11 @@ fn write_if_changed(path: &PathBuf, content: &str) -> Result<bool> {
 /// Writes only when absent or when the content differs (idempotent).
 pub fn ensure_configs() -> Result<ConfigPaths> {
     let dir = swamp_config_dir();
-    let starship = dir.join("starship.toml");
     let lazygit = dir.join("lazygit.yml");
 
-    write_if_changed(&starship, STARSHIP_CONFIG)?;
     write_if_changed(&lazygit, LAZYGIT_CONFIG)?;
 
-    Ok(ConfigPaths { starship, lazygit })
+    Ok(ConfigPaths { lazygit })
 }
 
 #[cfg(test)]
@@ -96,9 +92,7 @@ mod tests {
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let paths = ensure_configs().unwrap();
-        assert_eq!(paths.starship, base.join("swamp").join("starship.toml"));
         assert_eq!(paths.lazygit, base.join("swamp").join("lazygit.yml"));
-        assert!(paths.starship.exists());
         assert!(paths.lazygit.exists());
     }
 
@@ -109,7 +103,6 @@ mod tests {
         ensure_configs().unwrap();
         // Second call must not error and paths must still exist.
         let paths = ensure_configs().unwrap();
-        assert!(paths.starship.exists());
         assert!(paths.lazygit.exists());
     }
 }

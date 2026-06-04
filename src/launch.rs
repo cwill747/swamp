@@ -310,7 +310,6 @@ mod tests {
 
     fn dummy_cfg() -> ConfigPaths {
         ConfigPaths {
-            starship: PathBuf::from("/tmp/swamp/starship.toml"),
             lazygit: PathBuf::from("/tmp/swamp/lazygit.yml"),
         }
     }
@@ -359,6 +358,36 @@ mod tests {
             "exactly one --pin-cwd per worktree tab (none on dashboard); got:\n{content}"
         );
     }
+
+    #[test]
+    fn nix_entry_dialects() {
+        let fish = Shell { path: "/usr/bin/fish".into(), run_flag: "-C", is_fish: true };
+        let bash = Shell { path: "/bin/bash".into(), run_flag: "-c", is_fish: false };
+
+        let f = nix_entry(&fish, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
+        assert!(f.contains("if test -f flake.nix") && f.trim_end().ends_with("end"), "fish dialect; got:\n{f}");
+        assert!(!f.contains("STARSHIP"), "starship glue is gone; got:\n{f}");
+
+        let b = nix_entry(&bash, "bash -c 'exec /bin/bash'", "/bin/bash");
+        assert!(b.contains("if [ -f flake.nix ]") && b.trim_end().ends_with("fi"), "posix dialect; got:\n{b}");
+        assert!(!b.contains("set -gx") && !b.contains("STARSHIP"), "no fish syntax / no starship; got:\n{b}");
+    }
+
+    #[test]
+    fn worktree_panes_use_env_shell_not_hardcoded_fish() {
+        // Force a non-fish $SHELL and confirm the generated layout follows it.
+        // SAFETY: single-threaded test; no other thread reads the environment here.
+        unsafe { std::env::set_var("SHELL", "/bin/bash") };
+        let mut s = String::new();
+        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp");
+        assert!(s.contains("command=\"/bin/bash\""), "panes should launch $SHELL; got:\n{s}");
+        assert!(!s.contains("command=\"fish\""), "no hardcoded fish command; got:\n{s}");
+        assert!(!s.contains("STARSHIP"), "starship injection is gone; got:\n{s}");
+        // The interactive panes (lazygit, claude, shell) all run via `-c`.
+        assert!(s.contains("args \"-c\""), "bash panes use -c; got:\n{s}");
+        // nix auto-entry is preserved for the shell/claude panes.
+        assert!(s.contains("nix develop"), "nix auto-entry retained; got:\n{s}");
+    }
 }
 
 fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
@@ -383,8 +412,56 @@ fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     Ok(tmp)
 }
 
-fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
-    let starship_cfg = cfg.starship.display();
+/// The user's login shell, the basis for every interactive layout pane.
+///
+/// We launch each shell pane through `$SHELL` (falling back to bash) rather
+/// than hardcoding fish, and emit the startup glue in the matching dialect.
+struct Shell {
+    /// Path passed as the pane's `command=`.
+    path: String,
+    /// The flag that runs a command string at startup: fish uses `-C` (run,
+    /// then stay interactive); POSIX shells use `-c`.
+    run_flag: &'static str,
+    is_fish: bool,
+}
+
+fn user_shell() -> Shell {
+    let path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let is_fish = Path::new(&path)
+        .file_name()
+        .map(|n| n == "fish")
+        .unwrap_or(false);
+    Shell {
+        path,
+        run_flag: if is_fish { "-C" } else { "-c" },
+        is_fish,
+    }
+}
+
+/// Glue that drops into the nix dev shell when a flake/shell.nix/default.nix is
+/// present and `exec`s `in_nix` there, otherwise `exec`s `direct` directly.
+/// Written in `shell`'s dialect (fish vs POSIX).
+fn nix_entry(shell: &Shell, in_nix: &str, direct: &str) -> String {
+    if shell.is_fish {
+        format!(
+            "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
+             if test -f .git; exec nix develop path:. --command {in_nix}; \
+             else; exec nix develop --command {in_nix}; end; \
+             else; exec {direct}; end"
+        )
+    } else {
+        format!(
+            "if [ -f flake.nix ] || [ -f shell.nix ] || [ -f default.nix ]; then \
+             if [ -f .git ]; then exec nix develop path:. --command {in_nix}; \
+             else exec nix develop --command {in_nix}; fi; \
+             else exec {direct}; fi"
+        )
+    }
+}
+
+fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str) {
+    let sh = user_shell();
+    let shell_glue = nix_entry(&sh, &format!("bash -c 'exec {}'", sh.path), &sh.path);
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="33%" {{
         pane command="{swamp_bin}" size="50%" {{
@@ -406,21 +483,39 @@ fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
           name "pr-status"
         }}
       }}
-      pane command="fish" size="33%" {{
-        args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command bash -c 'exec fish'; else; exec nix develop --command bash -c 'exec fish'; end; else; exec fish; end"
+      pane command="{shell_path}" size="33%" {{
+        args "{run_flag}" "{shell_glue}"
         name "shell"
       }}
     }}
-"#));
+"#, shell_path = sh.path, run_flag = sh.run_flag));
 }
 
 fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
-    let lazygit_cfg = cfg.lazygit.display();
-    let starship_cfg = cfg.starship.display();
+    let lazygit_cfg = cfg.lazygit.display().to_string();
+    let sh = user_shell();
+
+    let lazygit_glue = if sh.is_fish {
+        format!("set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit")
+    } else {
+        format!("export LG_CONFIG_FILE={lazygit_cfg}; exec lazygit")
+    };
+
+    // Resolve claude on the host's PATH first, then carry that path into the
+    // nix shell (whose PATH may not include it).
+    let claude_prefix = if sh.is_fish {
+        "set -l cp (command -s claude); "
+    } else {
+        "cp=$(command -v claude); "
+    };
+    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, "$cp", "$cp"));
+
+    let shell_glue = nix_entry(&sh, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+
     s.push_str(&format!(r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="50%" {{
-        pane command="fish" size="65%" {{
-          args "-C" "set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit"
+        pane command="{shell_path}" size="65%" {{
+          args "{run_flag}" "{lazygit_glue}"
           name "lazygit"
         }}
         pane command="{swamp_bin}" size="35%" {{
@@ -429,15 +524,15 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
         }}
       }}
       pane split_direction="horizontal" size="50%" {{
-        pane command="fish" size="60%" start_suspended=true {{
-          args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; set -l cp (command -s claude); if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command $cp; else; exec nix develop --command $cp; end; else; exec $cp; end"
+        pane command="{shell_path}" size="60%" start_suspended=true {{
+          args "{run_flag}" "{claude_glue}"
           name "claude"
         }}
-        pane command="fish" size="40%" {{
-          args "-C" "set -gx STARSHIP_CONFIG {starship_cfg}; if test -f flake.nix -o -f shell.nix -o -f default.nix; if test -f .git; exec nix develop path:. --command bash -c 'exec fish'; else; exec nix develop --command bash -c 'exec fish'; end; else; exec fish; end"
+        pane command="{shell_path}" size="40%" {{
+          args "{run_flag}" "{shell_glue}"
           name "shell"
         }}
       }}
     }}
-"#));
+"#, shell_path = sh.path, run_flag = sh.run_flag));
 }
