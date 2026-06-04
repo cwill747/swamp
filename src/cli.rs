@@ -61,6 +61,10 @@ pub enum Cmd {
         /// Claude Code session/conversation name.
         #[arg(long)]
         session_name: Option<String>,
+        /// Claude Code session id (UUID). Recorded so a restarted swamp can
+        /// resume this worktree's session via `claude --resume <id>`.
+        #[arg(long)]
+        session_id: Option<String>,
     },
 
     /// Kill the swamp daemon and zellij session for this repo.

@@ -26,6 +26,11 @@ pub struct AgentRecord {
     pub ts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// Claude Code session id (UUID) for this worktree's active conversation.
+    /// Persisted so a restarted swamp can resume the same session via
+    /// `claude --resume <id>` while the worktree still exists (#33).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +100,13 @@ impl DaemonState {
         Ok(())
     }
 
-    pub fn apply_hook(&mut self, wt_name: &str, status: &str, session_name: Option<&str>) -> Result<()> {
+    pub fn apply_hook(
+        &mut self,
+        wt_name: &str,
+        status: &str,
+        session_name: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         let agent_status = match status.to_lowercase().as_str() {
             "working" => AgentStatus::Working,
             "waiting" => AgentStatus::Waiting,
@@ -107,10 +118,17 @@ impl DaemonState {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .or_else(|| existing.and_then(|r| r.session_name.clone()));
+        // Like session_name, a missing/empty session id preserves the previously
+        // recorded one rather than clearing it — most hooks don't carry it.
+        let sid = session_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| existing.and_then(|r| r.session_id.clone()));
         let rec = AgentRecord {
             status: agent_status,
             ts: now_unix(),
             session_name: session,
+            session_id: sid,
         };
         self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
@@ -213,7 +231,7 @@ mod tests {
         };
         state.rows.insert("main".into(), make_row("main"));
 
-        state.apply_hook("main", "working", None).unwrap();
+        state.apply_hook("main", "working", None, None).unwrap();
         let snap = state.snapshot();
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].agent, AgentStatus::Working);
@@ -231,12 +249,46 @@ mod tests {
         state.rows.insert("main".into(), make_row("main"));
 
         // "ghost" does not exist in rows; apply_hook must not crash.
-        state.apply_hook("ghost", "working", None).unwrap();
+        state.apply_hook("ghost", "working", None, None).unwrap();
         let snap = state.snapshot();
         // "main" row is untouched; no new row for "ghost".
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].name, "main");
         assert_eq!(snap.rows[0].agent, AgentStatus::Idle);
+    }
+
+    /// A session id is recorded on the agent record and preserved across a
+    /// later hook that omits it — so later `working`/`idle` pings don't wipe
+    /// the id we need to resume the session (#33).
+    #[test]
+    fn apply_hook_records_and_preserves_session_id() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+            prs: HashMap::new(),
+        };
+
+        state
+            .apply_hook("main", "working", None, Some("abc-123"))
+            .unwrap();
+        assert_eq!(
+            state.agents.get("main").unwrap().session_id.as_deref(),
+            Some("abc-123")
+        );
+
+        // A subsequent hook without a session id keeps the recorded one.
+        state.apply_hook("main", "idle", None, None).unwrap();
+        assert_eq!(
+            state.agents.get("main").unwrap().session_id.as_deref(),
+            Some("abc-123")
+        );
+
+        // An empty session id is treated as "not provided".
+        state.apply_hook("main", "working", None, Some("")).unwrap();
+        assert_eq!(
+            state.agents.get("main").unwrap().session_id.as_deref(),
+            Some("abc-123")
+        );
     }
 }
 

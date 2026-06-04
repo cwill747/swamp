@@ -8,7 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
-pub async fn run(status: String, dir: Option<PathBuf>, session_name: Option<String>) -> Result<()> {
+pub async fn run(
+    status: String,
+    dir: Option<PathBuf>,
+    session_name: Option<String>,
+    session_id: Option<String>,
+) -> Result<()> {
     let start = dir.unwrap_or(std::env::current_dir()?);
     let common = git_common_dir(&start).context("not inside a git repo")?;
     let wt_name = start
@@ -28,6 +33,7 @@ pub async fn run(status: String, dir: Option<PathBuf>, session_name: Option<Stri
                     worktree: wt_name.clone(),
                     status: status.clone(),
                     session_name: session_name.clone(),
+                    session_id: session_id.clone(),
                 },
             )
             .await;
@@ -42,11 +48,29 @@ pub async fn run(status: String, dir: Option<PathBuf>, session_name: Option<Stri
     } else {
         Default::default()
     };
+    // Carry forward prior session_name / session_id when this hook omits them,
+    // so transient `working`/`idle` pings don't erase the data we need to
+    // resume the session (#33). Mirrors DaemonState::apply_hook.
+    let prior = map.get(&wt_name).cloned();
+    let prior_field = |key: &str| {
+        prior
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    let session_name = session_name.filter(|s| !s.is_empty()).or_else(|| prior_field("session_name"));
+    let session_id = session_id.filter(|s| !s.is_empty()).or_else(|| prior_field("session_id"));
+
     let mut entry = serde_json::Map::new();
     entry.insert("status".into(), json!(status.to_lowercase()));
     entry.insert("ts".into(), json!(now_unix()));
     if let Some(ref name) = session_name {
         entry.insert("session_name".into(), json!(name));
+    }
+    if let Some(ref id) = session_id {
+        entry.insert("session_id".into(), json!(id));
     }
     map.insert(wt_name, json!(entry));
     let tmp = path.with_extension("json.tmp");

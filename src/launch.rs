@@ -202,6 +202,14 @@ fn write_multi_tab_layout(
         s.push_str("  }\n");
     }
 
+    // Resume map: worktree name → recorded Claude session id. A worktree that
+    // still exists and had an active session gets its Claude pane launched with
+    // `claude --resume <id>` so a swamp restart picks the conversation back up
+    // (#33).
+    let session_ids = git_common_dir(git_dir)
+        .map(|c| load_session_ids(&c))
+        .unwrap_or_default();
+
     for (i, wt) in worktrees.iter().enumerate() {
         let focus = if !bare && i == 0 { " focus=true" } else { "" };
         s.push_str(&format!(
@@ -210,7 +218,8 @@ fn write_multi_tab_layout(
             focus,
             wt.path.display()
         ));
-        push_worktree_panes(&mut s, cfg, &swamp_bin, nix);
+        let resume = session_ids.get(&wt.name()).map(|s| s.as_str());
+        push_worktree_panes(&mut s, cfg, &swamp_bin, nix, resume);
         s.push_str("  }\n");
     }
     s.push_str("}\n");
@@ -222,6 +231,37 @@ fn session_cwd(worktrees: &[Worktree], git_dir: &Path) -> String {
     find_default_worktree(worktrees, git_dir)
         .map(|w| w.path.display().to_string())
         .unwrap_or_else(|| ".".into())
+}
+
+/// Load the worktree → Claude session id map from the persisted
+/// `.swamp-status.json` in the git common dir. `swamp kill` leaves this file in
+/// place, so on the next launch we can resume each worktree's session. Ids that
+/// fail `is_safe_session_id` are dropped — we interpolate the id straight into a
+/// shell command line, so anything outside the expected UUID charset is refused
+/// rather than escaped.
+fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<String, String> {
+    let path = common_dir.join(".swamp-status.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Default::default();
+    };
+    let Ok(map) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
+    else {
+        return Default::default();
+    };
+    map.into_iter()
+        .filter_map(|(name, v)| {
+            v.get("session_id")
+                .and_then(|s| s.as_str())
+                .filter(|s| is_safe_session_id(s))
+                .map(|s| (name, s.to_string()))
+        })
+        .collect()
+}
+
+/// A session id is safe to splice into a shell command only if it's a plain
+/// token — Claude session ids are UUIDs, so restrict to `[A-Za-z0-9_-]`.
+fn is_safe_session_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -364,7 +404,7 @@ mod tests {
         // SAFETY: single-threaded test; no other thread reads the environment here.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
-        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp", true);
+        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp", true, None);
         assert!(s.contains("command=\"/bin/bash\""), "panes should launch $SHELL; got:\n{s}");
         assert!(!s.contains("command=\"fish\""), "no hardcoded fish command; got:\n{s}");
         assert!(!s.contains("STARSHIP"), "starship injection is gone; got:\n{s}");
@@ -375,9 +415,68 @@ mod tests {
 
         // With nix absent (`nix=false`), no pane emits nix-entry glue (#34).
         let mut sn = String::new();
-        push_worktree_panes(&mut sn, &dummy_cfg(), "/usr/bin/swamp", false);
+        push_worktree_panes(&mut sn, &dummy_cfg(), "/usr/bin/swamp", false, None);
         assert!(!sn.contains("nix develop"), "no nix develop when nix absent; got:\n{sn}");
         assert!(sn.contains("exec /bin/bash"), "shell pane execs $SHELL directly; got:\n{sn}");
+    }
+
+    /// When a worktree has a recorded session id, its Claude pane resumes that
+    /// session; without one it launches plain `claude` (#33).
+    #[test]
+    fn worktree_panes_resume_recorded_session() {
+        // SAFETY: single-threaded test; no other thread reads the environment.
+        unsafe { std::env::set_var("SHELL", "/bin/bash") };
+
+        let mut with = String::new();
+        push_worktree_panes(&mut with, &dummy_cfg(), "/usr/bin/swamp", false, Some("abc-123"));
+        assert!(
+            with.contains("$cp --resume abc-123"),
+            "recorded session should resume; got:\n{with}"
+        );
+
+        let mut without = String::new();
+        push_worktree_panes(&mut without, &dummy_cfg(), "/usr/bin/swamp", false, None);
+        assert!(
+            !without.contains("--resume"),
+            "no session → plain claude, no --resume; got:\n{without}"
+        );
+    }
+
+    #[test]
+    fn safe_session_id_accepts_uuid_rejects_shell_metachars() {
+        assert!(is_safe_session_id("3f9c1e2a-7b40-4d8e-9a1f-2c3d4e5f6a7b"));
+        assert!(is_safe_session_id("abc_123-DEF"));
+        assert!(!is_safe_session_id(""));
+        assert!(!is_safe_session_id("id; rm -rf /"));
+        assert!(!is_safe_session_id("$(whoami)"));
+        assert!(!is_safe_session_id("a b"));
+    }
+
+    /// `load_session_ids` reads worktree → session id pairs from a persisted
+    /// status file and drops entries whose id is unsafe or absent.
+    #[test]
+    fn load_session_ids_reads_safe_entries_only() {
+        let dir = std::env::temp_dir().join(format!("swamp-sid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{
+            "feat": { "status": "idle", "ts": 1, "session_id": "good-id-1" },
+            "bare": { "status": "working", "ts": 2, "session_id": "rm -rf" },
+            "none": { "status": "idle", "ts": 3 }
+        }"#;
+        std::fs::write(dir.join(".swamp-status.json"), json).unwrap();
+
+        let map = load_session_ids(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(map.get("feat").map(String::as_str), Some("good-id-1"));
+        assert!(!map.contains_key("bare"), "unsafe id must be dropped");
+        assert!(!map.contains_key("none"), "missing id must be absent");
+    }
+
+    #[test]
+    fn load_session_ids_missing_file_is_empty() {
+        let dir = std::env::temp_dir().join("swamp-definitely-missing-dir-xyz");
+        assert!(load_session_ids(&dir).is_empty());
     }
 }
 
@@ -407,7 +506,8 @@ fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     s.push_str("    }\n");
     s.push_str("  }\n");
     s.push_str("  tab {\n");
-    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available());
+    // A freshly-opened worktree tab has no prior session to resume.
+    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None);
     s.push_str("  }\n");
     s.push_str("}\n");
     std::fs::write(&tmp, s)?;
@@ -519,7 +619,13 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix
 "#, shell_path = sh.path, run_flag = sh.run_flag));
 }
 
-fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
+fn push_worktree_panes(
+    s: &mut String,
+    cfg: &ConfigPaths,
+    swamp_bin: &str,
+    nix: bool,
+    resume_session: Option<&str>,
+) {
     let lazygit_cfg = cfg.lazygit.display().to_string();
     let sh = user_shell();
 
@@ -530,13 +636,18 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: 
     };
 
     // Resolve claude on the host's PATH first, then carry that path into the
-    // nix shell (whose PATH may not include it).
+    // nix shell (whose PATH may not include it). When a session id was recorded
+    // for this worktree, resume it rather than starting a fresh conversation.
     let claude_prefix = if sh.is_fish {
         "set -l cp (command -s claude); "
     } else {
         "cp=$(command -v claude); "
     };
-    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, nix, "$cp", "$cp"));
+    let claude_cmd = match resume_session {
+        Some(id) => format!("$cp --resume {id}"),
+        None => "$cp".to_string(),
+    };
+    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, nix, &claude_cmd, &claude_cmd));
 
     let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
 
