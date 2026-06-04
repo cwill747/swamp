@@ -11,7 +11,7 @@ use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -22,6 +22,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+
+/// An active footer prompt that captures keystrokes instead of the normal
+/// navigation keys.
+pub enum InputMode {
+    /// Typing the branch name for a new worktree.
+    CreateBranch(String),
+    /// Confirming deletion of the named worktree.
+    ConfirmDelete(String),
+}
 
 /// A clickable PR row: enough to open it in a browser.
 #[derive(Clone)]
@@ -54,8 +63,11 @@ pub struct AppState {
     pub refreshing: bool,
     pub pending_delete: Option<String>,
     pub pending_create: bool,
-    pub create_input_received: bool,
     pub pre_create_names: HashSet<String>,
+    /// Active footer prompt (create/delete), if any.
+    pub input: Option<InputMode>,
+    /// Transient one-line status/error shown in the footer.
+    pub status_msg: Option<String>,
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
@@ -179,6 +191,8 @@ enum AppEvent {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     RefreshDone(Vec<String>),
+    /// A create/delete request failed; surface the message in the footer.
+    ActionError(String),
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -242,8 +256,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
         refreshing: false,
         pending_delete: None,
         pending_create: false,
-        create_input_received: false,
         pre_create_names: HashSet::new(),
+        input: None,
+        status_msg: None,
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
@@ -271,6 +286,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     if !app.snapshot.rows.iter().any(|r| &r.name == name) {
                         let _ = zellij::close_tab_by_name(name);
                         app.pending_delete = None;
+                        app.status_msg = None;
                     }
                 }
                 if app.pending_create {
@@ -285,8 +301,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             let _ = zellij::go_to_tab_name(&last.name);
                         }
                         app.pending_create = false;
-                    } else if app.create_input_received {
-                        app.pending_create = false;
+                        app.status_msg = None;
                     }
                 }
             }
@@ -312,17 +327,20 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                 }
             }
+            AppEvent::ActionError(msg) => {
+                app.pending_create = false;
+                app.pending_delete = None;
+                app.input = None;
+                app.status_msg = Some(msg);
+            }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if app.pending_create && !app.create_input_received {
-                    app.create_input_received = true;
-                    let tx = tx.clone();
-                    let common = common.to_path_buf();
-                    tokio::spawn(async move {
-                        let _ = send_refresh(&common, tx).await;
-                    });
+                if let Some(mode) = app.input.take() {
+                    handle_input_key(&mut app, mode, k, &tx, common);
+                    terminal.draw(|f| view::render(f, &mut app))?;
+                    continue;
                 }
                 match k.code {
                     KeyCode::Char('q') => return Ok(()),
@@ -365,37 +383,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         }
                     }
                     KeyCode::Char('c') => {
-                        app.pre_create_names = app.snapshot.rows.iter()
-                            .map(|r| r.name.clone())
-                            .collect();
-                        app.pending_create = true;
-                        app.create_input_received = false;
-                        let cwd = app.snapshot.rows.first()
-                            .map(|r| r.path.clone())
-                            .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
-                        let _ = zellij::run_floating(
-                            "git",
-                            &["wt", "add"],
-                            &cwd,
-                            "60%", "40%",
-                        );
+                        app.status_msg = None;
+                        app.input = Some(InputMode::CreateBranch(String::new()));
                     }
                     KeyCode::Char('d') => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
-                            let name = row.name.clone();
-                            app.pending_delete = Some(name.clone());
-                            // Run from a *different* worktree — removing the one
-                            // we're cd'd into would yank the shell's cwd.
-                            let cwd = app.snapshot.rows.iter()
-                                .find(|r| r.name != name)
-                                .map(|r| r.path.clone())
-                                .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
-                            let _ = zellij::run_floating(
-                                "git",
-                                &["wt", "remove", &name],
-                                &cwd,
-                                "60%", "40%",
-                            );
+                            app.status_msg = None;
+                            app.input = Some(InputMode::ConfirmDelete(row.name.clone()));
                         }
                     }
                     KeyCode::Char('r') if !app.refreshing => {
@@ -531,6 +525,94 @@ fn handle_mouse(app: &mut AppState, m: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Handle a keystroke while a footer prompt is active. `app.input` was already
+/// taken by the caller, so each branch re-stores it to stay open, or leaves it
+/// `None` to dismiss the prompt.
+fn handle_input_key(
+    app: &mut AppState,
+    mode: InputMode,
+    k: KeyEvent,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    match mode {
+        InputMode::CreateBranch(mut buf) => match k.code {
+            KeyCode::Esc => {}
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Enter => {
+                let branch = buf.trim().to_string();
+                if branch.is_empty() {
+                    return; // empty input cancels
+                }
+                app.pre_create_names =
+                    app.snapshot.rows.iter().map(|r| r.name.clone()).collect();
+                app.pending_create = true;
+                app.status_msg = Some(format!("Creating {branch}…"));
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) = send_action(
+                        &common,
+                        ClientMsg::CreateWorktree { branch },
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                    }
+                });
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.input = Some(InputMode::CreateBranch(buf));
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.input = Some(InputMode::CreateBranch(buf));
+            }
+            _ => {
+                app.input = Some(InputMode::CreateBranch(buf));
+            }
+        },
+        InputMode::ConfirmDelete(name) => match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.pending_delete = Some(name.clone());
+                app.status_msg = Some(format!("Deleting {name}…"));
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) = send_action(
+                        &common,
+                        ClientMsg::RemoveWorktree { name },
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                    }
+                });
+            }
+            _ => {} // n / Esc / anything else cancels
+        },
+    }
+}
+
+/// Send a create/remove request to the daemon and forward any error message
+/// back to the UI. Success is observed via the broadcast snapshot.
+async fn send_action(
+    common: &std::path::Path,
+    msg: ClientMsg,
+    tx: mpsc::Sender<AppEvent>,
+) -> Result<()> {
+    let sock = daemon::socket_path(common);
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(&mut stream, &msg).await?;
+    if let Some(ServerMsg::Err { message }) = read_server_msg(&mut stream).await? {
+        let _ = tx.send(AppEvent::ActionError(message)).await;
+    }
+    Ok(())
 }
 
 async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Result<()> {

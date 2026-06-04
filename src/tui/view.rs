@@ -94,6 +94,34 @@ fn render_all(f: &mut Frame, app: &mut AppState) {
 }
 
 fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    // An active prompt takes over the footer.
+    if let Some(input) = &app.input {
+        let line = match input {
+            crate::tui::InputMode::CreateBranch(buf) => Line::from(vec![
+                Span::styled("New worktree branch: ", Theme::muted()),
+                Span::raw(buf.clone()),
+                Span::styled("▏", Style::default().fg(Theme::WORKING)),
+                Span::styled("  (enter to create · esc to cancel)", Theme::muted()),
+            ]),
+            crate::tui::InputMode::ConfirmDelete(name) => Line::from(vec![
+                Span::styled("Delete worktree ", Style::default().fg(Theme::DIRTY)),
+                Span::styled(format!("'{name}'"), Style::default().fg(Theme::DIRTY)),
+                Span::styled("? (y/n)", Theme::muted()),
+            ]),
+        };
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(msg) = &app.status_msg {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(Theme::DIRTY),
+            ))),
+            area,
+        );
+        return;
+    }
     let mut spans = Vec::new();
     if app.refreshing {
         let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];

@@ -42,69 +42,6 @@ pub fn go_to_tab_name(name: &str) -> Result<()> {
     action(&["go-to-tab-name", name])
 }
 
-/// Single-quote a token for safe embedding in a `bash -c` string.
-fn sh_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// The user's login shell, falling back to bash.
-fn user_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
-}
-
-/// Open a floating pane running `cmd args` inside `cwd`.
-///
-/// The command is run through the user's own login shell (`$SHELL`) so their
-/// full PATH and environment is present — without it, an interactive
-/// `git wt add`/`git wt remove` can fail with `git: 'wt' is not a git command`
-/// the instant the pane opens. We also `cd` into `cwd` explicitly (a login
-/// shell may start elsewhere) so git can find the repo, and hold the pane open
-/// on a non-zero exit so the error stays visible instead of `--close-on-exit`
-/// tearing the pane down immediately. The pause glue is written in the user's
-/// shell dialect (fish vs POSIX).
-pub fn run_floating(cmd: &str, args: &[&str], cwd: &Path, width: &str, height: &str) -> Result<()> {
-    let mut cmdline = sh_quote(cmd);
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push_str(&sh_quote(a));
-    }
-    let shell = user_shell();
-    let is_fish = Path::new(&shell)
-        .file_name()
-        .map(|n| n == "fish")
-        .unwrap_or(false);
-    let cwd_q = sh_quote(&cwd.to_string_lossy());
-    let script = if is_fish {
-        format!(
-            "cd {cwd_q} && {cmdline}; set rc $status; \
-             if test $rc -ne 0; echo; echo \"[{name} exited $rc - press enter to close]\"; read swamp_close; end",
-            name = cmd,
-        )
-    } else {
-        format!(
-            "cd {cwd_q} && {cmdline}; rc=$?; \
-             if [ $rc -ne 0 ]; then echo; echo \"[{name} exited $rc - press enter to close]\"; read _; fi",
-            name = cmd,
-        )
-    };
-    let full = vec![
-        "action", "new-pane", "--floating", "--close-on-exit",
-        "--width", width, "--height", height,
-        "--", shell.as_str(), "-l", "-c", script.as_str(),
-    ];
-    zellij(&full)
-}
-
 pub fn close_tab_by_name(name: &str) -> Result<()> {
     go_to_tab_name(name)?;
     action(&["close-tab"])

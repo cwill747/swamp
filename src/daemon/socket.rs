@@ -21,6 +21,8 @@ pub enum ClientMsg {
     },
     GetVersion,
     Refresh,
+    CreateWorktree { branch: String },
+    RemoveWorktree { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,18 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let snap = daemon.state.read().await.snapshot();
                         let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
                         write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
+                    }
+                    ClientMsg::CreateWorktree { branch } => {
+                        match daemon.create_worktree(&branch).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
+                    }
+                    ClientMsg::RemoveWorktree { name } => {
+                        match daemon.remove_worktree(&name).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
                     }
                 }
             }
@@ -171,6 +185,8 @@ mod tests {
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
+            ClientMsg::CreateWorktree { branch: "feature/x".into() },
+            ClientMsg::RemoveWorktree { name: "feature-x".into() },
         ];
         for msg in &msgs {
             let json = serde_json::to_vec(msg).unwrap();

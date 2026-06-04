@@ -13,6 +13,9 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
+# Local-only worktree/status operations: no network, so no ssh/https (and thus no
+# openssl/libssh2). `vendored` builds libgit2 from source for the static-musl targets.
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 notify = "6"
 ratatui = "0.28"
 serde = { version = "1", features = ["derive"] }
