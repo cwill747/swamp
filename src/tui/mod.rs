@@ -250,11 +250,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         .collect();
                     if !new_rows.is_empty() {
                         for row in &new_rows {
-                            let _ = zellij::new_tab(
-                                crate::launch::LAYOUT_WORKTREE,
-                                &row.path,
-                                &row.name,
-                            );
+                            let _ = crate::launch::open_worktree_tab(&row.path, &row.name);
                         }
                         if let Some(last) = new_rows.last() {
                             let _ = zellij::go_to_tab_name(&last.name);

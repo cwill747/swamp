@@ -358,8 +358,8 @@ the layout has:
 - One tab per worktree, each with lazygit, a swamp TUI sidebar, a Claude pane,
   and a shell.
 
-For a non-bare repo with a single worktree, swamp uses the installed
-`swamp` Zellij layout directly.
+A non-bare repo with a single worktree gets the same generated single-tab
+worktree layout.
 
 The Claude pane auto-detects a `flake.nix` / `shell.nix` / `default.nix` and
 launches Claude inside `nix develop` if one is present.

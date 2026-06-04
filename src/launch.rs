@@ -7,8 +7,6 @@ use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-pub(crate) const LAYOUT_WORKTREE: &str = "swamp";
-
 /// Returns `true` when `running` differs from `mine` (i.e. the daemon was
 /// started by a different swamp build).  Simple equality for now; unit-tested
 /// so future changes don't silently regress.
@@ -103,10 +101,16 @@ fn spawn_into_existing(
         let _ = std::fs::remove_file(&layout);
         res?;
     }
-    for wt in worktrees {
-        zellij::new_tab(LAYOUT_WORKTREE, &wt.path, &wt.name())?;
-    }
-    Ok(())
+    let wt_layout = write_worktree_layout(cfg)?;
+    let wt_layout_str = wt_layout.to_string_lossy().to_string();
+    let res = (|| {
+        for wt in worktrees {
+            zellij::new_tab(&wt_layout_str, &wt.path, &wt.name())?;
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&wt_layout);
+    res
 }
 
 fn spawn_new_session(
@@ -175,11 +179,6 @@ fn spawn_new_session(
         }
     }
 
-    if !bare && worktrees.len() == 1 {
-        let layout = ensure_layout_path(LAYOUT_WORKTREE)?;
-        return zellij::new_session_with_layout(&layout, &worktrees[0].path, session);
-    }
-
     let git_dir = resolve_git_dir(target);
     let layout_path = write_multi_tab_layout(bare, worktrees, session, cfg, &git_dir)?;
     let res = zellij::new_session_with_layout(&layout_path, target, session);
@@ -187,9 +186,14 @@ fn spawn_new_session(
     res
 }
 
-fn ensure_layout_path(name: &str) -> Result<PathBuf> {
-    // We rely on the layouts being installed under $XDG_CONFIG_HOME/zellij/layouts/.
-    Ok(PathBuf::from(name))
+/// Open a new zellij tab for a worktree, using a freshly generated,
+/// `$SHELL`-aware layout rather than an externally-installed one.
+pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
+    let cfg = config::ensure_configs()?;
+    let layout = write_worktree_layout(&cfg)?;
+    let res = zellij::new_tab(&layout.to_string_lossy(), path, name);
+    let _ = std::fs::remove_file(&layout);
+    res
 }
 
 fn write_multi_tab_layout(
@@ -406,6 +410,31 @@ fn write_dashboard_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     s.push_str("  }\n");
     s.push_str("  default {\n");
     push_dashboard_panes(&mut s, cfg, &swamp_bin);
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    std::fs::write(&tmp, s)?;
+    Ok(tmp)
+}
+
+/// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
+/// the externally-installed `swamp` layout we used to depend on, but built from
+/// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
+fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
+    let swamp_bin = std::env::current_exe()
+        .context("resolve current executable")?
+        .display()
+        .to_string();
+    let tmp = std::env::temp_dir().join(format!("swamp-worktree-{}.kdl", std::process::id()));
+    let mut s = String::new();
+    s.push_str("layout {\n");
+    s.push_str("  pane_template name=\"default\" {\n");
+    s.push_str("    children\n");
+    s.push_str("    pane size=2 borderless=true {\n");
+    s.push_str("      plugin location=\"status-bar\"\n");
+    s.push_str("    }\n");
+    s.push_str("  }\n");
+    s.push_str("  default {\n");
+    push_worktree_panes(&mut s, cfg, &swamp_bin);
     s.push_str("  }\n");
     s.push_str("}\n");
     std::fs::write(&tmp, s)?;
