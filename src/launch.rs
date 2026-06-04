@@ -376,13 +376,21 @@ fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("swamp-worktree-{}.kdl", std::process::id()));
     let mut s = String::new();
     s.push_str("layout {\n");
-    s.push_str("  pane_template name=\"default\" {\n");
+    // Mirror the per-tab frame from `write_multi_tab_layout`: a
+    // `default_tab_template` carrying both the tab-bar (top) and status-bar
+    // (bottom). A new-tab layout that omits this leaves the created tab with no
+    // tab header or status bar — they only reappear when you switch to a tab
+    // that *was* built with the template.
+    s.push_str("  default_tab_template {\n");
+    s.push_str("    pane size=1 borderless=true {\n");
+    s.push_str("      plugin location=\"tab-bar\"\n");
+    s.push_str("    }\n");
     s.push_str("    children\n");
     s.push_str("    pane size=2 borderless=true {\n");
     s.push_str("      plugin location=\"status-bar\"\n");
     s.push_str("    }\n");
     s.push_str("  }\n");
-    s.push_str("  default {\n");
+    s.push_str("  tab {\n");
     push_worktree_panes(&mut s, cfg, &swamp_bin);
     s.push_str("  }\n");
     s.push_str("}\n");
