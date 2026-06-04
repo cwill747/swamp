@@ -122,15 +122,22 @@ pub fn list_tab_names() -> Result<Vec<String>> {
 }
 
 /// Launch a brand-new zellij session attached to `layout`, with `cwd` and `session`.
-pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str) -> Result<()> {
+/// When `nested` is true (we're already inside a zellij session), `ZELLIJ` is
+/// stripped from the child's environment so zellij allows the nested session.
+pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str, nested: bool) -> Result<()> {
     let layout = layout.to_string_lossy();
-    let status = Command::new("zellij")
-        .args([
-            "--new-session-with-layout",
-            &layout,
-            "--session",
-            session,
-        ])
+    let mut cmd = Command::new("zellij");
+    cmd.args([
+        "--new-session-with-layout",
+        &layout,
+        "--session",
+        session,
+    ]);
+    if nested {
+        cmd.env_remove("ZELLIJ");
+        cmd.env_remove("ZELLIJ_SESSION_NAME");
+    }
+    let status = cmd
         .status()
         .context("spawn zellij --new-session-with-layout")?;
     if !status.success() {
@@ -167,8 +174,12 @@ pub fn list_sessions() -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn attach(session: &str) -> Result<()> {
-    let err = exec::execvp("zellij", &["zellij", "attach", "--force-run-commands", session]);
+pub fn attach(session: &str, nested: bool) -> Result<()> {
+    let err = exec::execvp(
+        "zellij",
+        &["zellij", "attach", "--force-run-commands", session],
+        nested,
+    );
     Err(anyhow::anyhow!("exec zellij attach failed: {:?}", err))
 }
 
@@ -176,7 +187,13 @@ pub fn attach(session: &str) -> Result<()> {
 mod exec {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    pub fn execvp(cmd: &str, args: &[&str]) -> std::io::Error {
-        Command::new(cmd).args(&args[1..]).exec()
+    pub fn execvp(cmd: &str, args: &[&str], nested: bool) -> std::io::Error {
+        let mut c = Command::new(cmd);
+        c.args(&args[1..]);
+        if nested {
+            c.env_remove("ZELLIJ");
+            c.env_remove("ZELLIJ_SESSION_NAME");
+        }
+        c.exec()
     }
 }
