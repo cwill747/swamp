@@ -36,8 +36,8 @@ behind / dirty counts, and live agent status (working, waiting, idle). When
 Claude needs you in one tab, you see it from the others.
 
 **Zero per-repo setup.** Drop into any bare clone or repo with worktrees and run
-`swamp`. It writes its own starship and lazygit configs to
-`~/.config/swamp/`, generates a Zellij layout on the fly, and attaches.
+`swamp`. It writes its own lazygit config to `~/.config/swamp/`, generates a
+Zellij layout on the fly, and attaches.
 
 **Single binary, single daemon per repo.** A small Rust binary plus a per-repo
 Unix-socket daemon — no plugins, no shell hooks beyond Claude's.
@@ -86,8 +86,8 @@ cargo install --path .
 
 - [Zellij](https://zellij.dev) on `PATH`
 - [lazygit](https://github.com/jesseduffield/lazygit) on `PATH`
-- [starship](https://starship.rs) on `PATH` (used by the per-pane prompt)
-- A `fish` shell (panes are launched as `fish -C ...`)
+- A login shell (`$SHELL`, falling back to bash); fish and POSIX shells are
+  both supported — panes launch your normal shell with your own config
 - [Claude Code](https://github.com/anthropics/claude-code) if you want agent
   status reporting
 
@@ -358,8 +358,8 @@ the layout has:
 - One tab per worktree, each with lazygit, a swamp TUI sidebar, a Claude pane,
   and a shell.
 
-For a non-bare repo with a single worktree, swamp uses the installed
-`swamp` Zellij layout directly.
+A non-bare repo with a single worktree gets the same generated single-tab
+worktree layout.
 
 The Claude pane auto-detects a `flake.nix` / `shell.nix` / `default.nix` and
 launches Claude inside `nix develop` if one is present.
@@ -381,14 +381,16 @@ via the per-pane TUIs). You can also start it explicitly with `swamp serve`.
 
 ### Managed configs
 
-On first launch, swamp writes two configs under `$XDG_CONFIG_HOME/swamp/`
+On first launch, swamp writes one config under `$XDG_CONFIG_HOME/swamp/`
 (default `~/.config/swamp/`):
 
-- `starship.toml` — used by each pane's shell prompt
 - `lazygit.yml` — used by every lazygit pane
 
-These are rewritten only when the embedded contents differ from disk
-(idempotent). The generated Zellij layout points to these files directly.
+It is rewritten only when the embedded contents differ from disk
+(idempotent). The generated Zellij layout points to this file directly.
+
+Shell panes launch your login shell (`$SHELL`) directly, so your own prompt and
+shell config apply — swamp injects no prompt of its own.
 
 ### State files
 
@@ -397,7 +399,7 @@ These are rewritten only when the embedded contents differ from disk
 | `<git-common-dir>/.swamp-status.json` | Per-worktree agent status, persisted   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                     |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`    | Daemon PID file                        |
-| `$XDG_CONFIG_HOME/swamp/`             | Managed starship + lazygit configs     |
+| `$XDG_CONFIG_HOME/swamp/`             | Managed lazygit config                 |
 
 ## Building
 
