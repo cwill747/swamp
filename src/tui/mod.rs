@@ -11,16 +11,39 @@ use crate::daemon::{self};
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use std::io::stdout;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+
+/// A clickable PR row: enough to open it in a browser.
+#[derive(Clone)]
+pub struct PrHit {
+    pub url: Option<String>,
+}
+
+/// Screen regions captured during the last render, used to map mouse clicks
+/// back to rows. Rebuilt every frame in [`view::render`]; panels that aren't
+/// drawn this frame stay `None`.
+#[derive(Default)]
+pub struct HitRegions {
+    /// Worktree table: (row area, visible row count). Display row index equals
+    /// the snapshot index, so a hit row maps straight to `selected`.
+    pub worktrees: Option<(Rect, usize)>,
+    /// AI status table: (row area, snapshot index per visible row).
+    pub ai: Option<(Rect, Vec<usize>)>,
+    /// PR & CI table: (row area, PR per visible row).
+    pub prs: Option<(Rect, Vec<PrHit>)>,
+    /// Full Resources panel area (for scroll routing).
+    pub resources: Option<Rect>,
+}
 
 pub struct AppState {
     pub snapshot: Snapshot,
@@ -49,6 +72,10 @@ pub struct AppState {
     pub tab_env: Option<String>,
     /// Resolved name of the active worktree (for highlighting / pinning).
     pub current_tab: Option<String>,
+    /// Clickable regions from the last render (see [`HitRegions`]).
+    pub regions: HitRegions,
+    /// Last left-click (column, row, time), for double-click detection.
+    pub last_click: Option<(u16, u16, Instant)>,
 }
 
 impl AppState {
@@ -225,6 +252,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
         pin_cwd,
         tab_env: std::env::var("ZELLIJ_TAB_NAME").ok().filter(|s| !s.is_empty()),
         current_tab: None,
+        regions: HitRegions::default(),
+        last_click: None,
     };
     app.current_tab = app.tab_env.clone();
 
@@ -387,21 +416,121 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     _ => {}
                 }
             }
-            AppEvent::Input(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::ScrollDown => {
-                    let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
-                    app.resource_scroll = (app.resource_scroll + 3).min(max);
-                }
-                MouseEventKind::ScrollUp => {
-                    app.resource_scroll = app.resource_scroll.saturating_sub(3);
-                }
-                _ => {}
-            },
+            AppEvent::Input(Event::Mouse(m)) => handle_mouse(&mut app, m),
             AppEvent::Input(_) => {}
         }
         terminal.draw(|f| view::render(f, &mut app))?;
     }
     Ok(())
+}
+
+/// True when `(col, row)` falls inside `r`.
+fn point_in(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+}
+
+/// Map a click in a row region to a 0-based row index, if it lands on a row.
+fn row_index(area: Rect, count: usize, col: u16, row: u16) -> Option<usize> {
+    if !point_in(area, col, row) {
+        return None;
+    }
+    let idx = (row - area.y) as usize;
+    (idx < count).then_some(idx)
+}
+
+/// Detect a double-click: a left-press on the same row as the previous one
+/// within 400ms. Records the click for next time.
+fn is_double_click(app: &mut AppState, col: u16, row: u16) -> bool {
+    let now = Instant::now();
+    let dbl = matches!(
+        app.last_click,
+        Some((_, r, t)) if r == row && now.duration_since(t) < Duration::from_millis(400)
+    );
+    // Reset after a double so a third click starts a fresh pair.
+    app.last_click = if dbl { None } else { Some((col, row, now)) };
+    dbl
+}
+
+/// Jump the zellij session to the tab for the worktree at `idx`.
+fn jump_to_worktree(app: &AppState, idx: usize) {
+    if let Some(r) = app.snapshot.rows.get(idx) {
+        let _ = zellij::go_to_tab_name(&r.name);
+    }
+}
+
+fn handle_mouse(app: &mut AppState, m: MouseEvent) {
+    let (col, row) = (m.column, m.row);
+    match m.kind {
+        // Scroll routes to whatever panel the cursor is over.
+        MouseEventKind::ScrollDown => {
+            if app.regions.resources.map_or(false, |r| point_in(r, col, row)) {
+                let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
+                app.resource_scroll = (app.resource_scroll + 3).min(max);
+            } else if app.regions.worktrees.map_or(false, |(r, _)| point_in(r, col, row)) {
+                if !app.snapshot.rows.is_empty() {
+                    app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if app.regions.resources.map_or(false, |r| point_in(r, col, row)) {
+                app.resource_scroll = app.resource_scroll.saturating_sub(3);
+            } else if app.regions.worktrees.map_or(false, |(r, _)| point_in(r, col, row)) {
+                app.selected = app.selected.saturating_sub(1);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let dbl = is_double_click(app, col, row);
+
+            // Worktree table: click selects, double-click jumps. Clicking the
+            // PR-icon column opens the PR instead.
+            if let Some((area, count)) = app.regions.worktrees {
+                if let Some(idx) = row_index(area, count, col, row) {
+                    // Fixed leading columns: #(3) + sp + agent(2) + sp = 7,
+                    // then the 1-wide PR icon.
+                    let pr_col = area.x + 7;
+                    if col == pr_col {
+                        if let Some(url) = app
+                            .snapshot
+                            .rows
+                            .get(idx)
+                            .and_then(|r| app.pr_snapshot.prs.get(&r.branch))
+                            .and_then(|pr| pr.url.clone())
+                        {
+                            crate::util::open_url(&url);
+                            return;
+                        }
+                    }
+                    app.selected = idx;
+                    if dbl {
+                        jump_to_worktree(app, idx);
+                    }
+                    return;
+                }
+            }
+
+            // AI status: click selects the matching worktree, double-click jumps.
+            let ai_target = app.regions.ai.as_ref().and_then(|(area, idxs)| {
+                row_index(*area, idxs.len(), col, row).map(|i| idxs[i])
+            });
+            if let Some(idx) = ai_target {
+                app.selected = idx;
+                if dbl {
+                    jump_to_worktree(app, idx);
+                }
+                return;
+            }
+
+            // PR & CI: click opens the PR in a browser.
+            let pr_url = app.regions.prs.as_ref().and_then(|(area, hits)| {
+                row_index(*area, hits.len(), col, row).and_then(|i| hits[i].url.clone())
+            });
+            if let Some(url) = pr_url {
+                crate::util::open_url(&url);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Result<()> {
@@ -464,5 +593,27 @@ mod tests {
         assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/main")));
         // A worktree whose name is a prefix must not match (no false positive).
         assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/feature")));
+    }
+
+    #[test]
+    fn point_in_respects_bounds() {
+        let r = Rect { x: 2, y: 3, width: 4, height: 2 };
+        assert!(point_in(r, 2, 3)); // top-left corner
+        assert!(point_in(r, 5, 4)); // bottom-right inclusive
+        assert!(!point_in(r, 6, 4)); // one past width
+        assert!(!point_in(r, 5, 5)); // one past height
+        assert!(!point_in(r, 1, 3)); // left of region
+    }
+
+    #[test]
+    fn row_index_maps_click_to_row() {
+        // Rows region with three visible rows starting at y=3.
+        let area = Rect { x: 0, y: 3, width: 10, height: 5 };
+        assert_eq!(row_index(area, 3, 0, 3), Some(0));
+        assert_eq!(row_index(area, 3, 9, 5), Some(2));
+        // Inside the rect but past the populated rows.
+        assert_eq!(row_index(area, 3, 0, 6), None);
+        // Outside the rect entirely.
+        assert_eq!(row_index(area, 3, 0, 2), None);
     }
 }

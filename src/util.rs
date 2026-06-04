@@ -48,3 +48,19 @@ pub fn ascii_mode() -> bool {
             .to_lowercase()
             .contains("utf")
 }
+
+/// Open a URL in the user's default browser. Best-effort: spawns the platform
+/// opener detached and ignores failures (we're inside a TUI; there's nowhere
+/// useful to surface the error).
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
