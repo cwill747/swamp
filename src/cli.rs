@@ -44,6 +44,11 @@ pub enum Cmd {
         /// Which panel to render (default: all).
         #[arg(long, value_enum, default_value_t = TuiView::All)]
         view: TuiView,
+        /// Pin the worktree matching this pane's cwd to the top. Set for the
+        /// swamp pane inside a worktree tab; omitted on the dashboard, whose
+        /// cwd is the default worktree and should stay recency-sorted.
+        #[arg(long)]
+        pin_cwd: bool,
     },
 
     /// Record an agent status update (called from Claude Code hooks).

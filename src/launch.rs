@@ -348,6 +348,16 @@ mod tests {
             !content.contains("command=\"swamp\""),
             "layout should use resolved binary path, not bare 'swamp'; got:\n{content}"
         );
+        // Worktree-tab panes pin their cwd; the dashboard worktrees pane does not.
+        assert!(
+            content.contains("\"--view\" \"worktrees\" \"--pin-cwd\""),
+            "worktree-tab pane should pass --pin-cwd; got:\n{content}"
+        );
+        assert_eq!(
+            content.matches("--pin-cwd").count(),
+            worktrees.len(),
+            "exactly one --pin-cwd per worktree tab (none on dashboard); got:\n{content}"
+        );
     }
 }
 
@@ -414,7 +424,7 @@ fn push_worktree_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str) {
           name "lazygit"
         }}
         pane command="{swamp_bin}" size="35%" {{
-          args "tui" "--view" "worktrees"
+          args "tui" "--view" "worktrees" "--pin-cwd"
           name "swamp"
         }}
       }}

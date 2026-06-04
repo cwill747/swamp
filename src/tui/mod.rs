@@ -37,11 +37,41 @@ pub struct AppState {
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
     pub resource_viewport_height: u16,
+    /// Canonicalized working directory of this swamp pane — the worktree it
+    /// was launched in. Used to identify the active worktree row.
+    pub current_dir: Option<PathBuf>,
+    /// When true, resolve the active worktree from `current_dir`. Set on the
+    /// worktree-tab pane; false on the dashboard (whose cwd is the default
+    /// worktree, which must not be pinned).
+    pub pin_cwd: bool,
+    /// Tab name from `ZELLIJ_TAB_NAME`, used as a fallback when the working
+    /// directory does not match a known worktree.
+    pub tab_env: Option<String>,
+    /// Resolved name of the active worktree (for highlighting / pinning).
     pub current_tab: Option<String>,
 }
 
 impl AppState {
+    /// Identify the active worktree row: prefer the one whose path contains
+    /// this pane's working directory, falling back to the zellij tab name.
+    fn resolve_current_tab(&self) -> Option<String> {
+        if self.pin_cwd {
+            if let Some(ref dir) = self.current_dir {
+                if let Some(row) = self
+                    .snapshot
+                    .rows
+                    .iter()
+                    .find(|r| path_matches_worktree(dir, &r.path))
+                {
+                    return Some(row.name.clone());
+                }
+            }
+        }
+        self.tab_env.clone()
+    }
+
     fn pin_snapshot(&mut self) {
+        self.current_tab = self.resolve_current_tab();
         if self.view != TuiView::Worktrees {
             return;
         }
@@ -54,8 +84,20 @@ impl AppState {
     }
 }
 
-pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
-    let start = resolve_git_dir(&dir.unwrap_or(std::env::current_dir()?));
+/// True when `dir` is the worktree at `wt_path` (or a subdirectory of it).
+fn path_matches_worktree(dir: &std::path::Path, wt_path: &std::path::Path) -> bool {
+    let wt = wt_path
+        .canonicalize()
+        .unwrap_or_else(|_| wt_path.to_path_buf());
+    dir == wt || dir.starts_with(&wt)
+}
+
+pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<()> {
+    let cwd = match dir {
+        Some(d) => d,
+        None => std::env::current_dir()?,
+    };
+    let start = resolve_git_dir(&cwd);
     let common = git_common_dir(&start).context("not inside a git repo")?;
     let repo_name = common
         .parent()
@@ -72,7 +114,7 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, &common, repo_name, view).await;
+    let res = event_loop(&mut terminal, &common, repo_name, view, cwd, pin_cwd).await;
 
     disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
@@ -117,6 +159,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
     common: &std::path::Path,
     repo_name: String,
     view: TuiView,
+    cwd: PathBuf,
+    pin_cwd: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
@@ -177,8 +221,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
         resource_viewport_height: 0,
-        current_tab: std::env::var("ZELLIJ_TAB_NAME").ok(),
+        current_dir: cwd.canonicalize().ok(),
+        pin_cwd,
+        tab_env: std::env::var("ZELLIJ_TAB_NAME").ok().filter(|s| !s.is_empty()),
+        current_tab: None,
     };
+    app.current_tab = app.tab_env.clone();
 
     terminal.draw(|f| view::render(f, &mut app))?;
 
@@ -397,4 +445,28 @@ async fn subscribe_loop(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) ->
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_cwd_matches_its_worktree() {
+        let wt = std::path::Path::new("/repo/feature-x");
+        assert!(path_matches_worktree(wt, wt));
+        // A subdirectory of the worktree still resolves to it.
+        assert!(path_matches_worktree(
+            std::path::Path::new("/repo/feature-x/src"),
+            wt,
+        ));
+    }
+
+    #[test]
+    fn pane_cwd_does_not_match_other_worktrees() {
+        let cwd = std::path::Path::new("/repo/feature-x");
+        assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/main")));
+        // A worktree whose name is a prefix must not match (no false positive).
+        assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/feature")));
+    }
 }
