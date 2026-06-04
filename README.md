@@ -195,6 +195,7 @@ swamp hook waiting
 swamp hook idle
 swamp hook working --dir /path/to/worktree
 swamp hook working --session-name "Fix auth bug"
+swamp hook working --session-id "3f9c1e2a-7b40-4d8e-9a1f-2c3d4e5f6a7b"
 ```
 
 `--dir` overrides the inferred worktree. Without it, the worktree name is
@@ -203,6 +204,11 @@ derived from `$PWD`'s basename.
 `--session-name` sets the Claude Code conversation title for display in the AI
 status panel. When omitted, the previously recorded session name (if any) is
 preserved.
+
+`--session-id` records the Claude Code session UUID for the worktree. It is
+persisted to `.swamp-status.json` so that a later `swamp` launch can resume the
+session in that worktree's Claude pane (`claude --resume <id>`). When omitted,
+the previously recorded id (if any) is preserved.
 
 The hook prefers the daemon socket (200 ms timeout) and falls back to writing
 `.swamp-status.json` in the git common dir if the daemon is unreachable.
@@ -269,10 +275,13 @@ If you don't need session names in the dashboard, the minimal config is:
 }
 ```
 
-### Recommended (status + session name)
+### Recommended (status + session name + resume)
 
-This version extracts the Claude conversation title from the hook's JSON stdin
-and displays it in the AI status panel:
+This version extracts the Claude conversation title (`session_name`) and the
+session id (`session_id`) from the hook's JSON stdin. The title shows in the AI
+status panel; the id is recorded so that if you `swamp kill` and relaunch, each
+still-existing worktree's Claude pane resumes its session with
+`claude --resume <id>` instead of starting fresh.
 
 ```json
 {
@@ -282,7 +291,7 @@ and displays it in the AI status panel:
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" >/dev/null 2>&1 || true"
           }
         ]
       }
@@ -292,7 +301,7 @@ and displays it in the AI status panel:
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" >/dev/null 2>&1 || true"
           }
         ],
         "matcher": ""
@@ -303,7 +312,7 @@ and displays it in the AI status panel:
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+            "command": "input=$(cat); swamp hook working --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" >/dev/null 2>&1 || true"
           }
         ]
       }
@@ -314,7 +323,7 @@ and displays it in the AI status panel:
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); swamp hook waiting --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+            "command": "input=$(cat); swamp hook waiting --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" >/dev/null 2>&1 || true"
           }
         ]
       }
@@ -324,7 +333,7 @@ and displays it in the AI status panel:
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); swamp hook idle --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" >/dev/null 2>&1 || true"
+            "command": "input=$(cat); swamp hook idle --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" >/dev/null 2>&1 || true"
           }
         ]
       }
@@ -363,6 +372,12 @@ worktree layout.
 
 The Claude pane auto-detects a `flake.nix` / `shell.nix` / `default.nix` and
 launches Claude inside `nix develop` if one is present.
+
+If the worktree has a Claude session id recorded in `.swamp-status.json` (from
+the [hooks](#claude-code-hooks)), the pane launches `claude --resume <id>` so
+the conversation picks up where it left off after a `swamp kill` + relaunch. A
+worktree with no recorded session — or one that's since been removed — just gets
+a fresh `claude`.
 
 ### Daemon
 

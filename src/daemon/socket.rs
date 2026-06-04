@@ -12,7 +12,13 @@ use tokio::net::UnixStream;
 pub enum ClientMsg {
     Ping,
     Subscribe,
-    Hook { worktree: String, status: String, session_name: Option<String> },
+    Hook {
+        worktree: String,
+        status: String,
+        session_name: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     GetVersion,
     Refresh,
 }
@@ -47,8 +53,8 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let pr_snap = daemon.state.read().await.pr_snapshot();
                         write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
-                    ClientMsg::Hook { worktree, status, session_name } => {
-                        match daemon.apply_hook(&worktree, &status, session_name.as_deref()).await {
+                    ClientMsg::Hook { worktree, status, session_name, session_id } => {
+                        match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref()).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
@@ -161,6 +167,7 @@ mod tests {
                 worktree: "main".into(),
                 status: "working".into(),
                 session_name: None,
+                session_id: None,
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
