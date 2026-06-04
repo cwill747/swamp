@@ -1,6 +1,6 @@
 use super::icons;
 use super::theme::Theme;
-use super::AppState;
+use super::{AppState, PrHit};
 use crate::daemon::resources;
 use crate::cli::TuiView;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
@@ -14,10 +14,17 @@ use ratatui::Frame;
 use std::time::{Duration, SystemTime};
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
+    // Hit regions are rebuilt each frame; panels not drawn this frame stay None.
+    app.regions = super::HitRegions::default();
     match app.view {
         TuiView::All => render_all(f, app),
         _ => render_single_panel(f, app),
     }
+}
+
+/// Inner content area of a fully-bordered block (the row region).
+fn bordered_inner(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    Block::default().borders(Borders::ALL).inner(area)
 }
 
 fn render_single_panel(f: &mut Frame, app: &mut AppState) {
@@ -102,7 +109,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Rect) {
     let now = now_unix();
     let current_tab = app.current_tab.as_deref();
     let pin_current = app.view == TuiView::Worktrees;
@@ -136,9 +143,14 @@ fn render_worktree_table(f: &mut Frame, app: &AppState, area: ratatui::layout::R
     .column_spacing(1);
 
     f.render_widget(table, area);
+
+    let inner = bordered_inner(area);
+    let visible = (app.snapshot.rows.len()).min(inner.height as usize);
+    app.regions.worktrees = Some((inner, visible));
 }
 
-fn render_ai_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_ai_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Rect) {
+    let inner = bordered_inner(area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::MUTED))
@@ -170,6 +182,8 @@ fn render_ai_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             Theme::muted(),
         ))];
         f.render_widget(Paragraph::new(lines).block(block), area);
+        drop(entries);
+        app.regions.ai = Some((inner, Vec::new()));
         return;
     }
 
@@ -290,6 +304,15 @@ fn render_ai_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     .column_spacing(1);
 
     f.render_widget(table, area);
+
+    // Map each visible AI row back to its worktree's snapshot index.
+    let mut indices: Vec<usize> = entries
+        .iter()
+        .filter_map(|e| app.snapshot.rows.iter().position(|r| r.name == e.name))
+        .collect();
+    drop(entries);
+    indices.truncate(inner.height as usize);
+    app.regions.ai = Some((inner, indices));
 }
 
 fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Rect) {
@@ -302,6 +325,8 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::MUTED))
         .title(title);
+
+    app.regions.resources = Some(area);
 
     if res.session_pid.is_none() && res.procs.is_empty() {
         let lines = vec![Line::from(Span::styled(
@@ -417,7 +442,8 @@ pub fn max_resource_scroll(res: &resources::Snapshot, viewport_height: u16) -> u
     content.saturating_sub(viewport_height)
 }
 
-fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_pr_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Rect) {
+    let inner = bordered_inner(area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::MUTED))
@@ -441,6 +467,7 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
             Theme::muted(),
         ))];
         f.render_widget(Paragraph::new(lines).block(block), area);
+        app.regions.prs = Some((inner, Vec::new()));
         return;
     }
 
@@ -514,6 +541,15 @@ fn render_pr_status(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) 
     .column_spacing(1);
 
     f.render_widget(table, area);
+
+    // One PrHit per visible row, in the same order as `rows` above.
+    let hits: Vec<PrHit> = pr_rows
+        .iter()
+        .take(max_rows)
+        .map(|(_, pr)| PrHit { url: pr.url.clone() })
+        .collect();
+    drop(pr_rows);
+    app.regions.prs = Some((inner, hits));
 }
 
 fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
