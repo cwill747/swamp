@@ -1,6 +1,7 @@
 use super::resources;
 use super::state::{PrSnapshot, Snapshot};
 use super::Daemon;
+use crate::worktree::BranchInfo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -21,7 +22,9 @@ pub enum ClientMsg {
     },
     GetVersion,
     Refresh,
+    ListBranches,
     CreateWorktree { branch: String },
+    CreateWorktreeFromBase { branch: String, base: String },
     RemoveWorktree { name: String },
 }
 
@@ -36,6 +39,7 @@ pub enum ServerMsg {
     Err { message: String },
     Version { version: String },
     RefreshDone { worktree_names: Vec<String> },
+    Branches { branches: Vec<BranchInfo> },
 }
 
 pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
@@ -70,8 +74,32 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
                         write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
                     }
+                    ClientMsg::ListBranches => {
+                        let common = daemon.common_dir.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            crate::worktree::list_branches(&common)
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(branches)) => {
+                                write_msg(&mut stream, &ServerMsg::Branches { branches }).await?
+                            }
+                            Ok(Err(e)) => {
+                                write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?
+                            }
+                            Err(e) => {
+                                write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?
+                            }
+                        }
+                    }
                     ClientMsg::CreateWorktree { branch } => {
                         match daemon.create_worktree(&branch).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
+                    }
+                    ClientMsg::CreateWorktreeFromBase { branch, base } => {
+                        match daemon.create_worktree_from_base(&branch, &base).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
@@ -185,7 +213,12 @@ mod tests {
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
+            ClientMsg::ListBranches,
             ClientMsg::CreateWorktree { branch: "feature/x".into() },
+            ClientMsg::CreateWorktreeFromBase {
+                branch: "feature/x".into(),
+                base: "main".into(),
+            },
             ClientMsg::RemoveWorktree { name: "feature-x".into() },
         ];
         for msg in &msgs {

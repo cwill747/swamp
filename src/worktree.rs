@@ -13,6 +13,7 @@ use git2::{
     BranchType, Repository, RepositoryState, Status, StatusOptions, WorktreeAddOptions,
     WorktreePruneOptions,
 };
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,31 @@ use std::path::{Path, PathBuf};
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
+}
+
+/// Whether a [`BranchInfo`] names a local branch or a remote-tracking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchKind {
+    Local,
+    Remote,
+}
+
+/// A branch the create picker can offer: either to spin a worktree from
+/// directly, or to use as the base for a brand-new branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchInfo {
+    /// Short name (e.g. `feature/login`); for a remote branch the `<remote>/`
+    /// prefix is stripped so it reads like a local branch.
+    pub name: String,
+    pub kind: BranchKind,
+    /// The owning remote (e.g. `origin`) for [`BranchKind::Remote`].
+    pub remote: Option<String>,
+    /// True when this local branch is already checked out in some worktree —
+    /// such a branch can't be checked out into a *new* worktree.
+    pub checked_out: bool,
+    /// True for the repository default branch (sorted first; the base default).
+    pub is_default: bool,
 }
 
 impl Worktree {
@@ -318,8 +344,51 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
         }
     };
 
-    let root = workon_root(&repo)?;
-    // git can't name a worktree with slashes; use the branch basename.
+    add_worktree(&repo, branch, &reference)
+}
+
+/// Create a worktree for a brand-new `new_branch` cut from `base`.
+///
+/// `base` is resolved to a commit via, in order: a local branch, the
+/// `origin/<base>` remote-tracking branch, then a generic revparse (so a tag or
+/// raw sha works too). The new branch carries no upstream — it's local-only
+/// until pushed. `common_dir` must point at the bare/common git dir.
+pub fn create_worktree_from_base(
+    common_dir: &Path,
+    new_branch: &str,
+    base: &str,
+) -> Result<Worktree> {
+    let repo = Repository::open(common_dir)
+        .with_context(|| format!("open bare repo at {}", common_dir.display()))?;
+
+    let base_commit = repo
+        .find_branch(base, BranchType::Local)
+        .map(git2::Branch::into_reference)
+        .or_else(|_| {
+            repo.find_branch(&format!("origin/{}", base), BranchType::Remote)
+                .map(git2::Branch::into_reference)
+        })
+        .and_then(|r| r.peel_to_commit())
+        .or_else(|_| {
+            repo.revparse_single(base)
+                .and_then(|o| o.peel_to_commit())
+        })
+        .with_context(|| format!("resolve base branch {}", base))?;
+
+    let reference = repo
+        .branch(new_branch, &base_commit, false)
+        .with_context(|| format!("create branch {} from {}", new_branch, base))?
+        .into_reference();
+
+    add_worktree(&repo, new_branch, &reference)
+}
+
+/// Materialize the worktree directory for `branch` pointed at `reference`. The
+/// worktree dir is a sibling of `.bare` named after the branch (git-wt layout);
+/// since git can't name a worktree with slashes, the registry name uses the
+/// branch basename.
+fn add_worktree(repo: &Repository, branch: &str, reference: &git2::Reference) -> Result<Worktree> {
+    let root = workon_root(repo)?;
     let wt_name = Path::new(branch)
         .file_name()
         .and_then(|s| s.to_str())
@@ -330,7 +399,7 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
     }
 
     let mut opts = WorktreeAddOptions::new();
-    opts.reference(Some(&reference));
+    opts.reference(Some(reference));
     let wt = repo
         .worktree(wt_name, &wt_path, Some(&opts))
         .with_context(|| format!("create worktree {} at {}", wt_name, wt_path.display()))?;
@@ -339,6 +408,67 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
         path: wt.path().to_path_buf(),
         branch: branch.to_string(),
     })
+}
+
+/// List local + remote-tracking branches for the create picker.
+///
+/// Local branches come first (with `checked_out`/`is_default` marked); remote
+/// branches follow, with the `<remote>/` prefix stripped and `HEAD` skipped.
+/// A remote branch whose short name already exists locally is dropped (the
+/// local entry covers it). Sorted: default first, then local, then remote, each
+/// group alphabetical.
+pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
+    let repo = open_lenient(common_dir)?;
+    let default = default_branch_name(&repo);
+
+    // Branch names currently checked out in some worktree.
+    let checked_out: std::collections::HashSet<String> = list_worktrees(common_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.branch)
+        .collect();
+
+    let mut locals: Vec<BranchInfo> = Vec::new();
+    let mut local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in repo.branches(Some(BranchType::Local))?.flatten() {
+        let (branch, _) = entry;
+        if let Ok(Some(name)) = branch.name() {
+            local_names.insert(name.to_string());
+            locals.push(BranchInfo {
+                name: name.to_string(),
+                kind: BranchKind::Local,
+                remote: None,
+                checked_out: checked_out.contains(name),
+                is_default: default.as_deref() == Some(name),
+            });
+        }
+    }
+
+    let mut remotes: Vec<BranchInfo> = Vec::new();
+    for entry in repo.branches(Some(BranchType::Remote))?.flatten() {
+        let (branch, _) = entry;
+        if let Ok(Some(full)) = branch.name() {
+            let Some((remote, short)) = full.split_once('/') else {
+                continue;
+            };
+            if short == "HEAD" || local_names.contains(short) {
+                continue;
+            }
+            remotes.push(BranchInfo {
+                name: short.to_string(),
+                kind: BranchKind::Remote,
+                remote: Some(remote.to_string()),
+                checked_out: false,
+                is_default: false,
+            });
+        }
+    }
+
+    let sort_key = |b: &BranchInfo| (!b.is_default, b.name.clone());
+    locals.sort_by_key(sort_key);
+    remotes.sort_by_key(sort_key);
+    locals.extend(remotes);
+    Ok(locals)
 }
 
 /// Remove the worktree named `name`: delete its directory, prune the git
@@ -491,6 +621,71 @@ mod tests {
         let info = git_info(&wt.path).unwrap();
         assert_eq!(info.staged, 1);
         assert_eq!(info.untracked, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_branches_reports_local_and_checked_out() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        // Add a second local branch in the bare repo.
+        run(&bare, &["branch", "feature", "main"]);
+
+        let branches = list_branches(&bare).unwrap();
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"main"), "main should be listed: {names:?}");
+        assert!(names.contains(&"feature"), "feature should be listed: {names:?}");
+        assert!(
+            branches.iter().all(|b| b.kind == BranchKind::Local),
+            "no remotes configured, all should be local"
+        );
+        assert!(
+            branches.iter().all(|b| !b.checked_out),
+            "nothing checked out yet"
+        );
+
+        // After checking out `feature` into a worktree it must be flagged.
+        create_worktree(&bare, "feature").unwrap();
+        let branches = list_branches(&bare).unwrap();
+        let feature = branches.iter().find(|b| b.name == "feature").unwrap();
+        assert!(feature.checked_out, "feature is now in a worktree");
+        let main = branches.iter().find(|b| b.name == "main").unwrap();
+        assert!(!main.checked_out, "main is still free");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_worktree_from_base_cuts_new_branch() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        let wt = create_worktree_from_base(&bare, "feature/new", "main").unwrap();
+        assert_eq!(wt.branch, "feature/new");
+        assert!(wt.path.is_dir());
+
+        // The new branch must point at main's commit.
+        let head_of = |dir: &Path, rev: &str| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", rev])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let base_oid = head_of(&bare, "main");
+        let new_oid = head_of(&wt.path, "HEAD");
+        assert_eq!(new_oid, base_oid, "new branch should be cut from main");
+
+        // And the local branch exists in the repo.
+        let branches = list_branches(&bare).unwrap();
+        assert!(branches.iter().any(|b| b.name == "feature/new"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
