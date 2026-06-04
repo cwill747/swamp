@@ -40,6 +40,10 @@ pub struct AppState {
     /// Canonicalized working directory of this swamp pane — the worktree it
     /// was launched in. Used to identify the active worktree row.
     pub current_dir: Option<PathBuf>,
+    /// When true, resolve the active worktree from `current_dir`. Set on the
+    /// worktree-tab pane; false on the dashboard (whose cwd is the default
+    /// worktree, which must not be pinned).
+    pub pin_cwd: bool,
     /// Tab name from `ZELLIJ_TAB_NAME`, used as a fallback when the working
     /// directory does not match a known worktree.
     pub tab_env: Option<String>,
@@ -51,14 +55,16 @@ impl AppState {
     /// Identify the active worktree row: prefer the one whose path contains
     /// this pane's working directory, falling back to the zellij tab name.
     fn resolve_current_tab(&self) -> Option<String> {
-        if let Some(ref dir) = self.current_dir {
-            if let Some(row) = self
-                .snapshot
-                .rows
-                .iter()
-                .find(|r| path_matches_worktree(dir, &r.path))
-            {
-                return Some(row.name.clone());
+        if self.pin_cwd {
+            if let Some(ref dir) = self.current_dir {
+                if let Some(row) = self
+                    .snapshot
+                    .rows
+                    .iter()
+                    .find(|r| path_matches_worktree(dir, &r.path))
+                {
+                    return Some(row.name.clone());
+                }
             }
         }
         self.tab_env.clone()
@@ -86,7 +92,7 @@ fn path_matches_worktree(dir: &std::path::Path, wt_path: &std::path::Path) -> bo
     dir == wt || dir.starts_with(&wt)
 }
 
-pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
+pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<()> {
     let cwd = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
@@ -108,7 +114,7 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, &common, repo_name, view, cwd).await;
+    let res = event_loop(&mut terminal, &common, repo_name, view, cwd, pin_cwd).await;
 
     disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
@@ -154,6 +160,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
     repo_name: String,
     view: TuiView,
     cwd: PathBuf,
+    pin_cwd: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
@@ -215,6 +222,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
         resource_scroll: 0,
         resource_viewport_height: 0,
         current_dir: cwd.canonicalize().ok(),
+        pin_cwd,
         tab_env: std::env::var("ZELLIJ_TAB_NAME").ok().filter(|s| !s.is_empty()),
         current_tab: None,
     };
