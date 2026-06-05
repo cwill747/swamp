@@ -43,28 +43,28 @@ pub fn current_marker() -> &'static str {
 
 pub fn pr_icon(state: &str, is_draft: bool) -> &'static str {
     if is_draft {
-        return if ascii_mode() { "d" } else { "\u{f0124}" };
+        return if ascii_mode() { "d" } else { "\u{f4dd}" };
     }
     match state {
         "OPEN" => {
             if ascii_mode() {
                 "o"
             } else {
-                "\u{f0408}"
+                "\u{f407}"
             }
         }
         "MERGED" => {
             if ascii_mode() {
                 "m"
             } else {
-                "\u{f0409}"
+                "\u{f419}"
             }
         }
         "CLOSED" => {
             if ascii_mode() {
                 "x"
             } else {
-                "\u{f040a}"
+                "\u{f4dc}"
             }
         }
         _ => "?",
