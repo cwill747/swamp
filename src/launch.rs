@@ -180,6 +180,35 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
     res
 }
 
+/// Close the worktree's tab and reopen it, so a harness swap takes effect live.
+/// Reopening reads the freshly-persisted override, so the new tab's agent pane
+/// comes up as the chosen harness.
+///
+/// Meant to run **detached** from the pane that triggered it (`swamp
+/// relaunch-tab`): pressing `h` inside a worktree's own sidebar closes that very
+/// tab, which would otherwise abort the reopen. Skipped when fewer than two tabs
+/// exist — closing the only tab would end the session — so the swap then falls
+/// back to applying on the next launch.
+pub fn relaunch_worktree_tab(name: &str, path: &Path) -> Result<()> {
+    if !zellij::in_zellij() {
+        return Ok(());
+    }
+    let tabs = zellij::list_tab_names().unwrap_or_default();
+    if !tabs.iter().any(|t| t == name) {
+        // No tab to relaunch (e.g. closed); just open it fresh.
+        return open_worktree_tab(path, name);
+    }
+    if tabs.len() < 2 {
+        // Closing the sole tab would tear down the session; leave it and let the
+        // persisted override apply on the next launch.
+        return Ok(());
+    }
+    let _ = zellij::close_tab_by_name(name);
+    open_worktree_tab(path, name)?;
+    let _ = zellij::go_to_tab_name(name);
+    Ok(())
+}
+
 fn write_multi_tab_layout(
     bare: bool,
     worktrees: &[Worktree],
@@ -392,33 +421,44 @@ fn nix_available() -> bool {
 }
 
 /// Glue that drops into the nix dev shell when a flake/shell.nix/default.nix is
-/// present and `exec`s `in_nix` there, otherwise `exec`s `direct` directly.
-/// Written in `shell`'s dialect (fish vs POSIX). When `nix` is `false` (no nix
-/// on `$PATH`) the whole detection is skipped and we just `exec` `direct`.
-fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
+/// present and runs `in_nix` there, otherwise runs `direct` directly. Written in
+/// `shell`'s dialect (fish vs POSIX). When `nix` is `false` (no nix on `$PATH`)
+/// the whole detection is skipped and we just run `direct`.
+///
+/// `exec` controls whether the command replaces the shell (`exec …`) or runs as
+/// a child so control returns afterward — the latter lets a caller chain a
+/// follow-up (e.g. drop to an interactive shell once an agent exits).
+fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str, exec: bool) -> String {
+    let kw = if exec { "exec " } else { "" };
     if !nix {
-        return format!("exec {direct}");
+        return format!("{kw}{direct}");
     }
     if shell.is_fish {
         format!(
             "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
-             if test -f .git; exec nix develop path:. --command {in_nix}; \
-             else; exec nix develop --command {in_nix}; end; \
-             else; exec {direct}; end"
+             if test -f .git; {kw}nix develop path:. --command {in_nix}; \
+             else; {kw}nix develop --command {in_nix}; end; \
+             else; {kw}{direct}; end"
         )
     } else {
         format!(
             "if [ -f flake.nix ] || [ -f shell.nix ] || [ -f default.nix ]; then \
-             if [ -f .git ]; then exec nix develop path:. --command {in_nix}; \
-             else exec nix develop --command {in_nix}; fi; \
-             else exec {direct}; fi"
+             if [ -f .git ]; then {kw}nix develop path:. --command {in_nix}; \
+             else {kw}nix develop --command {in_nix}; fi; \
+             else {kw}{direct}; fi"
         )
     }
 }
 
 fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
     let sh = user_shell();
-    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    let shell_glue = nix_entry(
+        &sh,
+        nix,
+        &format!("bash -c 'exec {}'", sh.path),
+        &sh.path,
+        true,
+    );
     let d = &cfg.dashboard;
     s.push_str(&format!(
         r#"    pane split_direction="vertical" {{
@@ -487,12 +527,21 @@ fn push_worktree_panes(
         (Harness::Claude, Some(id)) => format!("$cp --resume {id}"),
         _ => "$cp".to_string(),
     };
-    let agent_glue = format!(
-        "{agent_prefix}{}",
-        nix_entry(&sh, nix, &agent_cmd, &agent_cmd)
+    let shell_glue = nix_entry(
+        &sh,
+        nix,
+        &format!("bash -c 'exec {}'", sh.path),
+        &sh.path,
+        true,
     );
-
-    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    // Run the agent as a child (not `exec`), then drop into an interactive nix
+    // shell once it exits. So quitting the harness leaves a usable prompt in the
+    // pane — you can relaunch it, or run the other harness by hand — instead of
+    // a dead pane.
+    let agent_glue = format!(
+        "{agent_prefix}{}; {shell_glue}",
+        nix_entry(&sh, nix, &agent_cmd, &agent_cmd, false)
+    );
 
     s.push_str(&format!(
         r#"    pane split_direction="vertical" {{
@@ -652,14 +701,20 @@ mod tests {
             is_fish: false,
         };
 
-        let f = nix_entry(&fish, true, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
+        let f = nix_entry(
+            &fish,
+            true,
+            "bash -c 'exec /usr/bin/fish'",
+            "/usr/bin/fish",
+            true,
+        );
         assert!(
             f.contains("if test -f flake.nix") && f.trim_end().ends_with("end"),
             "fish dialect; got:\n{f}"
         );
         assert!(!f.contains("STARSHIP"), "starship glue is gone; got:\n{f}");
 
-        let b = nix_entry(&bash, true, "bash -c 'exec /bin/bash'", "/bin/bash");
+        let b = nix_entry(&bash, true, "bash -c 'exec /bin/bash'", "/bin/bash", true);
         assert!(
             b.contains("if [ -f flake.nix ]") && b.trim_end().ends_with("fi"),
             "posix dialect; got:\n{b}"
@@ -676,12 +731,13 @@ mod tests {
             false,
             "bash -c 'exec /usr/bin/fish'",
             "/usr/bin/fish",
+            true,
         );
         assert_eq!(
             nf, "exec /usr/bin/fish",
             "no-nix fish glue is a bare exec; got:\n{nf}"
         );
-        let nb = nix_entry(&bash, false, "bash -c 'exec /bin/bash'", "/bin/bash");
+        let nb = nix_entry(&bash, false, "bash -c 'exec /bin/bash'", "/bin/bash", true);
         assert_eq!(
             nb, "exec /bin/bash",
             "no-nix posix glue is a bare exec; got:\n{nb}"
@@ -689,6 +745,16 @@ mod tests {
         assert!(
             !nf.contains("nix develop") && !nb.contains("nix develop"),
             "no nix develop when nix absent"
+        );
+
+        // With `exec=false` the command runs as a child (no `exec` keyword), so a
+        // caller can chain a follow-up after it returns.
+        let nrun = nix_entry(&bash, false, "x", "/bin/agent", false);
+        assert_eq!(nrun, "/bin/agent", "non-exec glue omits the exec keyword");
+        let run = nix_entry(&bash, true, "$cp", "$cp", false);
+        assert!(
+            run.contains("nix develop") && !run.contains("exec "),
+            "non-exec nix glue runs as a child; got:\n{run}"
         );
     }
 
@@ -810,6 +876,34 @@ mod tests {
         assert!(
             !s.contains("command -v claude"),
             "codex harness must not invoke claude; got:\n{s}"
+        );
+    }
+
+    /// The agent runs as a child (not `exec`) and the pane drops into an
+    /// interactive shell when it exits, so quitting the harness leaves a usable
+    /// prompt rather than a dead pane.
+    #[test]
+    fn worktree_agent_pane_drops_to_shell_on_exit() {
+        // SAFETY: single-threaded test; no other thread reads the environment.
+        unsafe { std::env::set_var("SHELL", "/bin/bash") };
+
+        let mut s = String::new();
+        push_worktree_panes(
+            &mut s,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            false,
+            None,
+            Harness::Claude,
+        );
+        // Agent is not exec'd, and the shell follows once it returns.
+        assert!(
+            s.contains("$cp; exec /bin/bash"),
+            "agent runs then drops to a shell; got:\n{s}"
+        );
+        assert!(
+            !s.contains("exec $cp"),
+            "agent must not be exec'd (else the pane dies on exit); got:\n{s}"
         );
     }
 

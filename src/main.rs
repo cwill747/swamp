@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
             session_id,
         }) => hook::run(status, dir, session_name, session_id).await,
         Some(cli::Cmd::CodexNotify { payload }) => codex_notify::run(payload).await,
+        Some(cli::Cmd::RelaunchTab { name, dir }) => launch::relaunch_worktree_tab(&name, &dir),
         Some(cli::Cmd::Kill { dir }) => kill::run(dir),
         Some(cli::Cmd::Init) => config::init(),
     }

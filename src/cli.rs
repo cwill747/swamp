@@ -75,6 +75,15 @@ pub enum Cmd {
         payload: Vec<String>,
     },
 
+    /// Close and reopen a worktree's tab so a harness swap takes effect live.
+    /// Spawned detached by the TUI; not typically run by hand.
+    RelaunchTab {
+        /// The worktree (tab) name.
+        name: String,
+        /// The worktree's path.
+        dir: PathBuf,
+    },
+
     /// Kill the swamp daemon and zellij session for this repo.
     Kill {
         /// Path inside the repo (default: cwd).

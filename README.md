@@ -312,10 +312,15 @@ A malformed config doesn't block a launch — swamp warns and uses defaults.
 The `[harness] default` setting is tri-state. `claude` or `codex` pin every
 worktree's agent pane to that agent. `choose` lets you pick per-worktree:
 highlight a worktree in the worktrees pane and press **`h`**, then `c` (Claude)
-or `x` (Codex). The choice is persisted in `.swamp-status.json` and takes effect
-the next time swamp builds that worktree's tab (e.g. after `swamp kill` +
-relaunch, or when the tab is reopened). A small `C`/`X` indicator in the
-worktrees table shows the recorded override.
+or `x` (Codex). The choice is persisted in `.swamp-status.json` and applied
+**live** — swamp closes and reopens that worktree's tab so its agent pane comes
+back up as the chosen harness (it also still applies on the next launch). A small
+`C`/`X` indicator in the worktrees table shows the recorded override.
+
+The agent pane runs the harness as a child of an interactive shell rather than
+replacing it, so when you quit the harness you land at a shell prompt in that
+pane (inside the nix dev shell, if any) — handy for relaunching it or running the
+other agent by hand.
 
 Codex reports agent status through its [`notify`](#codex-notify) hook, which
 [`swamp init`](#swamp-init) wires up. Because Codex only emits an
