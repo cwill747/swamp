@@ -191,23 +191,56 @@ fn apply_swamp_hooks(settings: &mut Value) -> bool {
             }
         };
 
-        // Update any existing swamp hook command in this event.
+        // Update any existing swamp hook command in this event, and refresh the
+        // enclosing group's matcher so a stale/missing matcher still fires for
+        // every intended case.
         let mut found = false;
         for group in arr.iter_mut() {
-            let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            let has_swamp = group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|inner| {
+                    inner.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_swamp_command)
+                    })
+                });
+            if !has_swamp {
                 continue;
-            };
+            }
+            found = true;
+
+            // Bring the group's matcher in line with the desired one.
+            let group_obj = group.as_object_mut().unwrap();
+            match matcher {
+                Some(m) => {
+                    if group_obj.get("matcher").and_then(|v| v.as_str()) != Some(*m) {
+                        group_obj.insert("matcher".into(), json!(m));
+                        changed = true;
+                    }
+                }
+                None => {
+                    if group_obj.remove("matcher").is_some() {
+                        changed = true;
+                    }
+                }
+            }
+
+            let inner = group_obj
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+                .unwrap();
             for hook in inner.iter_mut() {
                 let is_swamp = hook
                     .get("command")
                     .and_then(|c| c.as_str())
                     .is_some_and(is_swamp_command);
-                if is_swamp {
-                    found = true;
-                    if hook.get("command").and_then(|c| c.as_str()) != Some(desired.as_str()) {
-                        hook["command"] = json!(desired);
-                        changed = true;
-                    }
+                if is_swamp
+                    && hook.get("command").and_then(|c| c.as_str()) != Some(desired.as_str())
+                {
+                    hook["command"] = json!(desired);
+                    changed = true;
                 }
             }
         }
@@ -427,6 +460,59 @@ mod tests {
         assert_eq!(cmd, swamp_hook_command("idle"));
         // Only one swamp group — we updated in place, didn't append a duplicate.
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_swamp_hooks_refreshes_stale_matcher() {
+        // An existing swamp hook whose group has a too-narrow matcher should get
+        // its matcher refreshed, not just its command.
+        let mut settings = json!({
+            "hooks": {
+                "Notification": [
+                    {
+                        "matcher": "permission_prompt",
+                        "hooks": [ { "type": "command", "command": swamp_hook_command("waiting") } ]
+                    }
+                ]
+            }
+        });
+        assert!(
+            apply_swamp_hooks(&mut settings),
+            "stale matcher must trigger an update"
+        );
+        let group = &settings["hooks"]["Notification"][0];
+        assert_eq!(
+            group["matcher"].as_str().unwrap(),
+            "permission_prompt|elicitation_dialog"
+        );
+        // No duplicate group appended.
+        assert_eq!(
+            settings["hooks"]["Notification"].as_array().unwrap().len(),
+            1
+        );
+        // Idempotent on a second pass.
+        assert!(!apply_swamp_hooks(&mut settings));
+    }
+
+    #[test]
+    fn apply_swamp_hooks_drops_unwanted_matcher() {
+        // A swamp hook on a no-matcher event should have any stray matcher removed.
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "something",
+                        "hooks": [ { "type": "command", "command": swamp_hook_command("idle") } ]
+                    }
+                ]
+            }
+        });
+        assert!(
+            apply_swamp_hooks(&mut settings),
+            "stray matcher must be removed"
+        );
+        assert!(settings["hooks"]["Stop"][0].get("matcher").is_none());
+        assert!(!apply_swamp_hooks(&mut settings));
     }
 
     #[test]
