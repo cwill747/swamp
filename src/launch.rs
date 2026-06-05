@@ -337,6 +337,7 @@ mod tests {
     fn dummy_cfg() -> ConfigPaths {
         ConfigPaths {
             lazygit: PathBuf::from("/tmp/swamp/lazygit.yml"),
+            dashboard: crate::config::DashboardConfig::default(),
         }
     }
 
@@ -652,12 +653,13 @@ fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
     }
 }
 
-fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
+fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
     let sh = user_shell();
     let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    let d = &cfg.dashboard;
     s.push_str(&format!(
         r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="33%" {{
+      pane split_direction="horizontal" size="{worktrees_col}%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "worktrees"
           name "worktrees"
@@ -667,7 +669,7 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix
           name "resources"
         }}
       }}
-      pane split_direction="horizontal" size="34%" {{
+      pane split_direction="horizontal" size="{ai_col}%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "ai-status"
           name "ai-status"
@@ -677,12 +679,15 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix
           name "pr-status"
         }}
       }}
-      pane command="{shell_path}" size="33%" {{
+      pane command="{shell_path}" size="{shell_col}%" {{
         args "{run_flag}" "{shell_glue}"
         name "shell"
       }}
     }}
 "#,
+        worktrees_col = d.worktrees_column,
+        ai_col = d.ai_column,
+        shell_col = d.shell_column,
         shell_path = sh.path,
         run_flag = sh.run_flag
     ));

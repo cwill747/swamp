@@ -72,4 +72,7 @@ pub enum Cmd {
         /// Path inside the repo (default: cwd).
         dir: Option<PathBuf>,
     },
+
+    /// Write swamp's config file and install/update Claude Code hooks.
+    Init,
 }

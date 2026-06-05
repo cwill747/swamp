@@ -1,0 +1,16 @@
+# swamp configuration
+#
+# Lives at $XDG_CONFIG_HOME/swamp/config.toml (usually ~/.config/swamp/config.toml).
+# Written by `swamp init`; safe to edit. Missing values fall back to the
+# defaults shown below.
+
+[dashboard]
+# The dashboard is three side-by-side columns. These set each column's width as
+# a percentage of the terminal; they should sum to roughly 100.
+#
+#   worktrees_column — left column: worktrees + resources panes
+#   ai_column        — middle column: ai-status + pr-status panes
+#   shell_column     — right column: an interactive shell
+worktrees_column = 33
+ai_column = 34
+shell_column = 33
