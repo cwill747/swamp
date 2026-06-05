@@ -252,7 +252,11 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<(
 async fn ensure_daemon(start: &std::path::Path) -> Result<()> {
     let common = git_common_dir(start)?;
     let sock = daemon::socket_path(&common);
-    if sock.exists() {
+    // Probe rather than trust the file: a daemon that died can leave its socket
+    // behind, and a bare existence check would declare that stale file healthy
+    // and spawn nothing, leaving the TUI's subscribe loop stuck on a connection
+    // that's refused forever. `serve` itself removes a stale socket on startup.
+    if daemon::probe(&sock).await.is_ok() {
         return Ok(());
     }
     let me = std::env::current_exe()?;
@@ -263,8 +267,11 @@ async fn ensure_daemon(start: &std::path::Path) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
+    // Wait for a daemon that actually answers, not just for the socket file to
+    // reappear — during a stale-socket restart the old file lingers until the
+    // new daemon rebinds, so existence alone would return prematurely.
     for _ in 0..40 {
-        if sock.exists() {
+        if daemon::probe(&sock).await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
