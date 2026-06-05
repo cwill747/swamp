@@ -286,6 +286,55 @@ impl Daemon {
         }
     }
 
+    /// Fetch all remotes and fast-forward the default branch in its worktree,
+    /// the equivalent of the old `git wt update`, then broadcast the refreshed
+    /// snapshot.
+    pub async fn update_default(&self) -> Result<()> {
+        let fetch = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.common_dir)
+            .args(["fetch", "--all", "--prune"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .context("git fetch")?;
+        if !fetch.success() {
+            anyhow::bail!("git fetch exited {fetch}");
+        }
+
+        // Fast-forward the default branch in its worktree (if it's checked out).
+        // Merge the remote-tracking ref explicitly rather than `@{u}`: in a
+        // bare/git-wt layout the default branch often has no upstream
+        // configured, which would make `@{u}` fail with "no upstream
+        // configured".
+        let common = self.common_dir.clone();
+        let (wt, branch) = tokio::task::spawn_blocking(move || {
+            (
+                crate::worktree::default_worktree_path(&common),
+                crate::worktree::default_branch(&common),
+            )
+        })
+        .await
+        .context("locate default worktree")?;
+        if let Some(path) = wt {
+            let remote_ref = format!("origin/{branch}");
+            let out = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["merge", "--ff-only", &remote_ref])
+                .output()
+                .await
+                .context("git merge --ff-only")?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("fast-forward failed: {}", stderr.trim());
+            }
+        }
+
+        self.refresh_all().await
+    }
+
     /// Create a worktree for `branch` (git2, off the async thread) and
     /// broadcast the refreshed snapshot.
     pub async fn create_worktree(&self, branch: &str) -> Result<()> {

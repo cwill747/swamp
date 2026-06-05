@@ -217,6 +217,19 @@ pub fn find_default_worktree<'a>(worktrees: &'a [Worktree], dir: &Path) -> Optio
         .or_else(|| worktrees.first())
 }
 
+/// Path of the worktree that has the default branch checked out, if any. Unlike
+/// [`find_default_worktree`] this never falls back to an unrelated worktree — it
+/// returns `None` when the default branch isn't checked out anywhere, so callers
+/// (e.g. the "update" action) don't fast-forward the wrong tree.
+pub fn default_worktree_path(common_dir: &Path) -> Option<PathBuf> {
+    let default = default_branch(common_dir);
+    list_worktrees(common_dir)
+        .ok()?
+        .into_iter()
+        .find(|w| w.branch == default)
+        .map(|w| w.path)
+}
+
 /// Collect git status for a single worktree at `dir`.
 pub fn git_info(dir: &Path) -> Result<GitInfo> {
     let repo = Repository::open(dir)?;
