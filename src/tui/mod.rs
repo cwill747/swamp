@@ -8,10 +8,10 @@ use crate::kill;
 use crate::daemon::resources;
 use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::daemon::{self};
-use crate::worktree::{git_common_dir, resolve_git_dir};
+use crate::worktree::{git_common_dir, resolve_git_dir, BranchInfo};
 use crate::zellij;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -22,6 +22,94 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+
+/// An active prompt that captures keystrokes instead of the normal navigation
+/// keys.
+pub enum InputMode {
+    /// The git-wt-style create picker (centered modal overlay).
+    Create(CreatePicker),
+    /// Confirming deletion of the named worktree. `dirty` is true when the
+    /// worktree has uncommitted work, which turns the prompt into a force
+    /// override (deletion proceeds with `force: true`).
+    ConfirmDelete { name: String, dirty: bool },
+}
+
+/// Which step of the [`CreatePicker`] is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateStep {
+    /// Choosing an existing branch, or typing a new branch name.
+    Branch,
+    /// Choosing the base branch for the new branch named in `new_branch`.
+    Base,
+}
+
+/// State for the two-step "create worktree" modal: pick an existing branch to
+/// spin a worktree from, or type a new branch name and then pick its base.
+pub struct CreatePicker {
+    pub step: CreateStep,
+    /// Current filter text (and, in the Branch step, the new-branch name).
+    pub filter: String,
+    /// All branches reported by the daemon (empty until the reply lands).
+    pub branches: Vec<BranchInfo>,
+    /// Selected index into the *filtered* entry list (see [`CreatePicker::entries`]).
+    pub selected: usize,
+    /// First visible entry index (scroll offset).
+    pub scroll: usize,
+    /// In the Base step, the new branch name chosen in the Branch step.
+    pub new_branch: Option<String>,
+    /// True while waiting for the daemon's branch list.
+    pub loading: bool,
+}
+
+/// One row in the create picker's filtered list.
+pub enum CreateEntry<'a> {
+    /// Synthetic "create a new branch" row carrying the typed name.
+    New(&'a str),
+    /// An existing branch.
+    Branch(&'a BranchInfo),
+}
+
+/// The action a confirmed selection resolves to (owned, so the picker borrow
+/// can be released before we act).
+enum CreateAction {
+    New(String),
+    Branch(String),
+}
+
+impl CreatePicker {
+    /// The visible, filtered entries for the current step. The Branch step
+    /// excludes already-checked-out branches and prepends a synthetic "new
+    /// branch" row when the filter is non-empty and matches no branch; the Base
+    /// step lists every branch (any branch is a valid base).
+    pub fn entries(&self) -> Vec<CreateEntry<'_>> {
+        let needle = self.filter.trim().to_lowercase();
+        let mut out: Vec<CreateEntry<'_>> = Vec::new();
+        match self.step {
+            CreateStep::Branch => {
+                let trimmed = self.filter.trim();
+                let exact = self.branches.iter().any(|b| b.name == trimmed);
+                if !trimmed.is_empty() && !exact {
+                    out.push(CreateEntry::New(trimmed));
+                }
+                out.extend(
+                    self.branches
+                        .iter()
+                        .filter(|b| !b.checked_out && b.name.to_lowercase().contains(&needle))
+                        .map(CreateEntry::Branch),
+                );
+            }
+            CreateStep::Base => {
+                out.extend(
+                    self.branches
+                        .iter()
+                        .filter(|b| b.name.to_lowercase().contains(&needle))
+                        .map(CreateEntry::Branch),
+                );
+            }
+        }
+        out
+    }
+}
 
 /// A clickable PR row: enough to open it in a browser.
 #[derive(Clone)]
@@ -43,6 +131,8 @@ pub struct HitRegions {
     pub prs: Option<(Rect, Vec<PrHit>)>,
     /// Full Resources panel area (for scroll routing).
     pub resources: Option<Rect>,
+    /// Create-picker list rows area: clicks/scroll map to filtered entries.
+    pub create_list: Option<Rect>,
 }
 
 pub struct AppState {
@@ -54,8 +144,11 @@ pub struct AppState {
     pub refreshing: bool,
     pub pending_delete: Option<String>,
     pub pending_create: bool,
-    pub create_input_received: bool,
     pub pre_create_names: HashSet<String>,
+    /// Active footer prompt (create/delete), if any.
+    pub input: Option<InputMode>,
+    /// Transient one-line status/error shown in the footer.
+    pub status_msg: Option<String>,
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
@@ -179,6 +272,13 @@ enum AppEvent {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     RefreshDone(Vec<String>),
+    /// The daemon's reply to a ListBranches request, for the open create picker.
+    Branches(Vec<BranchInfo>),
+    /// A create/delete request failed; surface the message in the footer.
+    ActionError(String),
+    /// A non-forced delete was refused because the worktree is dirty; re-open
+    /// the confirmation as a force override.
+    DeleteNeedsForce(String),
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -242,8 +342,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
         refreshing: false,
         pending_delete: None,
         pending_create: false,
-        create_input_received: false,
         pre_create_names: HashSet::new(),
+        input: None,
+        status_msg: None,
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
@@ -271,6 +372,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     if !app.snapshot.rows.iter().any(|r| &r.name == name) {
                         let _ = zellij::close_tab_by_name(name);
                         app.pending_delete = None;
+                        app.status_msg = None;
                     }
                 }
                 if app.pending_create {
@@ -285,8 +387,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             let _ = zellij::go_to_tab_name(&last.name);
                         }
                         app.pending_create = false;
-                    } else if app.create_input_received {
-                        app.pending_create = false;
+                        app.status_msg = None;
                     }
                 }
             }
@@ -312,17 +413,41 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                 }
             }
+            AppEvent::Branches(branches) => {
+                if let Some(InputMode::Create(p)) = app.input.as_mut() {
+                    p.loading = false;
+                    if p.step == CreateStep::Base {
+                        p.selected = branches.iter().position(|b| b.is_default).unwrap_or(0);
+                    }
+                    p.branches = branches;
+                }
+            }
+            AppEvent::ActionError(msg) => {
+                app.pending_create = false;
+                app.pending_delete = None;
+                app.input = None;
+                app.status_msg = Some(msg);
+            }
+            AppEvent::DeleteNeedsForce(name) => {
+                // The snapshot looked clean but the daemon found uncommitted
+                // work; re-prompt as a force override instead of failing.
+                app.pending_delete = None;
+                app.status_msg = None;
+                app.input = Some(InputMode::ConfirmDelete { name, dirty: true });
+            }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if app.pending_create && !app.create_input_received {
-                    app.create_input_received = true;
-                    let tx = tx.clone();
-                    let common = common.to_path_buf();
-                    tokio::spawn(async move {
-                        let _ = send_refresh(&common, tx).await;
-                    });
+                if matches!(app.input, Some(InputMode::Create(_))) {
+                    handle_create_key(&mut app, k, &tx, common);
+                    terminal.draw(|f| view::render(f, &mut app))?;
+                    continue;
+                }
+                if let Some(mode) = app.input.take() {
+                    handle_input_key(&mut app, mode, k, &tx, common);
+                    terminal.draw(|f| view::render(f, &mut app))?;
+                    continue;
                 }
                 match k.code {
                     KeyCode::Char('q') => return Ok(()),
@@ -365,37 +490,38 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         }
                     }
                     KeyCode::Char('c') => {
-                        app.pre_create_names = app.snapshot.rows.iter()
-                            .map(|r| r.name.clone())
-                            .collect();
-                        app.pending_create = true;
-                        app.create_input_received = false;
-                        let cwd = app.snapshot.rows.first()
-                            .map(|r| r.path.clone())
-                            .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
-                        let _ = zellij::run_floating(
-                            "git",
-                            &["wt", "add"],
-                            &cwd,
-                            "60%", "40%",
-                        );
+                        app.status_msg = None;
+                        app.input = Some(InputMode::Create(CreatePicker {
+                            step: CreateStep::Branch,
+                            filter: String::new(),
+                            branches: Vec::new(),
+                            selected: 0,
+                            scroll: 0,
+                            new_branch: None,
+                            loading: true,
+                        }));
+                        let tx = tx.clone();
+                        let common = common.to_path_buf();
+                        tokio::spawn(async move {
+                            match request_branches(&common).await {
+                                Ok(branches) => {
+                                    let _ = tx.send(AppEvent::Branches(branches)).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                                }
+                            }
+                        });
                     }
                     KeyCode::Char('d') => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
-                            let name = row.name.clone();
-                            app.pending_delete = Some(name.clone());
-                            // Run from a *different* worktree — removing the one
-                            // we're cd'd into would yank the shell's cwd.
-                            let cwd = app.snapshot.rows.iter()
-                                .find(|r| r.name != name)
-                                .map(|r| r.path.clone())
-                                .unwrap_or_else(|| common.parent().unwrap_or(common).to_path_buf());
-                            let _ = zellij::run_floating(
-                                "git",
-                                &["wt", "remove", &name],
-                                &cwd,
-                                "60%", "40%",
-                            );
+                            app.status_msg = None;
+                            let dirty = row.staged + row.unstaged + row.untracked > 0
+                                || row.conflict;
+                            app.input = Some(InputMode::ConfirmDelete {
+                                name: row.name.clone(),
+                                dirty,
+                            });
                         }
                     }
                     KeyCode::Char('r') if !app.refreshing => {
@@ -416,7 +542,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     _ => {}
                 }
             }
-            AppEvent::Input(Event::Mouse(m)) => handle_mouse(&mut app, m),
+            AppEvent::Input(Event::Mouse(m)) => handle_mouse(&mut app, m, &tx, common),
             AppEvent::Input(_) => {}
         }
         terminal.draw(|f| view::render(f, &mut app))?;
@@ -458,7 +584,17 @@ fn jump_to_worktree(app: &AppState, idx: usize) {
     }
 }
 
-fn handle_mouse(app: &mut AppState, m: MouseEvent) {
+fn handle_mouse(
+    app: &mut AppState,
+    m: MouseEvent,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    // While the create picker is open it owns all mouse input.
+    if matches!(app.input, Some(InputMode::Create(_))) {
+        handle_create_mouse(app, m, tx, common);
+        return;
+    }
     let (col, row) = (m.column, m.row);
     match m.kind {
         // Scroll routes to whatever panel the cursor is over.
@@ -531,6 +667,250 @@ fn handle_mouse(app: &mut AppState, m: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Handle a keystroke while a footer prompt is active. `app.input` was already
+/// taken by the caller, so each branch re-stores it to stay open, or leaves it
+/// `None` to dismiss the prompt. (The create picker is handled separately by
+/// [`handle_create_key`].)
+fn handle_input_key(
+    app: &mut AppState,
+    mode: InputMode,
+    k: KeyEvent,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    match mode {
+        // The create picker keeps its state in `app.input` and is dispatched
+        // before this function is reached; it never arrives here.
+        InputMode::Create(picker) => {
+            app.input = Some(InputMode::Create(picker));
+        }
+        InputMode::ConfirmDelete { name, dirty } => match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.pending_delete = Some(name.clone());
+                app.status_msg = Some(format!("Deleting {name}…"));
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) = send_action(
+                        &common,
+                        ClientMsg::RemoveWorktree { name, force: dirty },
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                    }
+                });
+            }
+            _ => {} // n / Esc / anything else cancels
+        },
+    }
+}
+
+/// Handle a keystroke while the create picker is open. Mutates the picker in
+/// place via `app.input`; Enter is delegated to [`create_confirm`].
+fn handle_create_key(
+    app: &mut AppState,
+    k: KeyEvent,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => {
+            // From the Base step, Esc steps back to the Branch step (restoring
+            // the typed name); from the Branch step it cancels the picker.
+            if let Some(InputMode::Create(p)) = app.input.as_mut() {
+                if p.step == CreateStep::Base {
+                    p.step = CreateStep::Branch;
+                    p.filter = p.new_branch.take().unwrap_or_default();
+                    p.selected = 0;
+                    p.scroll = 0;
+                    return;
+                }
+            }
+            app.input = None;
+        }
+        KeyCode::Char('c') if ctrl => app.input = None,
+        KeyCode::Enter => create_confirm(app, tx, common),
+        KeyCode::Up => create_move_sel(app, -1),
+        KeyCode::Down => create_move_sel(app, 1),
+        KeyCode::Char('p') if ctrl => create_move_sel(app, -1),
+        KeyCode::Char('n') if ctrl => create_move_sel(app, 1),
+        KeyCode::Backspace => {
+            if let Some(InputMode::Create(p)) = app.input.as_mut() {
+                p.filter.pop();
+                p.selected = 0;
+                p.scroll = 0;
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            if let Some(InputMode::Create(p)) = app.input.as_mut() {
+                p.filter.push(c);
+                p.selected = 0;
+                p.scroll = 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move the picker selection by `delta`, clamped to the filtered entry list.
+fn create_move_sel(app: &mut AppState, delta: i32) {
+    if let Some(InputMode::Create(p)) = app.input.as_mut() {
+        let n = p.entries().len();
+        if n == 0 {
+            p.selected = 0;
+            return;
+        }
+        let next = p.selected as i32 + delta;
+        p.selected = next.clamp(0, n as i32 - 1) as usize;
+    }
+}
+
+/// Act on the currently-selected picker entry: advance to the Base step for a
+/// new branch, or fire the create request for an existing branch / chosen base.
+fn create_confirm(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    let Some(InputMode::Create(mut picker)) = app.input.take() else {
+        return;
+    };
+    let action = {
+        let entries = picker.entries();
+        entries.get(picker.selected).map(|e| match e {
+            CreateEntry::New(name) => CreateAction::New(name.to_string()),
+            CreateEntry::Branch(b) => CreateAction::Branch(b.name.clone()),
+        })
+    };
+    match (picker.step, action) {
+        (CreateStep::Branch, Some(CreateAction::New(name))) => {
+            picker.step = CreateStep::Base;
+            picker.new_branch = Some(name);
+            picker.filter.clear();
+            picker.selected = picker
+                .branches
+                .iter()
+                .position(|b| b.is_default)
+                .unwrap_or(0);
+            picker.scroll = 0;
+            app.input = Some(InputMode::Create(picker));
+        }
+        (CreateStep::Branch, Some(CreateAction::Branch(branch))) => {
+            start_create(app, tx, common, ClientMsg::CreateWorktree { branch });
+        }
+        (CreateStep::Base, Some(CreateAction::Branch(base))) => {
+            if let Some(branch) = picker.new_branch.clone() {
+                start_create(
+                    app,
+                    tx,
+                    common,
+                    ClientMsg::CreateWorktreeFromBase { branch, base },
+                );
+            }
+        }
+        // Nothing selectable, or an impossible combo: reopen unchanged.
+        _ => app.input = Some(InputMode::Create(picker)),
+    }
+}
+
+/// Fire a worktree-create request and arm the pending-create tracking so the
+/// new tab opens when the next snapshot arrives. Leaves `app.input` closed.
+fn start_create(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+    msg: ClientMsg,
+) {
+    let label = match &msg {
+        ClientMsg::CreateWorktree { branch }
+        | ClientMsg::CreateWorktreeFromBase { branch, .. } => branch.clone(),
+        _ => String::new(),
+    };
+    app.pre_create_names = app.snapshot.rows.iter().map(|r| r.name.clone()).collect();
+    app.pending_create = true;
+    app.status_msg = Some(format!("Creating {label}…"));
+    let tx = tx.clone();
+    let common = common.to_path_buf();
+    tokio::spawn(async move {
+        if let Err(e) = send_action(&common, msg, tx.clone()).await {
+            let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+        }
+    });
+}
+
+/// Route a mouse event to the open create picker: scroll/click select an entry,
+/// double-click confirms it.
+fn handle_create_mouse(
+    app: &mut AppState,
+    m: MouseEvent,
+    tx: &mpsc::Sender<AppEvent>,
+    common: &std::path::Path,
+) {
+    match m.kind {
+        MouseEventKind::ScrollDown => create_move_sel(app, 1),
+        MouseEventKind::ScrollUp => create_move_sel(app, -1),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(area) = app.regions.create_list else {
+                return;
+            };
+            let dbl = is_double_click(app, m.column, m.row);
+            if let Some(InputMode::Create(p)) = app.input.as_mut() {
+                let n = p.entries().len();
+                let visible = n.saturating_sub(p.scroll).min(area.height as usize);
+                if let Some(idx) = row_index(area, visible, m.column, m.row) {
+                    p.selected = (p.scroll + idx).min(n.saturating_sub(1));
+                }
+            }
+            if dbl {
+                create_confirm(app, tx, common);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Ask the daemon for the branch list (for the create picker). The connection
+/// also receives periodic broadcasts (snapshots/resources), so skip any frame
+/// that isn't the reply we asked for.
+async fn request_branches(common: &std::path::Path) -> Result<Vec<BranchInfo>> {
+    let sock = daemon::socket_path(common);
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(&mut stream, &ClientMsg::ListBranches).await?;
+    loop {
+        match read_server_msg(&mut stream).await? {
+            Some(ServerMsg::Branches { branches }) => return Ok(branches),
+            Some(ServerMsg::Err { message }) => anyhow::bail!(message),
+            Some(_) => continue, // stray broadcast; keep reading
+            None => return Ok(Vec::new()),
+        }
+    }
+}
+
+/// Send a create/remove request to the daemon and forward any error message
+/// back to the UI. Success is observed via the broadcast snapshot.
+async fn send_action(
+    common: &std::path::Path,
+    msg: ClientMsg,
+    tx: mpsc::Sender<AppEvent>,
+) -> Result<()> {
+    let sock = daemon::socket_path(common);
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(&mut stream, &msg).await?;
+    match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Err { message }) => {
+            let _ = tx.send(AppEvent::ActionError(message)).await;
+        }
+        Some(ServerMsg::ErrDirty { name }) => {
+            let _ = tx.send(AppEvent::DeleteNeedsForce(name)).await;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Result<()> {

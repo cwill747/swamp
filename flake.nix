@@ -27,7 +27,8 @@
             inherit src;
             pname = "swamp";
             version = self.shortRev or self.dirtyShortRev or "dev";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            # cmake: libgit2-sys builds vendored libgit2 from source.
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -46,7 +47,8 @@
                 src = staticSrc;
                 pname = "swamp";
                 version = self.shortRev or self.dirtyShortRev or "dev";
-                nativeBuildInputs = [ pkgs.pkg-config ];
+                # cmake: libgit2-sys builds vendored libgit2 from source.
+                nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
                 strictDeps = true;
                 CARGO_BUILD_TARGET = target;
                 CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
@@ -85,7 +87,7 @@
 
       devShells = forAllSystems (_: pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.rust-analyzer ];
+          packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.rust-analyzer pkgs.pkg-config pkgs.cmake ];
         };
       });
 

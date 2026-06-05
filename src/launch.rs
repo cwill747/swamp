@@ -290,8 +290,6 @@ mod tests {
         Worktree {
             path: PathBuf::from(path),
             branch: branch.into(),
-            head: "abc1234".into(),
-            bare: false,
         }
     }
 

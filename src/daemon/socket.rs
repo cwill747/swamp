@@ -1,6 +1,7 @@
 use super::resources;
 use super::state::{PrSnapshot, Snapshot};
 use super::Daemon;
+use crate::worktree::BranchInfo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -21,6 +22,14 @@ pub enum ClientMsg {
     },
     GetVersion,
     Refresh,
+    ListBranches,
+    CreateWorktree { branch: String },
+    CreateWorktreeFromBase { branch: String, base: String },
+    RemoveWorktree {
+        name: String,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +41,12 @@ pub enum ServerMsg {
     PrStatus(PrSnapshot),
     Ok,
     Err { message: String },
+    /// A non-forced `RemoveWorktree` was refused because the worktree has
+    /// uncommitted work. The client may retry with `force: true`.
+    ErrDirty { name: String },
     Version { version: String },
     RefreshDone { worktree_names: Vec<String> },
+    Branches { branches: Vec<BranchInfo> },
 }
 
 pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
@@ -67,6 +80,50 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let snap = daemon.state.read().await.snapshot();
                         let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
                         write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
+                    }
+                    ClientMsg::ListBranches => {
+                        let common = daemon.common_dir.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            crate::worktree::list_branches(&common)
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(branches)) => {
+                                write_msg(&mut stream, &ServerMsg::Branches { branches }).await?
+                            }
+                            Ok(Err(e)) => {
+                                write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?
+                            }
+                            Err(e) => {
+                                write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?
+                            }
+                        }
+                    }
+                    ClientMsg::CreateWorktree { branch } => {
+                        match daemon.create_worktree(&branch).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
+                    }
+                    ClientMsg::CreateWorktreeFromBase { branch, base } => {
+                        match daemon.create_worktree_from_base(&branch, &base).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
+                    }
+                    ClientMsg::RemoveWorktree { name, force } => {
+                        match daemon.remove_worktree(&name, force).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => {
+                                // Surface a dirty refusal distinctly so the TUI
+                                // can offer a force override.
+                                let reply = match e.downcast_ref::<crate::worktree::DirtyWorktree>() {
+                                    Some(d) => ServerMsg::ErrDirty { name: d.name.clone() },
+                                    None => ServerMsg::Err { message: e.to_string() },
+                                };
+                                write_msg(&mut stream, &reply).await?
+                            }
+                        }
                     }
                 }
             }
@@ -171,6 +228,13 @@ mod tests {
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
+            ClientMsg::ListBranches,
+            ClientMsg::CreateWorktree { branch: "feature/x".into() },
+            ClientMsg::CreateWorktreeFromBase {
+                branch: "feature/x".into(),
+                base: "main".into(),
+            },
+            ClientMsg::RemoveWorktree { name: "feature-x".into(), force: false },
         ];
         for msg in &msgs {
             let json = serde_json::to_vec(msg).unwrap();
