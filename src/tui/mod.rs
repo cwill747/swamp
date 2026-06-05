@@ -872,8 +872,14 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 /// tab, plus the dashboard's other views) don't race to create duplicate tabs.
 /// `query-tab-names` is the dedupe — a worktree that already has a tab is
 /// skipped, which also makes the first post-launch snapshot a no-op.
+///
+/// Bail unless we're inside a zellij session: `query-tab-names` has no session
+/// to query when `swamp tui` is run bare in a terminal, and
+/// [`zellij::list_tab_names`] reports that failure as an empty tab set — which
+/// would read as "every worktree is missing a tab" and spawn a doomed `new-tab`
+/// per row on every snapshot.
 fn reconcile_tabs(app: &AppState) {
-    if app.view != TuiView::Worktrees || app.pin_cwd {
+    if app.view != TuiView::Worktrees || app.pin_cwd || !zellij::in_zellij() {
         return;
     }
     let Ok(tabs) = zellij::list_tab_names() else {
