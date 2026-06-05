@@ -92,23 +92,14 @@ pub(super) async fn subscribe_loop(
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Subscribe).await?;
     while let Some(msg) = read_server_msg(&mut stream).await? {
-        match msg {
-            ServerMsg::Snapshot(s) => {
-                if tx.send(AppEvent::Snapshot(s)).await.is_err() {
-                    break;
-                }
-            }
-            ServerMsg::Resources(r) => {
-                if tx.send(AppEvent::Resources(r)).await.is_err() {
-                    break;
-                }
-            }
-            ServerMsg::PrStatus(pr) => {
-                if tx.send(AppEvent::PrStatus(pr)).await.is_err() {
-                    break;
-                }
-            }
-            _ => {}
+        let event = match msg {
+            ServerMsg::Snapshot(s) => AppEvent::Snapshot(s),
+            ServerMsg::Resources(r) => AppEvent::Resources(r),
+            ServerMsg::PrStatus(pr) => AppEvent::PrStatus(pr),
+            _ => continue,
+        };
+        if tx.send(event).await.is_err() {
+            break;
         }
     }
     Ok(())
