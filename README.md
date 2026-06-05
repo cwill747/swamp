@@ -10,6 +10,7 @@
   <a href="#installation">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#commands">Commands</a> ·
+  <a href="#configuration">Config</a> ·
   <a href="#claude-code-hooks">Claude hooks</a> ·
   <a href="#how-it-works">How it works</a>
 </p>
@@ -147,6 +148,31 @@ Behaviour:
 - Inside an existing Zellij session, swamp adds tabs to it instead of starting
   a new session.
 
+### `swamp init`
+
+One-shot setup. Writes swamp's TOML config (if absent), refreshes the embedded
+managed configs (lazygit), and installs or updates swamp's
+[Claude Code hooks](#claude-code-hooks) in your user `settings.json`.
+
+```bash
+swamp init
+```
+
+Behaviour:
+
+- Writes `$XDG_CONFIG_HOME/swamp/config.toml` from a commented default. An
+  existing config is left untouched — it's yours to edit.
+- Merges swamp's hooks into `~/.claude/settings.json` (honors
+  `CLAUDE_CONFIG_DIR`), preserving any unrelated hooks you've configured. An
+  existing swamp hook is updated in place rather than duplicated.
+- If `settings.json` is read-only (common under nix / home-manager, where it's
+  a symlink into the store), swamp won't modify it. Instead it tells you the
+  file is read-only and, if your hooks are missing or out of date, warns so you
+  can update the source manually.
+
+Re-running is safe and idempotent. See [Configuration](#configuration) for the
+config file.
+
 ### `swamp tui`
 
 Run the long-running status TUI. This is what populates the swamp sidebar pane
@@ -225,11 +251,31 @@ swamp kill ~/code/myproject
 This kills the Zellij session, deletes the session entry, stops the daemon,
 and removes the socket and PID files.
 
+## Configuration
+
+swamp reads optional settings from `$XDG_CONFIG_HOME/swamp/config.toml`
+(usually `~/.config/swamp/config.toml`). `swamp init` writes a commented
+default; a missing file or any unset value falls back to the built-in defaults,
+so the config is entirely optional.
+
+```toml
+[dashboard]
+# The dashboard is three side-by-side columns. These set each column's width as
+# a percentage of the terminal; they should sum to roughly 100.
+worktrees_column = 33   # left column: worktrees + resources panes
+ai_column        = 34   # middle column: ai-status + pr-status panes
+shell_column     = 33   # right column: an interactive shell
+```
+
+A malformed config doesn't block a launch — swamp warns and uses defaults.
+
 ## Claude Code hooks
 
-swamp tracks agent status per worktree via `swamp hook <status>`. To have
-Claude Code report its status automatically, add the following to
-`~/.claude/settings.json` (or a project-local `.claude/settings.json`).
+swamp tracks agent status per worktree via `swamp hook <status>`. The quickest
+way to wire this up is [`swamp init`](#swamp-init), which installs (or updates)
+the recommended hooks in your `~/.claude/settings.json` automatically. To set
+them up by hand instead, add the following to `~/.claude/settings.json` (or a
+project-local `.claude/settings.json`).
 
 The hooks parse Claude Code's JSON stdin to extract the conversation title
 (`session_name`) and pass it to `swamp hook --session-name`, so the AI status
@@ -396,13 +442,16 @@ via the per-pane TUIs). You can also start it explicitly with `swamp serve`.
 
 ### Managed configs
 
-On first launch, swamp writes one config under `$XDG_CONFIG_HOME/swamp/`
+On first launch, swamp writes its configs under `$XDG_CONFIG_HOME/swamp/`
 (default `~/.config/swamp/`):
 
-- `lazygit.yml` — used by every lazygit pane
+- `lazygit.yml` — used by every lazygit pane (managed: rewritten only when the
+  embedded contents differ from disk, idempotent)
+- `config.toml` — your settings (see [Configuration](#configuration)); written
+  by `swamp init` and never overwritten once it exists
 
-It is rewritten only when the embedded contents differ from disk
-(idempotent). The generated Zellij layout points to this file directly.
+The generated Zellij layout points to the lazygit file directly and reads the
+dashboard layout percentages from `config.toml`.
 
 Shell panes launch your login shell (`$SHELL`) directly, so your own prompt and
 shell config apply — swamp injects no prompt of its own.
@@ -414,7 +463,7 @@ shell config apply — swamp injects no prompt of its own.
 | `<git-common-dir>/.swamp-status.json` | Per-worktree agent status, persisted   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                     |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`    | Daemon PID file                        |
-| `$XDG_CONFIG_HOME/swamp/`             | Managed lazygit config                 |
+| `$XDG_CONFIG_HOME/swamp/`             | Managed lazygit config + `config.toml` |
 
 ## Building
 
