@@ -442,10 +442,59 @@ fn add_worktree(repo: &Repository, branch: &str, reference: &git2::Reference) ->
         .worktree(wt_name, &wt_path, Some(&opts))
         .with_context(|| format!("create worktree {} at {}", wt_name, wt_path.display()))?;
 
+    let path = wt.path().to_path_buf();
+    inflate_lfs(&path);
+
     Ok(Worktree {
-        path: wt.path().to_path_buf(),
+        path,
         branch: branch.to_string(),
     })
+}
+
+/// Inflate any Git LFS pointer files in the freshly-created worktree at `path`.
+///
+/// libgit2's checkout doesn't run Git's clean/smudge filters, so LFS-tracked
+/// files land as pointer files rather than their real contents. We shell out to
+/// `git lfs pull` (fetch missing objects + smudge) to materialize them — the
+/// same subprocess-for-credentials rationale as the daemon's periodic fetch.
+///
+/// Best-effort: a repo that doesn't use LFS, or a missing `git-lfs` install,
+/// is not an error — worktree creation must still succeed, so failures are
+/// only logged.
+fn inflate_lfs(path: &Path) {
+    if !uses_lfs(path) {
+        return;
+    }
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["lfs", "pull"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::warn!(
+            "git lfs pull in {} exited {}: {}",
+            path.display(),
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("git lfs pull in {} failed: {e}", path.display()),
+    }
+}
+
+/// Whether the worktree at `path` has LFS-tracked files at HEAD.
+///
+/// `git lfs ls-files` lists exactly the pointer files that need inflating; an
+/// empty list (non-LFS repo) or a non-zero exit (`git-lfs` not installed) both
+/// mean there's nothing for us to do.
+fn uses_lfs(path: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["lfs", "ls-files", "-n"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// List local + remote-tracking branches for the create picker.
