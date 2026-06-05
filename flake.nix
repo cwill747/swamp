@@ -29,10 +29,14 @@
           # `github:` refs — defeating the binary cache. The binary's own version
           # comes from CARGO_PKG_VERSION (Cargo.toml), independent of this.
           version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
-          # Include .yml only under src/ (src/config/lazygit.yml is include_str!'d).
-          # A blanket *.yml filter would also pull in .github/workflows/*.yml,
-          # invalidating the source hash whenever CI config changes.
-          ymlFilter = path: pkgs.lib.hasSuffix ".yml" path && pkgs.lib.hasInfix "/src/" path;
+          # Include .yml only under this repo's src/ (src/config/lazygit.yml is
+          # include_str!'d). A blanket *.yml filter would also pull in
+          # .github/workflows/*.yml, invalidating the source hash whenever CI
+          # config changes. Prefix-match the absolute src/ path rather than an
+          # infix "/src/" so a clone living under e.g. ~/src/swamp doesn't also
+          # match the workflow YAML.
+          srcDir = "${toString ./src}/";
+          ymlFilter = path: pkgs.lib.hasSuffix ".yml" path && pkgs.lib.hasPrefix srcDir path;
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
