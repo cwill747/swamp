@@ -467,12 +467,7 @@ fn parse_github_timestamp(s: &str) -> Option<u64> {
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
 
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 59
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
@@ -778,7 +773,10 @@ mod tests {
 
     #[test]
     fn branch_to_alias_sanitizes_special_chars() {
-        assert_eq!(branch_to_alias(0, "my-feature-branch"), "br0_my_feature_branch");
+        assert_eq!(
+            branch_to_alias(0, "my-feature-branch"),
+            "br0_my_feature_branch"
+        );
         assert_eq!(branch_to_alias(3, "feat/add-thing"), "br3_feat_add_thing");
     }
 

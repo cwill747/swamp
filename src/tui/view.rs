@@ -1,19 +1,19 @@
 use super::icons;
 use super::theme::Theme;
 use super::{AppState, PrHit};
-use crate::daemon::resources;
 use crate::cli::TuiView;
+use crate::daemon::resources;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
 use crate::github::{CheckState, PrSummary, ReviewDecision};
-use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
 use crate::tui::{CreateEntry, CreatePicker, CreateStep, InputMode};
 use crate::util::ascii_mode;
+use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
 use crate::worktree::BranchKind;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
-use ratatui::Frame;
 use std::time::{Duration, SystemTime};
 
 pub fn render(f: &mut Frame, app: &mut AppState) {
@@ -166,13 +166,13 @@ fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: ratatui::layou
     let table = Table::new(
         rows,
         [
-            Constraint::Length(3),  // # + caret
-            Constraint::Length(2),  // agent icon
-            Constraint::Length(1),  // PR icon
-            Constraint::Min(8),     // worktree name
-            Constraint::Min(10),    // branch
-            Constraint::Min(12),    // git
-            Constraint::Length(5),  // age
+            Constraint::Length(3), // # + caret
+            Constraint::Length(2), // agent icon
+            Constraint::Length(1), // PR icon
+            Constraint::Min(8),    // worktree name
+            Constraint::Min(10),   // branch
+            Constraint::Min(12),   // git
+            Constraint::Length(5), // age
         ],
     )
     .block(
@@ -280,8 +280,10 @@ fn render_ai_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
             let status_cell = Cell::from(Span::styled(label, label_style));
 
             // Worktree name.
-            let name_cell =
-                Cell::from(Span::styled(r.name.as_str(), Style::default().fg(Color::White)));
+            let name_cell = Cell::from(Span::styled(
+                r.name.as_str(),
+                Style::default().fg(Color::White),
+            ));
 
             // Branch.
             let branch_cell = Cell::from(Span::styled(
@@ -332,8 +334,8 @@ fn render_ai_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     let table = Table::new(
         rows,
         [
-            Constraint::Length(2),  // icon
-            Constraint::Length(8),  // status label
+            Constraint::Length(2), // icon
+            Constraint::Length(8), // status label
             Constraint::Min(8),    // worktree name
             Constraint::Min(10),   // branch
             Constraint::Min(8),    // git
@@ -360,7 +362,9 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     let res = &app.resources;
     let title = Span::styled(
         " Resources ",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -370,10 +374,7 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     app.regions.resources = Some(area);
 
     if res.session_pid.is_none() && res.procs.is_empty() {
-        let lines = vec![Line::from(Span::styled(
-            "sampling…",
-            Theme::muted(),
-        ))];
+        let lines = vec![Line::from(Span::styled("sampling…", Theme::muted()))];
         f.render_widget(Paragraph::new(lines).block(block), area);
         return;
     }
@@ -389,7 +390,9 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
         Span::styled("CPU ", Theme::muted()),
         Span::styled(
             format!("{:>5.1}%", res.total_cpu),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled("RSS ", Theme::muted()),
@@ -404,7 +407,10 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
             Style::default().fg(Color::White),
         ),
         Span::raw("  "),
-        Span::styled(format!("({} procs · {session_label})", res.procs.len()), Theme::muted()),
+        Span::styled(
+            format!("({} procs · {session_label})", res.procs.len()),
+            Theme::muted(),
+        ),
     ]));
 
     // Header row 2: system memory + load.
@@ -449,7 +455,9 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
             Span::styled(
                 format!("{:>5.1}  ", p.cpu),
                 if p.cpu > 10.0 {
-                    Style::default().fg(Theme::WORKING).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Theme::WORKING)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
@@ -466,7 +474,9 @@ fn render_resources(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     app.resource_scroll = app.resource_scroll.min(max);
 
     f.render_widget(
-        Paragraph::new(lines).block(block).scroll((app.resource_scroll, 0)),
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((app.resource_scroll, 0)),
         area,
     );
 }
@@ -530,12 +540,10 @@ fn render_pr_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
         ));
 
         let checks_cell = if let Some(ref checks) = pr.checks {
-            let (check_icon, check_color) =
-                check_state_icon_color(checks, app.spinner_frame);
+            let (check_icon, check_color) = check_state_icon_color(checks, app.spinner_frame);
             let mut spans = vec![Span::styled(check_icon, Style::default().fg(check_color))];
             match checks {
-                CheckState::Failure { passed, total }
-                | CheckState::Pending { passed, total } => {
+                CheckState::Failure { passed, total } | CheckState::Pending { passed, total } => {
                     spans.push(Span::styled(
                         format!(" {}/{}", passed, total),
                         Style::default().fg(check_color),
@@ -570,7 +578,7 @@ fn render_pr_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     let table = Table::new(
         rows,
         [
-            Constraint::Length(2),  // PR state icon
+            Constraint::Length(2), // PR state icon
             Constraint::Length(7), // #number
             Constraint::Length(7), // checks
             Constraint::Length(2), // review
@@ -587,7 +595,9 @@ fn render_pr_status(f: &mut Frame, app: &mut AppState, area: ratatui::layout::Re
     let hits: Vec<PrHit> = pr_rows
         .iter()
         .take(max_rows)
-        .map(|(_, pr)| PrHit { url: pr.url.clone() })
+        .map(|(_, pr)| PrHit {
+            url: pr.url.clone(),
+        })
         .collect();
     drop(pr_rows);
     app.regions.prs = Some((inner, hits));
@@ -631,8 +641,7 @@ fn check_state_icon_color(checks: &CheckState, spinner_frame: usize) -> (String,
         CheckState::Success => (icons::check_success().to_string(), Color::Green),
         CheckState::Failure { .. } => (icons::check_failure().to_string(), Color::Red),
         CheckState::Pending { .. } => {
-            let frame =
-                icons::SPINNER_FRAMES[spinner_frame % icons::SPINNER_FRAMES.len()];
+            let frame = icons::SPINNER_FRAMES[spinner_frame % icons::SPINNER_FRAMES.len()];
             (frame.to_string(), Color::Cyan)
         }
     }
@@ -695,15 +704,9 @@ fn build_row<'a>(
     let pr_cell = if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
         let (icon, color) = if pr.state == "OPEN" && !pr.is_draft {
             match &pr.review {
-                Some(ReviewDecision::ChangesRequested) => {
-                    (icons::review_changes(), Color::Red)
-                }
-                Some(ReviewDecision::Commented) => {
-                    (icons::review_commented(), Color::Yellow)
-                }
-                Some(ReviewDecision::Approved) => {
-                    (icons::review_approved(), Color::Green)
-                }
+                Some(ReviewDecision::ChangesRequested) => (icons::review_changes(), Color::Red),
+                Some(ReviewDecision::Commented) => (icons::review_commented(), Color::Yellow),
+                Some(ReviewDecision::Approved) => (icons::review_approved(), Color::Green),
                 _ => pr_state_icon_color(pr),
             }
         } else {
@@ -746,7 +749,15 @@ fn build_row<'a>(
         Cell::from(Span::styled(txt, style))
     };
 
-    let row = Row::new(vec![idx_cell, agent_cell, pr_cell, name_cell, branch_cell, git_cell, age_cell]);
+    let row = Row::new(vec![
+        idx_cell,
+        agent_cell,
+        pr_cell,
+        name_cell,
+        branch_cell,
+        git_cell,
+        age_cell,
+    ]);
     if i == app.selected {
         row.style(Theme::selected())
     } else if is_current {
@@ -793,9 +804,16 @@ fn picker_rows(p: &CreatePicker, list_height: usize) -> (Vec<Row<'static>>, usiz
     }
 
     if n == 0 {
-        let msg = if p.loading { "" } else { "no matching branches" };
+        let msg = if p.loading {
+            ""
+        } else {
+            "no matching branches"
+        };
         return (
-            vec![Row::new(vec![Cell::from(Span::styled(msg, Theme::muted()))])],
+            vec![Row::new(vec![Cell::from(Span::styled(
+                msg,
+                Theme::muted(),
+            ))])],
             scroll,
         );
     }
@@ -825,14 +843,21 @@ fn picker_rows(p: &CreatePicker, list_height: usize) -> (Vec<Row<'static>>, usiz
                     Style::default().fg(Theme::BRANCH)
                 };
                 spans.push(Span::styled(b.name.clone(), name_style));
-                spans.push(Span::styled(format!("  {}", branch_label(b)), Theme::muted()));
+                spans.push(Span::styled(
+                    format!("  {}", branch_label(b)),
+                    Theme::muted(),
+                ));
                 if b.checked_out {
                     spans.push(Span::styled("  in use", Theme::muted()));
                 }
             }
         }
         let row = Row::new(vec![Cell::from(Line::from(spans))]);
-        rows.push(if is_sel { row.style(Theme::selected()) } else { row });
+        rows.push(if is_sel {
+            row.style(Theme::selected())
+        } else {
+            row
+        });
     }
     (rows, scroll)
 }
@@ -860,7 +885,10 @@ fn render_create_picker(f: &mut Frame, app: &mut AppState) {
         let title = match p.step {
             CreateStep::Branch => " Create worktree ".to_string(),
             CreateStep::Base => {
-                format!(" Base branch for \"{}\" ", p.new_branch.as_deref().unwrap_or(""))
+                format!(
+                    " Base branch for \"{}\" ",
+                    p.new_branch.as_deref().unwrap_or("")
+                )
             }
         };
         let filter_spans: Vec<Span<'static>> = if p.loading {
@@ -912,7 +940,9 @@ fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
     if unstaged > 0 || r.staged > 0 {
         spans.push(Span::styled(
             format!("{}{}", icons::dirty_marker(), unstaged.max(r.staged)),
-            Style::default().fg(Theme::DIRTY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Theme::DIRTY)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
     }
@@ -940,13 +970,17 @@ fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
     if r.rebase {
         spans.push(Span::styled(
             "R ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     if r.conflict {
         spans.push(Span::styled(
             "! ",
-            Style::default().fg(Theme::DIRTY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Theme::DIRTY)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     spans

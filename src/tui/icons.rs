@@ -15,7 +15,11 @@ pub fn agent_icon(status: AgentStatus, frame: usize, recent: bool) -> &'static s
             }
         }
         AgentStatus::Waiting => {
-            if ascii { "?" } else { "\u{f252}" }
+            if ascii {
+                "?"
+            } else {
+                "\u{f252}"
+            }
         }
         AgentStatus::Idle => {
             if !recent {
@@ -42,9 +46,27 @@ pub fn pr_icon(state: &str, is_draft: bool) -> &'static str {
         return if ascii_mode() { "d" } else { "\u{f0124}" };
     }
     match state {
-        "OPEN" => if ascii_mode() { "o" } else { "\u{f0408}" },
-        "MERGED" => if ascii_mode() { "m" } else { "\u{f0409}" },
-        "CLOSED" => if ascii_mode() { "x" } else { "\u{f040a}" },
+        "OPEN" => {
+            if ascii_mode() {
+                "o"
+            } else {
+                "\u{f0408}"
+            }
+        }
+        "MERGED" => {
+            if ascii_mode() {
+                "m"
+            } else {
+                "\u{f0409}"
+            }
+        }
+        "CLOSED" => {
+            if ascii_mode() {
+                "x"
+            } else {
+                "\u{f040a}"
+            }
+        }
         _ => "?",
     }
 }

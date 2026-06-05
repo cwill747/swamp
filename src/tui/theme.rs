@@ -15,7 +15,9 @@ impl Theme {
     pub const CURRENT_BG: Color = Color::Indexed(235);
 
     pub fn accent_bold() -> Style {
-        Style::default().fg(Self::ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
     }
     pub fn muted() -> Style {
         Style::default().fg(Self::MUTED)

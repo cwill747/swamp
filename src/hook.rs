@@ -1,4 +1,4 @@
-use crate::daemon::socket::{write_client_msg, ClientMsg};
+use crate::daemon::socket::{ClientMsg, write_client_msg};
 use crate::daemon::{self};
 use crate::util::now_unix;
 use crate::worktree::git_common_dir;
@@ -60,8 +60,12 @@ pub async fn run(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     };
-    let session_name = session_name.filter(|s| !s.is_empty()).or_else(|| prior_field("session_name"));
-    let session_id = session_id.filter(|s| !s.is_empty()).or_else(|| prior_field("session_id"));
+    let session_name = session_name
+        .filter(|s| !s.is_empty())
+        .or_else(|| prior_field("session_name"));
+    let session_id = session_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| prior_field("session_id"));
 
     let mut entry = serde_json::Map::new();
     entry.insert("status".into(), json!(status.to_lowercase()));

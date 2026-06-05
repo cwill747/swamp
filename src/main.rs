@@ -22,9 +22,12 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::Launch { dir }) => launch::run(dir),
         Some(cli::Cmd::Serve { dir, foreground }) => daemon::serve(dir, foreground).await,
         Some(cli::Cmd::Tui { dir, view, pin_cwd }) => tui::run(dir, view, pin_cwd).await,
-        Some(cli::Cmd::Hook { status, dir, session_name, session_id }) => {
-            hook::run(status, dir, session_name, session_id).await
-        }
+        Some(cli::Cmd::Hook {
+            status,
+            dir,
+            session_name,
+            session_id,
+        }) => hook::run(status, dir, session_name, session_id).await,
         Some(cli::Cmd::Kill { dir }) => kill::run(dir),
     }
 }

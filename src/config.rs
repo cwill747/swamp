@@ -12,9 +12,7 @@ pub struct ConfigPaths {
 fn swamp_config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("swamp")
 }
@@ -31,8 +29,7 @@ fn write_if_changed(path: &PathBuf, content: &str) -> Result<bool> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create dir {}", parent.display()))?;
     }
-    std::fs::write(path, content)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 

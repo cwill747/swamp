@@ -1,6 +1,6 @@
+use super::Daemon;
 use super::resources;
 use super::state::{PrSnapshot, Snapshot};
-use super::Daemon;
 use crate::worktree::BranchInfo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,13 @@ pub enum ClientMsg {
     GetVersion,
     Refresh,
     ListBranches,
-    CreateWorktree { branch: String },
-    CreateWorktreeFromBase { branch: String, base: String },
+    CreateWorktree {
+        branch: String,
+    },
+    CreateWorktreeFromBase {
+        branch: String,
+        base: String,
+    },
     RemoveWorktree {
         name: String,
         #[serde(default)]
@@ -40,13 +45,23 @@ pub enum ServerMsg {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     Ok,
-    Err { message: String },
+    Err {
+        message: String,
+    },
     /// A non-forced `RemoveWorktree` was refused because the worktree has
     /// uncommitted work. The client may retry with `force: true`.
-    ErrDirty { name: String },
-    Version { version: String },
-    RefreshDone { worktree_names: Vec<String> },
-    Branches { branches: Vec<BranchInfo> },
+    ErrDirty {
+        name: String,
+    },
+    Version {
+        version: String,
+    },
+    RefreshDone {
+        worktree_names: Vec<String>,
+    },
+    Branches {
+        branches: Vec<BranchInfo>,
+    },
 }
 
 pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
@@ -153,7 +168,9 @@ pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
 
 pub async fn write_msg(stream: &mut UnixStream, msg: &ServerMsg) -> Result<()> {
     let bytes = serde_json::to_vec(msg)?;
-    stream.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(())
@@ -175,7 +192,9 @@ pub async fn read_server_msg(stream: &mut UnixStream) -> Result<Option<ServerMsg
 
 pub async fn write_client_msg(stream: &mut UnixStream, msg: &ClientMsg) -> Result<()> {
     let bytes = serde_json::to_vec(msg)?;
-    stream.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(())
@@ -229,12 +248,17 @@ mod tests {
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
             ClientMsg::ListBranches,
-            ClientMsg::CreateWorktree { branch: "feature/x".into() },
+            ClientMsg::CreateWorktree {
+                branch: "feature/x".into(),
+            },
             ClientMsg::CreateWorktreeFromBase {
                 branch: "feature/x".into(),
                 base: "main".into(),
             },
-            ClientMsg::RemoveWorktree { name: "feature-x".into(), force: false },
+            ClientMsg::RemoveWorktree {
+                name: "feature-x".into(),
+                force: false,
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_vec(msg).unwrap();
@@ -247,17 +271,21 @@ mod tests {
     /// GetVersion / Version round-trip over a live Unix socket pair.
     #[tokio::test]
     async fn get_version_socket_roundtrip() {
-        let tmp = std::env::temp_dir()
-            .join(format!("swamp-test-ver-{}.sock", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("swamp-test-ver-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&tmp).unwrap();
 
         let handle = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
             let msg = read_msg(&mut s).await.unwrap().unwrap();
             assert!(matches!(msg, ClientMsg::GetVersion));
-            write_msg(&mut s, &ServerMsg::Version { version: "1.2.3".into() })
-                .await
-                .unwrap();
+            write_msg(
+                &mut s,
+                &ServerMsg::Version {
+                    version: "1.2.3".into(),
+                },
+            )
+            .await
+            .unwrap();
         });
 
         let mut client = tokio::net::UnixStream::connect(&tmp).await.unwrap();

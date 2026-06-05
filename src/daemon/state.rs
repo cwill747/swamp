@@ -211,9 +211,15 @@ mod tests {
             agents: HashMap::new(),
             prs: HashMap::new(),
         };
-        state.rows.insert("old".into(), make_row_with_ts("old", 100));
-        state.rows.insert("newest".into(), make_row_with_ts("newest", 300));
-        state.rows.insert("middle".into(), make_row_with_ts("middle", 200));
+        state
+            .rows
+            .insert("old".into(), make_row_with_ts("old", 100));
+        state
+            .rows
+            .insert("newest".into(), make_row_with_ts("newest", 300));
+        state
+            .rows
+            .insert("middle".into(), make_row_with_ts("middle", 200));
 
         let snap = state.snapshot();
         let names: Vec<&str> = snap.rows.iter().map(|r| r.name.as_str()).collect();

@@ -1,7 +1,9 @@
 use crate::config::{self, ConfigPaths};
 use crate::daemon;
 use crate::daemon::socket::{ClientMsg, ServerMsg};
-use crate::worktree::{find_default_worktree, git_common_dir, is_bare, list_worktrees, resolve_git_dir, Worktree};
+use crate::worktree::{
+    Worktree, find_default_worktree, git_common_dir, is_bare, list_worktrees, resolve_git_dir,
+};
 use crate::zellij;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -25,42 +27,45 @@ fn query_daemon_version(common_dir: &Path) -> Option<String> {
     }
 
     let handle = tokio::runtime::Handle::try_current().ok()?;
-    tokio::task::block_in_place(|| handle.block_on(async {
-        use crate::daemon::socket::{read_server_msg, write_client_msg};
-        use tokio::net::UnixStream;
+    tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            use crate::daemon::socket::{read_server_msg, write_client_msg};
+            use tokio::net::UnixStream;
 
-        let mut stream = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            UnixStream::connect(&sock),
-        )
-        .await
-        .ok()  // Result<Result<UnixStream>, Elapsed> → Option<Result<UnixStream>>
-        .and_then(|r| r.ok())?; // flatten inner Result → Option<UnixStream>
-
-        write_client_msg(&mut stream, &ClientMsg::GetVersion)
+            let mut stream = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                UnixStream::connect(&sock),
+            )
             .await
-            .ok()?;
+            .ok() // Result<Result<UnixStream>, Elapsed> → Option<Result<UnixStream>>
+            .and_then(|r| r.ok())?; // flatten inner Result → Option<UnixStream>
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            read_server_msg(&mut stream),
-        )
-        .await
-        .ok()                         // Option<Result<Option<ServerMsg>>>
-        .and_then(|r| r.ok())         // Option<Option<ServerMsg>>
-        .and_then(|o| o)?;            // Option<ServerMsg>
+            write_client_msg(&mut stream, &ClientMsg::GetVersion)
+                .await
+                .ok()?;
 
-        match resp {
-            ServerMsg::Version { version } => Some(version),
-            _ => None,
-        }
-    }))
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_server_msg(&mut stream),
+            )
+            .await
+            .ok() // Option<Result<Option<ServerMsg>>>
+            .and_then(|r| r.ok()) // Option<Option<ServerMsg>>
+            .and_then(|o| o)?; // Option<ServerMsg>
+
+            match resp {
+                ServerMsg::Version { version } => Some(version),
+                _ => None,
+            }
+        })
+    })
 }
 
 pub fn run(dir: Option<PathBuf>) -> Result<()> {
     let target = match dir {
-        Some(p) => std::fs::canonicalize(&p)
-            .with_context(|| format!("canonicalize {}", p.display()))?,
+        Some(p) => {
+            std::fs::canonicalize(&p).with_context(|| format!("canonicalize {}", p.display()))?
+        }
         None => std::env::current_dir()?,
     };
     let git_dir = resolve_git_dir(&target);
@@ -244,7 +249,8 @@ fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<String, Stri
     let Ok(bytes) = std::fs::read(&path) else {
         return Default::default();
     };
-    let Ok(map) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
+    let Ok(map) =
+        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
     else {
         return Default::default();
     };
@@ -261,7 +267,9 @@ fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<String, Stri
 /// A session id is safe to splice into a shell command only if it's a plain
 /// token — Claude session ids are UUIDs, so restrict to `[A-Za-z0-9_-]`.
 fn is_safe_session_id(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -320,7 +328,10 @@ mod tests {
     #[test]
     fn session_cwd_single_worktree() {
         let worktrees = vec![make_wt("/home/user/myproject", "main")];
-        assert_eq!(session_cwd(&worktrees, &dummy_git_dir()), "/home/user/myproject");
+        assert_eq!(
+            session_cwd(&worktrees, &dummy_git_dir()),
+            "/home/user/myproject"
+        );
     }
 
     fn dummy_cfg() -> ConfigPaths {
@@ -336,7 +347,8 @@ mod tests {
             make_wt("/repo/talks/main", "main"),
         ];
         let cfg = dummy_cfg();
-        let layout_path = write_multi_tab_layout(true, &worktrees, "talks", &cfg, &dummy_git_dir()).unwrap();
+        let layout_path =
+            write_multi_tab_layout(true, &worktrees, "talks", &cfg, &dummy_git_dir()).unwrap();
         let content = std::fs::read_to_string(&layout_path).unwrap();
         let _ = std::fs::remove_file(&layout_path);
 
@@ -376,24 +388,55 @@ mod tests {
 
     #[test]
     fn nix_entry_dialects() {
-        let fish = Shell { path: "/usr/bin/fish".into(), run_flag: "-C", is_fish: true };
-        let bash = Shell { path: "/bin/bash".into(), run_flag: "-c", is_fish: false };
+        let fish = Shell {
+            path: "/usr/bin/fish".into(),
+            run_flag: "-C",
+            is_fish: true,
+        };
+        let bash = Shell {
+            path: "/bin/bash".into(),
+            run_flag: "-c",
+            is_fish: false,
+        };
 
         let f = nix_entry(&fish, true, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
-        assert!(f.contains("if test -f flake.nix") && f.trim_end().ends_with("end"), "fish dialect; got:\n{f}");
+        assert!(
+            f.contains("if test -f flake.nix") && f.trim_end().ends_with("end"),
+            "fish dialect; got:\n{f}"
+        );
         assert!(!f.contains("STARSHIP"), "starship glue is gone; got:\n{f}");
 
         let b = nix_entry(&bash, true, "bash -c 'exec /bin/bash'", "/bin/bash");
-        assert!(b.contains("if [ -f flake.nix ]") && b.trim_end().ends_with("fi"), "posix dialect; got:\n{b}");
-        assert!(!b.contains("set -gx") && !b.contains("STARSHIP"), "no fish syntax / no starship; got:\n{b}");
+        assert!(
+            b.contains("if [ -f flake.nix ]") && b.trim_end().ends_with("fi"),
+            "posix dialect; got:\n{b}"
+        );
+        assert!(
+            !b.contains("set -gx") && !b.contains("STARSHIP"),
+            "no fish syntax / no starship; got:\n{b}"
+        );
 
         // With nix absent from PATH (`nix=false`), no detection is emitted —
         // just a bare direct exec, in either dialect (#34).
-        let nf = nix_entry(&fish, false, "bash -c 'exec /usr/bin/fish'", "/usr/bin/fish");
-        assert_eq!(nf, "exec /usr/bin/fish", "no-nix fish glue is a bare exec; got:\n{nf}");
+        let nf = nix_entry(
+            &fish,
+            false,
+            "bash -c 'exec /usr/bin/fish'",
+            "/usr/bin/fish",
+        );
+        assert_eq!(
+            nf, "exec /usr/bin/fish",
+            "no-nix fish glue is a bare exec; got:\n{nf}"
+        );
         let nb = nix_entry(&bash, false, "bash -c 'exec /bin/bash'", "/bin/bash");
-        assert_eq!(nb, "exec /bin/bash", "no-nix posix glue is a bare exec; got:\n{nb}");
-        assert!(!nf.contains("nix develop") && !nb.contains("nix develop"), "no nix develop when nix absent");
+        assert_eq!(
+            nb, "exec /bin/bash",
+            "no-nix posix glue is a bare exec; got:\n{nb}"
+        );
+        assert!(
+            !nf.contains("nix develop") && !nb.contains("nix develop"),
+            "no nix develop when nix absent"
+        );
     }
 
     #[test]
@@ -403,19 +446,37 @@ mod tests {
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
         push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp", true, None);
-        assert!(s.contains("command=\"/bin/bash\""), "panes should launch $SHELL; got:\n{s}");
-        assert!(!s.contains("command=\"fish\""), "no hardcoded fish command; got:\n{s}");
-        assert!(!s.contains("STARSHIP"), "starship injection is gone; got:\n{s}");
+        assert!(
+            s.contains("command=\"/bin/bash\""),
+            "panes should launch $SHELL; got:\n{s}"
+        );
+        assert!(
+            !s.contains("command=\"fish\""),
+            "no hardcoded fish command; got:\n{s}"
+        );
+        assert!(
+            !s.contains("STARSHIP"),
+            "starship injection is gone; got:\n{s}"
+        );
         // The interactive panes (lazygit, claude, shell) all run via `-c`.
         assert!(s.contains("args \"-c\""), "bash panes use -c; got:\n{s}");
         // nix auto-entry is preserved for the shell/claude panes when nix is present.
-        assert!(s.contains("nix develop"), "nix auto-entry retained; got:\n{s}");
+        assert!(
+            s.contains("nix develop"),
+            "nix auto-entry retained; got:\n{s}"
+        );
 
         // With nix absent (`nix=false`), no pane emits nix-entry glue (#34).
         let mut sn = String::new();
         push_worktree_panes(&mut sn, &dummy_cfg(), "/usr/bin/swamp", false, None);
-        assert!(!sn.contains("nix develop"), "no nix develop when nix absent; got:\n{sn}");
-        assert!(sn.contains("exec /bin/bash"), "shell pane execs $SHELL directly; got:\n{sn}");
+        assert!(
+            !sn.contains("nix develop"),
+            "no nix develop when nix absent; got:\n{sn}"
+        );
+        assert!(
+            sn.contains("exec /bin/bash"),
+            "shell pane execs $SHELL directly; got:\n{sn}"
+        );
     }
 
     /// When a worktree has a recorded session id, its Claude pane resumes that
@@ -426,7 +487,13 @@ mod tests {
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut with = String::new();
-        push_worktree_panes(&mut with, &dummy_cfg(), "/usr/bin/swamp", false, Some("abc-123"));
+        push_worktree_panes(
+            &mut with,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            false,
+            Some("abc-123"),
+        );
         assert!(
             with.contains("$cp --resume abc-123"),
             "recorded session should resume; got:\n{with}"
@@ -588,7 +655,8 @@ fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
 fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
     let sh = user_shell();
     let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
-    s.push_str(&format!(r#"    pane split_direction="vertical" {{
+    s.push_str(&format!(
+        r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="33%" {{
         pane command="{swamp_bin}" size="50%" {{
           args "tui" "--view" "worktrees"
@@ -614,7 +682,10 @@ fn push_dashboard_panes(s: &mut String, _cfg: &ConfigPaths, swamp_bin: &str, nix
         name "shell"
       }}
     }}
-"#, shell_path = sh.path, run_flag = sh.run_flag));
+"#,
+        shell_path = sh.path,
+        run_flag = sh.run_flag
+    ));
 }
 
 fn push_worktree_panes(
@@ -645,11 +716,15 @@ fn push_worktree_panes(
         Some(id) => format!("$cp --resume {id}"),
         None => "$cp".to_string(),
     };
-    let claude_glue = format!("{claude_prefix}{}", nix_entry(&sh, nix, &claude_cmd, &claude_cmd));
+    let claude_glue = format!(
+        "{claude_prefix}{}",
+        nix_entry(&sh, nix, &claude_cmd, &claude_cmd)
+    );
 
     let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
 
-    s.push_str(&format!(r#"    pane split_direction="vertical" {{
+    s.push_str(&format!(
+        r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="50%" {{
         pane command="{shell_path}" size="65%" {{
           args "{run_flag}" "{lazygit_glue}"
@@ -671,5 +746,8 @@ fn push_worktree_panes(
         }}
       }}
     }}
-"#, shell_path = sh.path, run_flag = sh.run_flag));
+"#,
+        shell_path = sh.path,
+        run_flag = sh.run_flag
+    ));
 }

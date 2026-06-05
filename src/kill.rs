@@ -14,8 +14,9 @@ pub fn session_name_for_dir(dir: &std::path::Path) -> String {
 
 pub fn run(dir: Option<PathBuf>) -> Result<()> {
     let start = match dir {
-        Some(p) => std::fs::canonicalize(&p)
-            .with_context(|| format!("canonicalize {}", p.display()))?,
+        Some(p) => {
+            std::fs::canonicalize(&p).with_context(|| format!("canonicalize {}", p.display()))?
+        }
         None => std::env::current_dir()?,
     };
 
@@ -62,7 +63,9 @@ fn kill_daemon(common_dir: &std::path::Path) {
                                 });
                         }
                         Ok(_) => {
-                            tracing::warn!("kill -TERM {pid} returned non-zero (process may not exist)");
+                            tracing::warn!(
+                                "kill -TERM {pid} returned non-zero (process may not exist)"
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("failed to run kill: {e}");
@@ -122,9 +125,6 @@ mod tests {
     fn session_name_trailing_slash_stripped() {
         // PathBuf::file_name() handles trailing slashes by returning None on
         // "/", but for a normal path it works correctly regardless.
-        assert_eq!(
-            session_name_for_dir(Path::new("/some/path/repo")),
-            "repo"
-        );
+        assert_eq!(session_name_for_dir(Path::new("/some/path/repo")), "repo");
     }
 }

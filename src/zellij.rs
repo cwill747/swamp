@@ -27,15 +27,7 @@ pub fn action(args: &[&str]) -> Result<()> {
 
 pub fn new_tab(layout: &str, cwd: &Path, name: &str) -> Result<()> {
     let cwd = cwd.to_string_lossy();
-    action(&[
-        "new-tab",
-        "--layout",
-        layout,
-        "--cwd",
-        &cwd,
-        "--name",
-        name,
-    ])
+    action(&["new-tab", "--layout", layout, "--cwd", &cwd, "--name", name])
 }
 
 pub fn go_to_tab_name(name: &str) -> Result<()> {
@@ -61,15 +53,15 @@ pub fn list_tab_names() -> Result<Vec<String>> {
 /// Launch a brand-new zellij session attached to `layout`, with `cwd` and `session`.
 /// When `nested` is true (we're already inside a zellij session), `ZELLIJ` is
 /// stripped from the child's environment so zellij allows the nested session.
-pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str, nested: bool) -> Result<()> {
+pub fn new_session_with_layout(
+    layout: &Path,
+    _cwd: &Path,
+    session: &str,
+    nested: bool,
+) -> Result<()> {
     let layout = layout.to_string_lossy();
     let mut cmd = Command::new("zellij");
-    cmd.args([
-        "--new-session-with-layout",
-        &layout,
-        "--session",
-        session,
-    ]);
+    cmd.args(["--new-session-with-layout", &layout, "--session", session]);
     if nested {
         cmd.env_remove("ZELLIJ");
         cmd.env_remove("ZELLIJ_SESSION_NAME");
@@ -86,9 +78,7 @@ pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str, nested
 pub fn kill_session(name: &str) -> Result<()> {
     // kill-session terminates the session; delete-session removes the entry.
     // Both are best-effort — we warn on failure instead of bailing.
-    let _ = Command::new("zellij")
-        .args(["kill-session", name])
-        .status();
+    let _ = Command::new("zellij").args(["kill-session", name]).status();
     let status = Command::new("zellij")
         .args(["delete-session", name, "--force"])
         .status()

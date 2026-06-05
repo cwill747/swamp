@@ -33,8 +33,8 @@ pub fn sample(session_name: &str, cached_roots: &mut Vec<u32>) -> Result<Snapsho
 
     // Resolve session roots: zellij processes whose argv references this session.
     // Cache them; re-resolve if any cached pid disappears or the cache is empty.
-    let cache_valid = !cached_roots.is_empty()
-        && cached_roots.iter().all(|p| by_pid.contains_key(p));
+    let cache_valid =
+        !cached_roots.is_empty() && cached_roots.iter().all(|p| by_pid.contains_key(p));
     if !cache_valid {
         *cached_roots = find_session_roots(session_name, &procs);
     }
@@ -56,8 +56,11 @@ pub fn sample(session_name: &str, cached_roots: &mut Vec<u32>) -> Result<Snapsho
                 snap.procs.push(p.clone());
             }
         }
-        snap.procs
-            .sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        snap.procs.sort_by(|a, b| {
+            b.cpu
+                .partial_cmp(&a.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     let (l1, l5, l15) = load_avg();
@@ -91,10 +94,18 @@ fn list_processes() -> Result<Vec<ProcInfo>> {
             rest = &rest[end..];
             Some(tok)
         };
-        let Some(pid) = take().and_then(|x| x.parse().ok()) else { continue };
-        let Some(ppid) = take().and_then(|x| x.parse().ok()) else { continue };
-        let Some(cpu) = take().and_then(|x| x.parse().ok()) else { continue };
-        let Some(rss) = take().and_then(|x| x.parse().ok()) else { continue };
+        let Some(pid) = take().and_then(|x| x.parse().ok()) else {
+            continue;
+        };
+        let Some(ppid) = take().and_then(|x| x.parse().ok()) else {
+            continue;
+        };
+        let Some(cpu) = take().and_then(|x| x.parse().ok()) else {
+            continue;
+        };
+        let Some(rss) = take().and_then(|x| x.parse().ok()) else {
+            continue;
+        };
         let time_str = take().unwrap_or("0:00").to_string();
         let comm = rest.trim().to_string();
         v.push(ProcInfo {
@@ -146,7 +157,9 @@ fn find_session_roots(session_name: &str, procs: &[ProcInfo]) -> Vec<u32> {
     let live: HashMap<u32, ()> = procs.iter().map(|p| (p.pid, ())).collect();
     for line in text.lines() {
         let line = line.trim_start();
-        let Some((pid_str, args)) = line.split_once(char::is_whitespace) else { continue };
+        let Some((pid_str, args)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
         if !args.contains("zellij") {
             continue;
         }
@@ -155,7 +168,9 @@ fn find_session_roots(session_name: &str, procs: &[ProcInfo]) -> Vec<u32> {
         if !contains_token(args, session_name) {
             continue;
         }
-        let Ok(pid) = pid_str.parse::<u32>() else { continue };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
         if live.contains_key(&pid) {
             roots.push(pid);
         }
@@ -184,11 +199,7 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn descendants(
-    root: u32,
-    procs: &[ProcInfo],
-    by_pid: &HashMap<u32, usize>,
-) -> Vec<usize> {
+fn descendants(root: u32, procs: &[ProcInfo], by_pid: &HashMap<u32, usize>) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for p in procs {
         children.entry(p.ppid).or_default().push(p.pid);

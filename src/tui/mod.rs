@@ -3,21 +3,26 @@ mod theme;
 mod view;
 
 use crate::cli::TuiView;
-use crate::daemon::socket::{read_server_msg, write_client_msg, ClientMsg, ServerMsg};
-use crate::kill;
 use crate::daemon::resources;
+use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
 use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::daemon::{self};
-use crate::worktree::{git_common_dir, resolve_git_dir, BranchInfo};
+use crate::kill;
+use crate::worktree::{BranchInfo, git_common_dir, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
-use std::io::stdout;
 use std::collections::HashSet;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
@@ -237,7 +242,11 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<(
     let res = event_loop(&mut terminal, &common, repo_name, view, cwd, pin_cwd).await;
 
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     res
 }
@@ -308,11 +317,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
     // Input pump (blocking poll on a thread).
     {
         let tx = tx.clone();
-        std::thread::spawn(move || loop {
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(evt) = event::read() {
-                    if tx.blocking_send(AppEvent::Input(evt)).is_err() {
-                        return;
+        std::thread::spawn(move || {
+            loop {
+                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                    if let Ok(evt) = event::read() {
+                        if tx.blocking_send(AppEvent::Input(evt)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -351,7 +362,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
         resource_viewport_height: 0,
         current_dir: cwd.canonicalize().ok(),
         pin_cwd,
-        tab_env: std::env::var("ZELLIJ_TAB_NAME").ok().filter(|s| !s.is_empty()),
+        tab_env: std::env::var("ZELLIJ_TAB_NAME")
+            .ok()
+            .filter(|s| !s.is_empty()),
         current_tab: None,
         regions: HitRegions::default(),
         last_click: None,
@@ -376,7 +389,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 if app.pending_create {
-                    let new_rows: Vec<_> = app.snapshot.rows.iter()
+                    let new_rows: Vec<_> = app
+                        .snapshot
+                        .rows
+                        .iter()
                         .filter(|r| !app.pre_create_names.contains(&r.name))
                         .collect();
                     if !new_rows.is_empty() {
@@ -456,7 +472,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
                         if app.view == TuiView::Resources {
-                            let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
+                            let max = view::max_resource_scroll(
+                                &app.resources,
+                                app.resource_viewport_height,
+                            );
                             app.resource_scroll = (app.resource_scroll + 1).min(max);
                         } else if !app.snapshot.rows.is_empty() {
                             app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
@@ -478,7 +497,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Char('G') => {
                         if app.view == TuiView::Resources {
-                            let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
+                            let max = view::max_resource_scroll(
+                                &app.resources,
+                                app.resource_viewport_height,
+                            );
                             app.resource_scroll = max;
                         } else if !app.snapshot.rows.is_empty() {
                             app.selected = app.snapshot.rows.len() - 1;
@@ -516,8 +538,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('d') => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
                             app.status_msg = None;
-                            let dirty = row.staged + row.unstaged + row.untracked > 0
-                                || row.conflict;
+                            let dirty =
+                                row.staged + row.unstaged + row.untracked > 0 || row.conflict;
                             app.input = Some(InputMode::ConfirmDelete {
                                 name: row.name.clone(),
                                 dirty,
@@ -535,9 +557,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         });
                     }
                     KeyCode::Char('K') => {
-                        return kill::run(Some(
-                            common.parent().unwrap_or(common).to_path_buf(),
-                        ));
+                        return kill::run(Some(common.parent().unwrap_or(common).to_path_buf()));
                     }
                     _ => {}
                 }
@@ -552,7 +572,10 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
 /// True when `(col, row)` falls inside `r`.
 fn point_in(r: Rect, col: u16, row: u16) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 /// Map a click in a row region to a 0-based row index, if it lands on a row.
@@ -599,19 +622,35 @@ fn handle_mouse(
     match m.kind {
         // Scroll routes to whatever panel the cursor is over.
         MouseEventKind::ScrollDown => {
-            if app.regions.resources.map_or(false, |r| point_in(r, col, row)) {
+            if app
+                .regions
+                .resources
+                .map_or(false, |r| point_in(r, col, row))
+            {
                 let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
                 app.resource_scroll = (app.resource_scroll + 3).min(max);
-            } else if app.regions.worktrees.map_or(false, |(r, _)| point_in(r, col, row)) {
+            } else if app
+                .regions
+                .worktrees
+                .map_or(false, |(r, _)| point_in(r, col, row))
+            {
                 if !app.snapshot.rows.is_empty() {
                     app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
                 }
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.regions.resources.map_or(false, |r| point_in(r, col, row)) {
+            if app
+                .regions
+                .resources
+                .map_or(false, |r| point_in(r, col, row))
+            {
                 app.resource_scroll = app.resource_scroll.saturating_sub(3);
-            } else if app.regions.worktrees.map_or(false, |(r, _)| point_in(r, col, row)) {
+            } else if app
+                .regions
+                .worktrees
+                .map_or(false, |(r, _)| point_in(r, col, row))
+            {
                 app.selected = app.selected.saturating_sub(1);
             }
         }
@@ -646,9 +685,10 @@ fn handle_mouse(
             }
 
             // AI status: click selects the matching worktree, double-click jumps.
-            let ai_target = app.regions.ai.as_ref().and_then(|(area, idxs)| {
-                row_index(*area, idxs.len(), col, row).map(|i| idxs[i])
-            });
+            let ai_target =
+                app.regions.ai.as_ref().and_then(|(area, idxs)| {
+                    row_index(*area, idxs.len(), col, row).map(|i| idxs[i])
+                });
             if let Some(idx) = ai_target {
                 app.selected = idx;
                 if dbl {
@@ -772,11 +812,7 @@ fn create_move_sel(app: &mut AppState, delta: i32) {
 
 /// Act on the currently-selected picker entry: advance to the Base step for a
 /// new branch, or fire the create request for an existing branch / chosen base.
-fn create_confirm(
-    app: &mut AppState,
-    tx: &mpsc::Sender<AppEvent>,
-    common: &std::path::Path,
-) {
+fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std::path::Path) {
     let Some(InputMode::Create(mut picker)) = app.input.take() else {
         return;
     };
@@ -827,8 +863,9 @@ fn start_create(
     msg: ClientMsg,
 ) {
     let label = match &msg {
-        ClientMsg::CreateWorktree { branch }
-        | ClientMsg::CreateWorktreeFromBase { branch, .. } => branch.clone(),
+        ClientMsg::CreateWorktree { branch } | ClientMsg::CreateWorktreeFromBase { branch, .. } => {
+            branch.clone()
+        }
         _ => String::new(),
     };
     app.pre_create_names = app.snapshot.rows.iter().map(|r| r.name.clone()).collect();
@@ -970,14 +1007,25 @@ mod tests {
     #[test]
     fn pane_cwd_does_not_match_other_worktrees() {
         let cwd = std::path::Path::new("/repo/feature-x");
-        assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/main")));
+        assert!(!path_matches_worktree(
+            cwd,
+            std::path::Path::new("/repo/main")
+        ));
         // A worktree whose name is a prefix must not match (no false positive).
-        assert!(!path_matches_worktree(cwd, std::path::Path::new("/repo/feature")));
+        assert!(!path_matches_worktree(
+            cwd,
+            std::path::Path::new("/repo/feature")
+        ));
     }
 
     #[test]
     fn point_in_respects_bounds() {
-        let r = Rect { x: 2, y: 3, width: 4, height: 2 };
+        let r = Rect {
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 2,
+        };
         assert!(point_in(r, 2, 3)); // top-left corner
         assert!(point_in(r, 5, 4)); // bottom-right inclusive
         assert!(!point_in(r, 6, 4)); // one past width
@@ -988,7 +1036,12 @@ mod tests {
     #[test]
     fn row_index_maps_click_to_row() {
         // Rows region with three visible rows starting at y=3.
-        let area = Rect { x: 0, y: 3, width: 10, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 3,
+            width: 10,
+            height: 5,
+        };
         assert_eq!(row_index(area, 3, 0, 3), Some(0));
         assert_eq!(row_index(area, 3, 9, 5), Some(2));
         // Inside the rect but past the populated rows.

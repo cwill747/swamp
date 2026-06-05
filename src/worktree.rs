@@ -136,7 +136,11 @@ fn worktree_branch(path: &Path) -> String {
         return String::new();
     };
     if !repo.head_detached().unwrap_or(false) {
-        if let Some(name) = repo.head().ok().and_then(|h| h.shorthand().map(String::from)) {
+        if let Some(name) = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(String::from))
+        {
             return name;
         }
     }
@@ -306,10 +310,7 @@ fn workon_root(repo: &Repository) -> Result<PathBuf> {
     if let Some(workdir) = repo.workdir() {
         if workdir != path {
             let repo_ancestors: Vec<_> = path.ancestors().collect();
-            if let Some(common) = workdir
-                .ancestors()
-                .find(|a| repo_ancestors.contains(a))
-            {
+            if let Some(common) = workdir.ancestors().find(|a| repo_ancestors.contains(a)) {
                 return Ok(common.to_path_buf());
             }
         }
@@ -321,7 +322,10 @@ fn workon_root(repo: &Repository) -> Result<PathBuf> {
 
 /// Find a remote-tracking branch `<remote>/<branch_name>` and return its
 /// `(remote, oid)`. Adapted from git-workon-lib.
-fn find_remote_tracking_branch(repo: &Repository, branch_name: &str) -> Option<(String, git2::Oid)> {
+fn find_remote_tracking_branch(
+    repo: &Repository,
+    branch_name: &str,
+) -> Option<(String, git2::Oid)> {
     for entry in repo.branches(Some(BranchType::Remote)).ok()?.flatten() {
         let (branch, _) = entry;
         if let Ok(Some(full)) = branch.name() {
@@ -397,10 +401,7 @@ pub fn create_worktree_from_base(
                 .map(git2::Branch::into_reference)
         })
         .and_then(|r| r.peel_to_commit())
-        .or_else(|_| {
-            repo.revparse_single(base)
-                .and_then(|o| o.peel_to_commit())
-        })
+        .or_else(|_| repo.revparse_single(base).and_then(|o| o.peel_to_commit()))
         .with_context(|| format!("resolve base branch {}", base))?;
 
     let reference = repo
@@ -591,8 +592,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir()
-            .join(format!("swamp-wt-test-{}-{}", std::process::id(), nanos));
+        let root =
+            std::env::temp_dir().join(format!("swamp-wt-test-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(&root).unwrap();
         run(&root, &["init", "-q"]);
         run(&root, &["config", "user.email", "t@example.com"]);
@@ -715,7 +716,10 @@ mod tests {
         let branches = list_branches(&bare).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"main"), "main should be listed: {names:?}");
-        assert!(names.contains(&"feature"), "feature should be listed: {names:?}");
+        assert!(
+            names.contains(&"feature"),
+            "feature should be listed: {names:?}"
+        );
         assert!(
             branches.iter().all(|b| b.kind == BranchKind::Local),
             "no remotes configured, all should be local"
@@ -778,10 +782,7 @@ mod tests {
         assert_eq!(resolve_git_dir(&root), bare);
         assert!(is_bare(&bare));
         let common = git_common_dir(&bare).unwrap();
-        assert_eq!(
-            common.canonicalize().unwrap(),
-            bare.canonicalize().unwrap()
-        );
+        assert_eq!(common.canonicalize().unwrap(), bare.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

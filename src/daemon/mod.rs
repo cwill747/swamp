@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 use self::socket::{ClientMsg, ServerMsg};
 use self::state::DaemonState;
@@ -83,13 +83,15 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     // that contains the bare repo / .git. Prefer the ZELLIJ_SESSION_NAME env if
     // present (set inside any zellij pane), so the daemon agrees with zellij
     // even when started from an unusual cwd.
-    let session_name = std::env::var("ZELLIJ_SESSION_NAME").ok().unwrap_or_else(|| {
-        common
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "swamp".into())
-    });
+    let session_name = std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .unwrap_or_else(|| {
+            common
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "swamp".into())
+        });
 
     let daemon = Arc::new(Daemon {
         common_dir: common.clone(),
@@ -365,7 +367,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("swamp-bind-test-{}-{}", std::process::id(), nanos));
+        let dir =
+            std::env::temp_dir().join(format!("swamp-bind-test-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(&dir).unwrap();
         let run = |args: &[&str]| {
             let ok = StdCommand::new("git")
@@ -429,7 +432,10 @@ mod tests {
                 break;
             }
         }
-        assert!(populated, "background scan should populate the worktree row");
+        assert!(
+            populated,
+            "background scan should populate the worktree row"
+        );
 
         drop(listener);
         let _ = std::fs::remove_file(&sock);
