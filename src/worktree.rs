@@ -71,6 +71,34 @@ pub struct GitInfo {
     pub head_ts: u64,
 }
 
+impl GitInfo {
+    /// Whether the working tree holds changes that a removal would discard:
+    /// staged, unstaged, untracked, or an in-progress conflict.
+    pub fn is_dirty(&self) -> bool {
+        self.staged + self.unstaged + self.untracked > 0 || self.conflict
+    }
+}
+
+/// Returned by [`remove_worktree`] when a non-forced removal is refused because
+/// the worktree has uncommitted work. Callers can downcast the `anyhow::Error`
+/// to this to offer a force override rather than treating it as a hard failure.
+#[derive(Debug)]
+pub struct DirtyWorktree {
+    pub name: String,
+}
+
+impl std::fmt::Display for DirtyWorktree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "worktree '{}' has uncommitted changes; refusing to remove",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for DirtyWorktree {}
+
 /// Resolve the effective directory for git operations.
 ///
 /// The git-wt bare-clone pattern creates a container dir with `.git → .bare`
@@ -474,13 +502,37 @@ pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
 /// Remove the worktree named `name`: delete its directory, prune the git
 /// metadata, and (when `delete_branch`) delete its local branch. Mirrors
 /// `git wt remove`. Adapted from git-workon's `prune_worktree`.
-pub fn remove_worktree(common_dir: &Path, name: &str, delete_branch: bool) -> Result<()> {
+///
+/// Unless `force` is set, a worktree with uncommitted or untracked changes is
+/// refused (returning a [`DirtyWorktree`] error) so `remove_dir_all` can't
+/// silently discard local work — the caller is expected to surface this and
+/// let the user opt into a forced removal.
+pub fn remove_worktree(
+    common_dir: &Path,
+    name: &str,
+    delete_branch: bool,
+    force: bool,
+) -> Result<()> {
     let repo = Repository::open(common_dir)
         .with_context(|| format!("open bare repo at {}", common_dir.display()))?;
     let wt = repo
         .find_worktree(name)
         .with_context(|| format!("find worktree {}", name))?;
     let wt_path = wt.path().to_path_buf();
+
+    // Guard against destroying uncommitted work. A failure to read status is
+    // treated as "assume clean" so a removal is never blocked by a transient
+    // libgit2 error; the force path skips the check entirely.
+    if !force && wt_path.exists() {
+        if let Ok(info) = git_info(&wt_path) {
+            if info.is_dirty() {
+                return Err(DirtyWorktree {
+                    name: name.to_string(),
+                }
+                .into());
+            }
+        }
+    }
 
     // Capture the branch before we tear the worktree down.
     let branch = if delete_branch {
@@ -588,7 +640,7 @@ mod tests {
         assert_eq!(info.staged, 0);
         assert!(!info.conflict && !info.rebase);
 
-        remove_worktree(&bare, "feature", true).unwrap();
+        remove_worktree(&bare, "feature", true, false).unwrap();
         assert!(list_worktrees(&bare).unwrap().is_empty());
         assert!(!wt.path.exists());
         let branch_exists = Command::new("git")
@@ -600,6 +652,32 @@ mod tests {
             .status
             .success();
         assert!(!branch_exists, "branch feature should be deleted");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_refuses_dirty_without_force() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+
+        // Leave an untracked file so the worktree is dirty.
+        std::fs::write(wt.path.join("scratch.txt"), "wip").unwrap();
+        assert!(git_info(&wt.path).unwrap().is_dirty());
+
+        // Non-forced removal is refused and leaves everything in place.
+        let err = remove_worktree(&bare, "feature", true, false).unwrap_err();
+        assert!(err.downcast_ref::<DirtyWorktree>().is_some());
+        assert!(wt.path.exists());
+        assert_eq!(list_worktrees(&bare).unwrap().len(), 1);
+
+        // Forcing through discards the worktree.
+        remove_worktree(&bare, "feature", true, true).unwrap();
+        assert!(!wt.path.exists());
+        assert!(list_worktrees(&bare).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

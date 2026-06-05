@@ -28,8 +28,10 @@ use tokio::sync::mpsc;
 pub enum InputMode {
     /// The git-wt-style create picker (centered modal overlay).
     Create(CreatePicker),
-    /// Confirming deletion of the named worktree.
-    ConfirmDelete(String),
+    /// Confirming deletion of the named worktree. `dirty` is true when the
+    /// worktree has uncommitted work, which turns the prompt into a force
+    /// override (deletion proceeds with `force: true`).
+    ConfirmDelete { name: String, dirty: bool },
 }
 
 /// Which step of the [`CreatePicker`] is active.
@@ -274,6 +276,9 @@ enum AppEvent {
     Branches(Vec<BranchInfo>),
     /// A create/delete request failed; surface the message in the footer.
     ActionError(String),
+    /// A non-forced delete was refused because the worktree is dirty; re-open
+    /// the confirmation as a force override.
+    DeleteNeedsForce(String),
 }
 
 async fn event_loop<B: ratatui::backend::Backend>(
@@ -423,6 +428,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 app.input = None;
                 app.status_msg = Some(msg);
             }
+            AppEvent::DeleteNeedsForce(name) => {
+                // The snapshot looked clean but the daemon found uncommitted
+                // work; re-prompt as a force override instead of failing.
+                app.pending_delete = None;
+                app.status_msg = None;
+                app.input = Some(InputMode::ConfirmDelete { name, dirty: true });
+            }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
                     continue;
@@ -504,7 +516,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('d') => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
                             app.status_msg = None;
-                            app.input = Some(InputMode::ConfirmDelete(row.name.clone()));
+                            let dirty = row.staged + row.unstaged + row.untracked > 0
+                                || row.conflict;
+                            app.input = Some(InputMode::ConfirmDelete {
+                                name: row.name.clone(),
+                                dirty,
+                            });
                         }
                     }
                     KeyCode::Char('r') if !app.refreshing => {
@@ -669,7 +686,7 @@ fn handle_input_key(
         InputMode::Create(picker) => {
             app.input = Some(InputMode::Create(picker));
         }
-        InputMode::ConfirmDelete(name) => match k.code {
+        InputMode::ConfirmDelete { name, dirty } => match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.pending_delete = Some(name.clone());
                 app.status_msg = Some(format!("Deleting {name}…"));
@@ -678,7 +695,7 @@ fn handle_input_key(
                 tokio::spawn(async move {
                     if let Err(e) = send_action(
                         &common,
-                        ClientMsg::RemoveWorktree { name },
+                        ClientMsg::RemoveWorktree { name, force: dirty },
                         tx.clone(),
                     )
                     .await
@@ -884,8 +901,14 @@ async fn send_action(
     let sock = daemon::socket_path(common);
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &msg).await?;
-    if let Some(ServerMsg::Err { message }) = read_server_msg(&mut stream).await? {
-        let _ = tx.send(AppEvent::ActionError(message)).await;
+    match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Err { message }) => {
+            let _ = tx.send(AppEvent::ActionError(message)).await;
+        }
+        Some(ServerMsg::ErrDirty { name }) => {
+            let _ = tx.send(AppEvent::DeleteNeedsForce(name)).await;
+        }
+        _ => {}
     }
     Ok(())
 }

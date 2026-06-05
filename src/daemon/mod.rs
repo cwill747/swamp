@@ -311,11 +311,11 @@ impl Daemon {
 
     /// Remove worktree `name` and its local branch (git2, off the async thread),
     /// then broadcast the refreshed snapshot.
-    pub async fn remove_worktree(&self, name: &str) -> Result<()> {
+    pub async fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
         let common = self.common_dir.clone();
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
-            crate::worktree::remove_worktree(&common, &name, true)
+            crate::worktree::remove_worktree(&common, &name, true, force)
         })
         .await
         .context("remove worktree task")??;
