@@ -99,39 +99,21 @@ fn spawn_new_session(
 ) -> Result<()> {
     // Reuse an existing session if one already matches this repo's name —
     // but first check whether the running daemon is stale.
-    if let Ok(sessions) = zellij::list_sessions() {
-        if sessions.iter().any(|s| s == session) {
-            let my_version = env!("CARGO_PKG_VERSION");
-            let git_dir = resolve_git_dir(target);
-            let common = git_common_dir(&git_dir);
+    if let Ok(sessions) = zellij::list_sessions()
+        && sessions.iter().any(|s| s == session)
+    {
+        let my_version = env!("CARGO_PKG_VERSION");
+        let git_dir = resolve_git_dir(target);
+        let common = git_common_dir(&git_dir);
 
-            let mut do_restart = false;
-            if let Ok(common) = &common {
-                if let Some(running_version) = query_daemon_version(common) {
-                    if version_is_stale(&running_version, my_version) {
-                        if std::io::stdin().is_terminal() {
-                            print!(
-                                "swamp: running daemon is version {} but this binary is {} — restart session? [Y/n] ",
-                                running_version, my_version
-                            );
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
-                            let mut answer = String::new();
-                            let _ = std::io::stdin().read_line(&mut answer);
-                            let answer = answer.trim().to_lowercase();
-                            do_restart = answer.is_empty() || answer == "y" || answer == "yes";
-                        } else {
-                            eprintln!(
-                                "swamp: warning: running daemon is version {} but this binary is {} (non-interactive, attaching anyway)",
-                                running_version, my_version
-                            );
-                        }
-                    }
-                } else {
-                    // No version response — treat as stale (old daemon).
+        let mut do_restart = false;
+        if let Ok(common) = &common {
+            if let Some(running_version) = query_daemon_version(common) {
+                if version_is_stale(&running_version, my_version) {
                     if std::io::stdin().is_terminal() {
                         print!(
-                            "swamp: running daemon did not report a version (likely an older build) — restart session? [Y/n] "
+                            "swamp: running daemon is version {} but this binary is {} — restart session? [Y/n] ",
+                            running_version, my_version
                         );
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
@@ -141,18 +123,36 @@ fn spawn_new_session(
                         do_restart = answer.is_empty() || answer == "y" || answer == "yes";
                     } else {
                         eprintln!(
-                            "swamp: warning: running daemon did not report a version (likely an older build), attaching anyway"
+                            "swamp: warning: running daemon is version {} but this binary is {} (non-interactive, attaching anyway)",
+                            running_version, my_version
                         );
                     }
                 }
-            }
-
-            if do_restart {
-                crate::kill::run(Some(target.to_path_buf()))?;
-                // Fall through to fresh launch below.
             } else {
-                return zellij::attach(session, nested);
+                // No version response — treat as stale (old daemon).
+                if std::io::stdin().is_terminal() {
+                    print!(
+                        "swamp: running daemon did not report a version (likely an older build) — restart session? [Y/n] "
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let mut answer = String::new();
+                    let _ = std::io::stdin().read_line(&mut answer);
+                    let answer = answer.trim().to_lowercase();
+                    do_restart = answer.is_empty() || answer == "y" || answer == "yes";
+                } else {
+                    eprintln!(
+                        "swamp: warning: running daemon did not report a version (likely an older build), attaching anyway"
+                    );
+                }
             }
+        }
+
+        if do_restart {
+            crate::kill::run(Some(target.to_path_buf()))?;
+            // Fall through to fresh launch below.
+        } else {
+            return zellij::attach(session, nested);
         }
     }
 
@@ -270,6 +270,217 @@ fn is_safe_session_id(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
+/// the externally-installed `swamp` layout we used to depend on, but built from
+/// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
+fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
+    let swamp_bin = std::env::current_exe()
+        .context("resolve current executable")?
+        .display()
+        .to_string();
+    let tmp = std::env::temp_dir().join(format!("swamp-worktree-{}.kdl", std::process::id()));
+    let mut s = String::new();
+    s.push_str("layout {\n");
+    // Mirror the per-tab frame from `write_multi_tab_layout`: a
+    // `default_tab_template` carrying both the tab-bar (top) and status-bar
+    // (bottom). A new-tab layout that omits this leaves the created tab with no
+    // tab header or status bar — they only reappear when you switch to a tab
+    // that *was* built with the template.
+    s.push_str("  default_tab_template {\n");
+    s.push_str("    pane size=1 borderless=true {\n");
+    s.push_str("      plugin location=\"tab-bar\"\n");
+    s.push_str("    }\n");
+    s.push_str("    children\n");
+    s.push_str("    pane size=2 borderless=true {\n");
+    s.push_str("      plugin location=\"status-bar\"\n");
+    s.push_str("    }\n");
+    s.push_str("  }\n");
+    s.push_str("  tab {\n");
+    // A freshly-opened worktree tab has no prior session to resume.
+    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None);
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    std::fs::write(&tmp, s)?;
+    Ok(tmp)
+}
+
+/// The user's login shell, the basis for every interactive layout pane.
+///
+/// We launch each shell pane through `$SHELL` (falling back to bash) rather
+/// than hardcoding fish, and emit the startup glue in the matching dialect.
+struct Shell {
+    /// Path passed as the pane's `command=`.
+    path: String,
+    /// The flag that runs a command string at startup: fish uses `-C` (run,
+    /// then stay interactive); POSIX shells use `-c`.
+    run_flag: &'static str,
+    is_fish: bool,
+}
+
+fn user_shell() -> Shell {
+    let path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let is_fish = Path::new(&path)
+        .file_name()
+        .map(|n| n == "fish")
+        .unwrap_or(false);
+    Shell {
+        path,
+        run_flag: if is_fish { "-C" } else { "-c" },
+        is_fish,
+    }
+}
+
+/// Whether a `nix` executable is resolvable on `$PATH`. Checked once per
+/// process and cached — "decide once when the session spins up" (#34). On a
+/// host without nix we skip the `nix develop` glue entirely rather than emit
+/// shell that would fail with `nix: command not found` inside any repo that
+/// happens to carry a `flake.nix`.
+fn nix_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|d| {
+                // `metadata()` follows symlinks, so a `~/.nix-profile/bin/nix`
+                // link resolves; require a regular-ish file with an execute bit
+                // so a stale non-executable `nix` placeholder isn't mistaken for
+                // a usable install.
+                std::fs::metadata(d.join("nix"))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+        })
+    })
+}
+
+/// Glue that drops into the nix dev shell when a flake/shell.nix/default.nix is
+/// present and `exec`s `in_nix` there, otherwise `exec`s `direct` directly.
+/// Written in `shell`'s dialect (fish vs POSIX). When `nix` is `false` (no nix
+/// on `$PATH`) the whole detection is skipped and we just `exec` `direct`.
+fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
+    if !nix {
+        return format!("exec {direct}");
+    }
+    if shell.is_fish {
+        format!(
+            "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
+             if test -f .git; exec nix develop path:. --command {in_nix}; \
+             else; exec nix develop --command {in_nix}; end; \
+             else; exec {direct}; end"
+        )
+    } else {
+        format!(
+            "if [ -f flake.nix ] || [ -f shell.nix ] || [ -f default.nix ]; then \
+             if [ -f .git ]; then exec nix develop path:. --command {in_nix}; \
+             else exec nix develop --command {in_nix}; fi; \
+             else exec {direct}; fi"
+        )
+    }
+}
+
+fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
+    let sh = user_shell();
+    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+    let d = &cfg.dashboard;
+    s.push_str(&format!(
+        r#"    pane split_direction="vertical" {{
+      pane split_direction="horizontal" size="{worktrees_col}%" {{
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "worktrees"
+          name "worktrees"
+        }}
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "resources"
+          name "resources"
+        }}
+      }}
+      pane split_direction="horizontal" size="{ai_col}%" {{
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "ai-status"
+          name "ai-status"
+        }}
+        pane command="{swamp_bin}" size="50%" {{
+          args "tui" "--view" "pr-status"
+          name "pr-status"
+        }}
+      }}
+      pane command="{shell_path}" size="{shell_col}%" {{
+        args "{run_flag}" "{shell_glue}"
+        name "shell"
+      }}
+    }}
+"#,
+        worktrees_col = d.worktrees_column,
+        ai_col = d.ai_column,
+        shell_col = d.shell_column,
+        shell_path = sh.path,
+        run_flag = sh.run_flag
+    ));
+}
+
+fn push_worktree_panes(
+    s: &mut String,
+    cfg: &ConfigPaths,
+    swamp_bin: &str,
+    nix: bool,
+    resume_session: Option<&str>,
+) {
+    let lazygit_cfg = cfg.lazygit.display().to_string();
+    let sh = user_shell();
+
+    let lazygit_glue = if sh.is_fish {
+        format!("set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit")
+    } else {
+        format!("export LG_CONFIG_FILE={lazygit_cfg}; exec lazygit")
+    };
+
+    // Resolve claude on the host's PATH first, then carry that path into the
+    // nix shell (whose PATH may not include it). When a session id was recorded
+    // for this worktree, resume it rather than starting a fresh conversation.
+    let claude_prefix = if sh.is_fish {
+        "set -l cp (command -s claude); "
+    } else {
+        "cp=$(command -v claude); "
+    };
+    let claude_cmd = match resume_session {
+        Some(id) => format!("$cp --resume {id}"),
+        None => "$cp".to_string(),
+    };
+    let claude_glue = format!(
+        "{claude_prefix}{}",
+        nix_entry(&sh, nix, &claude_cmd, &claude_cmd)
+    );
+
+    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
+
+    s.push_str(&format!(
+        r#"    pane split_direction="vertical" {{
+      pane split_direction="horizontal" size="50%" {{
+        pane command="{shell_path}" size="65%" {{
+          args "{run_flag}" "{lazygit_glue}"
+          name "lazygit"
+        }}
+        pane command="{swamp_bin}" size="35%" {{
+          args "tui" "--view" "worktrees" "--pin-cwd"
+          name "swamp"
+        }}
+      }}
+      pane split_direction="horizontal" size="50%" {{
+        pane command="{shell_path}" size="60%" start_suspended=true {{
+          args "{run_flag}" "{claude_glue}"
+          name "claude"
+        }}
+        pane command="{shell_path}" size="40%" {{
+          args "{run_flag}" "{shell_glue}"
+          name "shell"
+        }}
+      }}
+    }}
+"#,
+        shell_path = sh.path,
+        run_flag = sh.run_flag
+    ));
 }
 
 #[cfg(test)]
@@ -544,215 +755,4 @@ mod tests {
         let dir = std::env::temp_dir().join("swamp-definitely-missing-dir-xyz");
         assert!(load_session_ids(&dir).is_empty());
     }
-}
-
-/// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
-/// the externally-installed `swamp` layout we used to depend on, but built from
-/// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
-fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
-    let swamp_bin = std::env::current_exe()
-        .context("resolve current executable")?
-        .display()
-        .to_string();
-    let tmp = std::env::temp_dir().join(format!("swamp-worktree-{}.kdl", std::process::id()));
-    let mut s = String::new();
-    s.push_str("layout {\n");
-    // Mirror the per-tab frame from `write_multi_tab_layout`: a
-    // `default_tab_template` carrying both the tab-bar (top) and status-bar
-    // (bottom). A new-tab layout that omits this leaves the created tab with no
-    // tab header or status bar — they only reappear when you switch to a tab
-    // that *was* built with the template.
-    s.push_str("  default_tab_template {\n");
-    s.push_str("    pane size=1 borderless=true {\n");
-    s.push_str("      plugin location=\"tab-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("    children\n");
-    s.push_str("    pane size=2 borderless=true {\n");
-    s.push_str("      plugin location=\"status-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("  }\n");
-    s.push_str("  tab {\n");
-    // A freshly-opened worktree tab has no prior session to resume.
-    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None);
-    s.push_str("  }\n");
-    s.push_str("}\n");
-    std::fs::write(&tmp, s)?;
-    Ok(tmp)
-}
-
-/// The user's login shell, the basis for every interactive layout pane.
-///
-/// We launch each shell pane through `$SHELL` (falling back to bash) rather
-/// than hardcoding fish, and emit the startup glue in the matching dialect.
-struct Shell {
-    /// Path passed as the pane's `command=`.
-    path: String,
-    /// The flag that runs a command string at startup: fish uses `-C` (run,
-    /// then stay interactive); POSIX shells use `-c`.
-    run_flag: &'static str,
-    is_fish: bool,
-}
-
-fn user_shell() -> Shell {
-    let path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let is_fish = Path::new(&path)
-        .file_name()
-        .map(|n| n == "fish")
-        .unwrap_or(false);
-    Shell {
-        path,
-        run_flag: if is_fish { "-C" } else { "-c" },
-        is_fish,
-    }
-}
-
-/// Whether a `nix` executable is resolvable on `$PATH`. Checked once per
-/// process and cached — "decide once when the session spins up" (#34). On a
-/// host without nix we skip the `nix develop` glue entirely rather than emit
-/// shell that would fail with `nix: command not found` inside any repo that
-/// happens to carry a `flake.nix`.
-fn nix_available() -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|d| {
-                // `metadata()` follows symlinks, so a `~/.nix-profile/bin/nix`
-                // link resolves; require a regular-ish file with an execute bit
-                // so a stale non-executable `nix` placeholder isn't mistaken for
-                // a usable install.
-                std::fs::metadata(d.join("nix"))
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            })
-        })
-    })
-}
-
-/// Glue that drops into the nix dev shell when a flake/shell.nix/default.nix is
-/// present and `exec`s `in_nix` there, otherwise `exec`s `direct` directly.
-/// Written in `shell`'s dialect (fish vs POSIX). When `nix` is `false` (no nix
-/// on `$PATH`) the whole detection is skipped and we just `exec` `direct`.
-fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str) -> String {
-    if !nix {
-        return format!("exec {direct}");
-    }
-    if shell.is_fish {
-        format!(
-            "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
-             if test -f .git; exec nix develop path:. --command {in_nix}; \
-             else; exec nix develop --command {in_nix}; end; \
-             else; exec {direct}; end"
-        )
-    } else {
-        format!(
-            "if [ -f flake.nix ] || [ -f shell.nix ] || [ -f default.nix ]; then \
-             if [ -f .git ]; then exec nix develop path:. --command {in_nix}; \
-             else exec nix develop --command {in_nix}; fi; \
-             else exec {direct}; fi"
-        )
-    }
-}
-
-fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
-    let sh = user_shell();
-    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
-    let d = &cfg.dashboard;
-    s.push_str(&format!(
-        r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="{worktrees_col}%" {{
-        pane command="{swamp_bin}" size="50%" {{
-          args "tui" "--view" "worktrees"
-          name "worktrees"
-        }}
-        pane command="{swamp_bin}" size="50%" {{
-          args "tui" "--view" "resources"
-          name "resources"
-        }}
-      }}
-      pane split_direction="horizontal" size="{ai_col}%" {{
-        pane command="{swamp_bin}" size="50%" {{
-          args "tui" "--view" "ai-status"
-          name "ai-status"
-        }}
-        pane command="{swamp_bin}" size="50%" {{
-          args "tui" "--view" "pr-status"
-          name "pr-status"
-        }}
-      }}
-      pane command="{shell_path}" size="{shell_col}%" {{
-        args "{run_flag}" "{shell_glue}"
-        name "shell"
-      }}
-    }}
-"#,
-        worktrees_col = d.worktrees_column,
-        ai_col = d.ai_column,
-        shell_col = d.shell_column,
-        shell_path = sh.path,
-        run_flag = sh.run_flag
-    ));
-}
-
-fn push_worktree_panes(
-    s: &mut String,
-    cfg: &ConfigPaths,
-    swamp_bin: &str,
-    nix: bool,
-    resume_session: Option<&str>,
-) {
-    let lazygit_cfg = cfg.lazygit.display().to_string();
-    let sh = user_shell();
-
-    let lazygit_glue = if sh.is_fish {
-        format!("set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit")
-    } else {
-        format!("export LG_CONFIG_FILE={lazygit_cfg}; exec lazygit")
-    };
-
-    // Resolve claude on the host's PATH first, then carry that path into the
-    // nix shell (whose PATH may not include it). When a session id was recorded
-    // for this worktree, resume it rather than starting a fresh conversation.
-    let claude_prefix = if sh.is_fish {
-        "set -l cp (command -s claude); "
-    } else {
-        "cp=$(command -v claude); "
-    };
-    let claude_cmd = match resume_session {
-        Some(id) => format!("$cp --resume {id}"),
-        None => "$cp".to_string(),
-    };
-    let claude_glue = format!(
-        "{claude_prefix}{}",
-        nix_entry(&sh, nix, &claude_cmd, &claude_cmd)
-    );
-
-    let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
-
-    s.push_str(&format!(
-        r#"    pane split_direction="vertical" {{
-      pane split_direction="horizontal" size="50%" {{
-        pane command="{shell_path}" size="65%" {{
-          args "{run_flag}" "{lazygit_glue}"
-          name "lazygit"
-        }}
-        pane command="{swamp_bin}" size="35%" {{
-          args "tui" "--view" "worktrees" "--pin-cwd"
-          name "swamp"
-        }}
-      }}
-      pane split_direction="horizontal" size="50%" {{
-        pane command="{shell_path}" size="60%" start_suspended=true {{
-          args "{run_flag}" "{claude_glue}"
-          name "claude"
-        }}
-        pane command="{shell_path}" size="40%" {{
-          args "{run_flag}" "{shell_glue}"
-          name "shell"
-        }}
-      }}
-    }}
-"#,
-        shell_path = sh.path,
-        run_flag = sh.run_flag
-    ));
 }

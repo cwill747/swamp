@@ -39,8 +39,10 @@ pub fn sample(session_name: &str, cached_roots: &mut Vec<u32>) -> Result<Snapsho
         *cached_roots = find_session_roots(session_name, &procs);
     }
 
-    let mut snap = Snapshot::default();
-    snap.session_pid = cached_roots.first().copied();
+    let mut snap = Snapshot {
+        session_pid: cached_roots.first().copied(),
+        ..Default::default()
+    };
 
     if !cached_roots.is_empty() {
         let mut seen = HashSet::new();
@@ -249,31 +251,31 @@ fn mem_stats() -> (u64, u64) {
     // macOS path.
     if let Ok(out) = Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
         let s = String::from_utf8_lossy(&out.stdout);
-        if let Ok(total) = s.trim().parse::<u64>() {
-            if total > 0 {
-                if let Ok(vm) = Command::new("vm_stat").output() {
-                    let vm = String::from_utf8_lossy(&vm.stdout);
-                    let mut page_size: u64 = 4096;
-                    let mut free: u64 = 0;
-                    let mut speculative: u64 = 0;
-                    for line in vm.lines() {
-                        if let Some(rest) =
-                            line.strip_prefix("Mach Virtual Memory Statistics: (page size of ")
-                        {
-                            if let Some(num) = rest.split_whitespace().next() {
-                                page_size = num.parse().unwrap_or(4096);
-                            }
-                        } else if let Some(rest) = line.strip_prefix("Pages free:") {
-                            free = parse_pages(rest);
-                        } else if let Some(rest) = line.strip_prefix("Pages speculative:") {
-                            speculative = parse_pages(rest);
+        if let Ok(total) = s.trim().parse::<u64>()
+            && total > 0
+        {
+            if let Ok(vm) = Command::new("vm_stat").output() {
+                let vm = String::from_utf8_lossy(&vm.stdout);
+                let mut page_size: u64 = 4096;
+                let mut free: u64 = 0;
+                let mut speculative: u64 = 0;
+                for line in vm.lines() {
+                    if let Some(rest) =
+                        line.strip_prefix("Mach Virtual Memory Statistics: (page size of ")
+                    {
+                        if let Some(num) = rest.split_whitespace().next() {
+                            page_size = num.parse().unwrap_or(4096);
                         }
+                    } else if let Some(rest) = line.strip_prefix("Pages free:") {
+                        free = parse_pages(rest);
+                    } else if let Some(rest) = line.strip_prefix("Pages speculative:") {
+                        speculative = parse_pages(rest);
                     }
-                    let free_bytes = (free + speculative) * page_size;
-                    return (total, total.saturating_sub(free_bytes));
                 }
-                return (total, 0);
+                let free_bytes = (free + speculative) * page_size;
+                return (total, total.saturating_sub(free_bytes));
             }
+            return (total, 0);
         }
     }
     // Linux fallback.

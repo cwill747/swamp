@@ -8,16 +8,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentStatus {
     Working,
     Waiting,
+    #[default]
     Idle,
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self {
-        AgentStatus::Idle
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -153,6 +149,31 @@ impl DaemonState {
         PrSnapshot {
             prs: self.prs.clone(),
         }
+    }
+}
+
+fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
+    let branch = if info.branch.is_empty() || info.branch == "(detached)" {
+        wt.branch.clone()
+    } else {
+        info.branch.clone()
+    };
+    WorktreeRow {
+        name: wt.name(),
+        path: wt.path.clone(),
+        branch,
+        upstream: info.upstream.clone(),
+        ahead: info.ahead,
+        behind: info.behind,
+        staged: info.staged,
+        unstaged: info.unstaged,
+        untracked: info.untracked,
+        conflict: info.conflict,
+        rebase: info.rebase,
+        agent: agent.status,
+        agent_ts: agent.ts,
+        session_name: agent.session_name.clone(),
+        head_ts: info.head_ts,
     }
 }
 
@@ -295,30 +316,5 @@ mod tests {
             state.agents.get("main").unwrap().session_id.as_deref(),
             Some("abc-123")
         );
-    }
-}
-
-fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
-    let branch = if info.branch.is_empty() || info.branch == "(detached)" {
-        wt.branch.clone()
-    } else {
-        info.branch.clone()
-    };
-    WorktreeRow {
-        name: wt.name(),
-        path: wt.path.clone(),
-        branch,
-        upstream: info.upstream.clone(),
-        ahead: info.ahead,
-        behind: info.behind,
-        staged: info.staged,
-        unstaged: info.unstaged,
-        untracked: info.untracked,
-        conflict: info.conflict,
-        rebase: info.rebase,
-        agent: agent.status,
-        agent_ts: agent.ts,
-        session_name: agent.session_name.clone(),
-        head_ts: info.head_ts,
     }
 }

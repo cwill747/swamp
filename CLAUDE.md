@@ -11,3 +11,19 @@ current directory explicitly.
 ```
 nix build path:.
 ```
+
+## Linting
+
+Formatting and Clippy are enforced in CI (`.github/workflows/lint.yml`) and must
+be clean:
+
+```
+nix develop --command cargo fmt --all --check
+nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Enable the local pre-commit hook (runs `cargo fmt --check` before each commit):
+
+```
+git config core.hooksPath .githooks
+```

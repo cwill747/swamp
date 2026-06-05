@@ -135,14 +135,13 @@ fn worktree_branch(path: &Path) -> String {
     let Ok(repo) = Repository::open(path) else {
         return String::new();
     };
-    if !repo.head_detached().unwrap_or(false) {
-        if let Some(name) = repo
+    if !repo.head_detached().unwrap_or(false)
+        && let Some(name) = repo
             .head()
             .ok()
             .and_then(|h| h.shorthand().map(String::from))
-        {
-            return name;
-        }
+    {
+        return name;
     }
     let head = repo
         .head()
@@ -178,12 +177,12 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
         wts.push(Worktree { path, branch });
     }
 
-    if !repo.is_bare() {
-        if let Some(workdir) = repo.workdir() {
-            let path = workdir.to_path_buf();
-            let branch = worktree_branch(&path);
-            wts.push(Worktree { path, branch });
-        }
+    if !repo.is_bare()
+        && let Some(workdir) = repo.workdir()
+    {
+        let path = workdir.to_path_buf();
+        let branch = worktree_branch(&path);
+        wts.push(Worktree { path, branch });
     }
 
     Ok(wts)
@@ -252,22 +251,21 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
     }
 
     // Upstream tracking + ahead/behind.
-    if !detached {
-        if let (Some(local_oid), Ok(branch)) = (
+    if !detached
+        && let (Some(local_oid), Ok(branch)) = (
             head.as_ref().and_then(|h| h.target()),
             repo.find_branch(&info.branch, BranchType::Local),
-        ) {
-            if let Ok(upstream) = branch.upstream() {
-                if let Ok(Some(name)) = upstream.name() {
-                    info.upstream = Some(name.to_string());
-                }
-                if let Some(up_oid) = upstream.get().target() {
-                    if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid) {
-                        info.ahead = ahead as u32;
-                        info.behind = behind as u32;
-                    }
-                }
-            }
+        )
+        && let Ok(upstream) = branch.upstream()
+    {
+        if let Ok(Some(name)) = upstream.name() {
+            info.upstream = Some(name.to_string());
+        }
+        if let Some(up_oid) = upstream.get().target()
+            && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid)
+        {
+            info.ahead = ahead as u32;
+            info.behind = behind as u32;
         }
     }
 
@@ -320,12 +318,12 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
 /// Adapted from git-workon-lib's `workon_root`.
 fn workon_root(repo: &Repository) -> Result<PathBuf> {
     let path = repo.path();
-    if let Some(workdir) = repo.workdir() {
-        if workdir != path {
-            let repo_ancestors: Vec<_> = path.ancestors().collect();
-            if let Some(common) = workdir.ancestors().find(|a| repo_ancestors.contains(a)) {
-                return Ok(common.to_path_buf());
-            }
+    if let Some(workdir) = repo.workdir()
+        && workdir != path
+    {
+        let repo_ancestors: Vec<_> = path.ancestors().collect();
+        if let Some(common) = workdir.ancestors().find(|a| repo_ancestors.contains(a)) {
+            return Ok(common.to_path_buf());
         }
     }
     path.parent()
@@ -341,14 +339,12 @@ fn find_remote_tracking_branch(
 ) -> Option<(String, git2::Oid)> {
     for entry in repo.branches(Some(BranchType::Remote)).ok()?.flatten() {
         let (branch, _) = entry;
-        if let Ok(Some(full)) = branch.name() {
-            if let Some((remote, name)) = full.split_once('/') {
-                if name == branch_name {
-                    if let Some(oid) = branch.get().target() {
-                        return Some((remote.to_string(), oid));
-                    }
-                }
-            }
+        if let Ok(Some(full)) = branch.name()
+            && let Some((remote, name)) = full.split_once('/')
+            && name == branch_name
+            && let Some(oid) = branch.get().target()
+        {
+            return Some((remote.to_string(), oid));
         }
     }
     None
@@ -537,15 +533,15 @@ pub fn remove_worktree(
     // Guard against destroying uncommitted work. A failure to read status is
     // treated as "assume clean" so a removal is never blocked by a transient
     // libgit2 error; the force path skips the check entirely.
-    if !force && wt_path.exists() {
-        if let Ok(info) = git_info(&wt_path) {
-            if info.is_dirty() {
-                return Err(DirtyWorktree {
-                    name: name.to_string(),
-                }
-                .into());
-            }
+    if !force
+        && wt_path.exists()
+        && let Ok(info) = git_info(&wt_path)
+        && info.is_dirty()
+    {
+        return Err(DirtyWorktree {
+            name: name.to_string(),
         }
+        .into());
     }
 
     // Capture the branch before we tear the worktree down.
@@ -568,10 +564,10 @@ pub fn remove_worktree(
     wt.prune(Some(&mut opts))
         .with_context(|| format!("prune worktree {}", name))?;
 
-    if let Some(branch) = branch {
-        if let Ok(mut b) = repo.find_branch(&branch, BranchType::Local) {
-            let _ = b.delete();
-        }
+    if let Some(branch) = branch
+        && let Ok(mut b) = repo.find_branch(&branch, BranchType::Local)
+    {
+        let _ = b.delete();
     }
 
     Ok(())

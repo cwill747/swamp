@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pre-commit hook: verify Rust formatting before allowing a commit.
+#
+# Install with:  git config core.hooksPath .githooks
+#
+# Runs `cargo fmt --check`. If cargo/rustfmt are not on PATH (e.g. committing
+# outside `nix develop`), it falls back to running inside the flake dev shell.
+set -euo pipefail
+
+# Nix-first repo: prefer the flake dev shell so the pinned rustfmt is used.
+# Fall back to a bare cargo only when nix/flake aren't available.
+run() {
+	if command -v nix >/dev/null 2>&1 && [ -f flake.nix ]; then
+		nix develop path:. --command cargo "$@"
+	elif command -v cargo >/dev/null 2>&1; then
+		cargo "$@"
+	else
+		echo "pre-commit: neither nix nor cargo found on PATH; skipping fmt check" >&2
+		return 0
+	fi
+}
+
+if ! run fmt --all --check; then
+	echo >&2
+	echo "pre-commit: formatting check failed. Run 'cargo fmt --all' and re-stage." >&2
+	exit 1
+fi

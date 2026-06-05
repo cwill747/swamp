@@ -86,15 +86,15 @@ fn kill_daemon(common_dir: &std::path::Path) {
     }
 
     // Clean up socket and pid files regardless.
-    if sock_file.exists() {
-        if let Err(e) = std::fs::remove_file(&sock_file) {
-            tracing::warn!("could not remove socket file: {e}");
-        }
+    if sock_file.exists()
+        && let Err(e) = std::fs::remove_file(&sock_file)
+    {
+        tracing::warn!("could not remove socket file: {e}");
     }
-    if pid_file.exists() {
-        if let Err(e) = std::fs::remove_file(&pid_file) {
-            tracing::warn!("could not remove pid file: {e}");
-        }
+    if pid_file.exists()
+        && let Err(e) = std::fs::remove_file(&pid_file)
+    {
+        tracing::warn!("could not remove pid file: {e}");
     }
 }
 

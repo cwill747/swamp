@@ -93,10 +93,10 @@ pub fn ensure_config_toml() -> Result<(PathBuf, bool)> {
 /// Write `content` to `path` only if the file is absent or differs.
 /// Returns `true` if the file was (re)written.
 fn write_if_changed(path: &PathBuf, content: &str) -> Result<bool> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return Ok(false);
-        }
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == content
+    {
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -264,10 +264,10 @@ fn apply_swamp_hooks(settings: &mut Value) -> bool {
 /// Whether `path` can't be written: a symlink into the immutable nix store
 /// (home-manager) or a file whose permissions are read-only.
 fn is_read_only(path: &Path) -> bool {
-    if let Ok(target) = std::fs::read_link(path) {
-        if target.starts_with("/nix/store") {
-            return true;
-        }
+    if let Ok(target) = std::fs::read_link(path)
+        && target.starts_with("/nix/store")
+    {
+        return true;
     }
     std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly())
 }
