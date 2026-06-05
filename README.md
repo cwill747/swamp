@@ -77,6 +77,33 @@ nix build
 ./result/bin/swamp --help
 ```
 
+#### Binary cache
+
+Prebuilt binaries for every commit on `main` and every release are pushed to the
+[`cwill747-swamp`](https://app.cachix.org/cache/cwill747-swamp) Cachix cache, so
+you can install without compiling from source.
+
+The flake advertises the cache via `nixConfig`, but Nix **ignores** that unless
+you are a trusted user. Either pass the flag per-invocation:
+
+```bash
+nix build github:cwill747/swamp --accept-flake-config
+```
+
+…or, to use the cache permanently, add it to your `nix.conf`
+(`~/.config/nix/nix.conf` or `/etc/nix/nix.conf`):
+
+```
+extra-substituters = https://cwill747-swamp.cachix.org
+extra-trusted-public-keys = cwill747-swamp.cachix.org-1:Oa1mwV26phjG8DrTS4nMuUhfq6VfCFE66ROte3qSSWU=
+```
+
+Or, with `cachix` installed: `cachix use cwill747-swamp`.
+
+> If you still see source builds, you're likely evaluating a dirty tree or a
+> commit that CI hasn't cached yet — only clean, pushed revisions have prebuilt
+> binaries.
+
 ### Cargo
 
 ```bash
