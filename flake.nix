@@ -1,6 +1,13 @@
 {
   description = "Zellij-integrated git worktree dashboard";
 
+  nixConfig = {
+    extra-substituters = [ "https://cwill747-swamp.cachix.org" ];
+    extra-trusted-public-keys = [
+      "cwill747-swamp.cachix.org-1:Oa1mwV26phjG8DrTS4nMuUhfq6VfCFE66ROte3qSSWU="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
@@ -16,17 +23,27 @@
       packages = forAllSystems (system: pkgs:
         let
           craneLib = crane.mkLib pkgs;
+          # Stable version read from Cargo.toml. Deliberately NOT self.shortRev:
+          # baking the git rev into the derivation name changes the output store
+          # path on every commit and differs between `path:.`, dirty trees, and
+          # `github:` refs — defeating the binary cache. The binary's own version
+          # comes from CARGO_PKG_VERSION (Cargo.toml), independent of this.
+          version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
+          # Include .yml only under src/ (src/config/lazygit.yml is include_str!'d).
+          # A blanket *.yml filter would also pull in .github/workflows/*.yml,
+          # invalidating the source hash whenever CI config changes.
+          ymlFilter = path: pkgs.lib.hasSuffix ".yml" path && pkgs.lib.hasInfix "/src/" path;
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
-              (pkgs.lib.hasSuffix ".yml" path)
+              (ymlFilter path)
               || (pkgs.lib.hasSuffix ".toml" path)
               || (craneLib.filterCargoSources path type);
           };
           commonArgs = {
             inherit src;
             pname = "swamp";
-            version = self.shortRev or self.dirtyShortRev or "dev";
+            inherit version;
             # cmake: libgit2-sys builds vendored libgit2 from source.
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
           };
@@ -38,7 +55,7 @@
               staticSrc = pkgs.lib.cleanSourceWith {
                 src = ./.;
                 filter = path: type:
-                  (pkgs.lib.hasSuffix ".yml" path)
+                  (ymlFilter path)
                   || (pkgs.lib.hasSuffix ".toml" path)
                   || (craneLibStatic.filterCargoSources path type);
               };
@@ -46,7 +63,7 @@
               staticArgs = {
                 src = staticSrc;
                 pname = "swamp";
-                version = self.shortRev or self.dirtyShortRev or "dev";
+                inherit version;
                 # cmake: libgit2-sys builds vendored libgit2 from source.
                 nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
                 strictDeps = true;
