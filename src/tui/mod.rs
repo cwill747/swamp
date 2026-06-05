@@ -281,6 +281,9 @@ enum AppEvent {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     RefreshDone(Vec<String>),
+    /// The default-branch update finished; `Ok(())` clears the status line,
+    /// `Err` carries a message to surface.
+    UpdateDone(Result<(), String>),
     /// The daemon's reply to a ListBranches request, for the open create picker.
     Branches(Vec<BranchInfo>),
     /// A create/delete request failed; surface the message in the footer.
@@ -429,6 +432,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                 }
             }
+            AppEvent::UpdateDone(res) => {
+                app.status_msg = match res {
+                    Ok(()) => None,
+                    Err(msg) => Some(msg),
+                };
+            }
             AppEvent::Branches(branches) => {
                 if let Some(InputMode::Create(p)) = app.input.as_mut() {
                     p.loading = false;
@@ -553,6 +562,16 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         tokio::spawn(async move {
                             if let Err(e) = send_refresh(&common, tx).await {
                                 tracing::warn!("refresh: {e:?}");
+                            }
+                        });
+                    }
+                    KeyCode::Char('u') => {
+                        app.status_msg = Some("Updating default branch…".into());
+                        let tx = tx.clone();
+                        let common = common.to_path_buf();
+                        tokio::spawn(async move {
+                            if let Err(e) = send_update(&common, tx.clone()).await {
+                                let _ = tx.send(AppEvent::UpdateDone(Err(e.to_string()))).await;
                             }
                         });
                     }
@@ -959,6 +978,20 @@ async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> R
             let _ = tx.send(AppEvent::RefreshDone(worktree_names)).await;
         }
     }
+    Ok(())
+}
+
+/// Ask the daemon to fetch and fast-forward the default branch, then report the
+/// outcome so the footer status line can clear (or show an error).
+async fn send_update(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Result<()> {
+    let sock = daemon::socket_path(common);
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(&mut stream, &ClientMsg::UpdateDefault).await?;
+    let done = match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Err { message }) => Err(message),
+        _ => Ok(()),
+    };
+    let _ = tx.send(AppEvent::UpdateDone(done)).await;
     Ok(())
 }
 

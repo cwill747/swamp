@@ -22,6 +22,9 @@ pub enum ClientMsg {
     },
     GetVersion,
     Refresh,
+    /// Fetch all remotes and fast-forward the default branch in its worktree —
+    /// the equivalent of the old `git wt update`.
+    UpdateDefault,
     ListBranches,
     CreateWorktree {
         branch: String,
@@ -95,6 +98,12 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let snap = daemon.state.read().await.snapshot();
                         let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
                         write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
+                    }
+                    ClientMsg::UpdateDefault => {
+                        match daemon.update_default().await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
                     }
                     ClientMsg::ListBranches => {
                         let common = daemon.common_dir.clone();
@@ -247,6 +256,7 @@ mod tests {
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
+            ClientMsg::UpdateDefault,
             ClientMsg::ListBranches,
             ClientMsg::CreateWorktree {
                 branch: "feature/x".into(),
