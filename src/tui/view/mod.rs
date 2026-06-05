@@ -135,6 +135,16 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
         );
         return;
     }
+    if let Some((msg, _)) = &app.toast {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(Theme::IDLE_RECENT),
+            ))),
+            area,
+        );
+        return;
+    }
     let mut spans = Vec::new();
     if app.refreshing {
         let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];
@@ -143,11 +153,22 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
             Style::default().fg(Theme::WORKING),
         ));
     }
-    spans.push(Span::styled(
-        "j/k move · enter jump · c create · d delete · r refresh · u update · K kill · q quit",
-        Theme::muted(),
-    ));
+    spans.push(Span::styled(footer_hint(app.view), Theme::muted()));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Key/mouse hints for the footer. Each single panel advertises only what it
+/// actually responds to; the worktree list (and the combined `All` view) is the
+/// only place the create/delete/jump keys do anything visible.
+fn footer_hint(view: TuiView) -> &'static str {
+    match view {
+        TuiView::All | TuiView::Worktrees => {
+            "j/k move · enter jump · c create · d delete · r refresh · u update · K kill · q quit"
+        }
+        TuiView::Resources => "j/k scroll · r refresh · q quit",
+        TuiView::AiStatus => "dbl-click jump · r refresh · q quit",
+        TuiView::PrStatus => "click copies PR url · r refresh · q quit",
+    }
 }
 
 /// Truncate `s` to at most `max` chars, appending an ellipsis when cut.
@@ -157,5 +178,42 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     } else {
         let end = max.saturating_sub(1);
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footer_hint_matches_panel_keys() {
+        // Worktree-style panels advertise the full action set.
+        assert!(footer_hint(TuiView::Worktrees).contains("enter jump"));
+        assert!(footer_hint(TuiView::All).contains("d delete"));
+
+        // Auxiliary panels only advertise keys they actually honor; they must
+        // not promise the worktree-only keyboard actions.
+        for view in [TuiView::Resources, TuiView::AiStatus, TuiView::PrStatus] {
+            let hint = footer_hint(view);
+            assert!(hint.contains("q quit"), "{view:?} should advertise quit");
+            assert!(
+                hint.contains("r refresh"),
+                "{view:?} should advertise refresh"
+            );
+            assert!(
+                !hint.contains("enter jump"),
+                "{view:?} should not advertise enter-jump"
+            );
+            assert!(
+                !hint.contains("create"),
+                "{view:?} should not advertise create"
+            );
+            assert!(
+                !hint.contains("delete"),
+                "{view:?} should not advertise delete"
+            );
+        }
+
+        assert!(footer_hint(TuiView::Resources).contains("j/k scroll"));
     }
 }

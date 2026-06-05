@@ -10,6 +10,9 @@ use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Lifetime of a footer toast, in spinner ticks (~120ms each); about 3 seconds.
+const TOAST_TICKS: u16 = 25;
+
 /// True when `(col, row)` falls inside `r`.
 fn point_in(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x
@@ -127,12 +130,15 @@ pub(super) fn handle_mouse(
                 return;
             }
 
-            // PR & CI: click opens the PR in a browser.
+            // PR & CI: click copies the PR URL to the clipboard. OSC 52 reaches
+            // the user's own clipboard across SSH, where a local browser opener
+            // would not.
             let pr_url = app.regions.prs.as_ref().and_then(|(area, hits)| {
                 row_index(*area, hits.len(), col, row).and_then(|i| hits[i].url.clone())
             });
             if let Some(url) = pr_url {
-                crate::util::open_url(&url);
+                crate::util::copy_to_clipboard(&url);
+                app.toast = Some(("PR URL copied to clipboard".into(), TOAST_TICKS));
             }
         }
         _ => {}

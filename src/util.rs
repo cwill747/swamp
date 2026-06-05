@@ -64,3 +64,59 @@ pub fn open_url(url: &str) {
         .stderr(std::process::Stdio::null())
         .spawn();
 }
+
+/// Copy `text` to the clipboard via an OSC 52 escape sequence. Because this
+/// rides the terminal protocol rather than a local opener, it reaches the
+/// user's own clipboard even across SSH and multiplexers (as long as they pass
+/// OSC 52 through). Best-effort: a terminal that ignores OSC 52 is a no-op.
+pub fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = b0 << 16 | b1 << 8 | b2;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            base64_encode(b"https://github.com/cwill747/swamp/pull/52"),
+            "aHR0cHM6Ly9naXRodWIuY29tL2N3aWxsNzQ3L3N3YW1wL3B1bGwvNTI="
+        );
+    }
+}

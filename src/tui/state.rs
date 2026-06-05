@@ -133,6 +133,9 @@ pub struct AppState {
     pub input: Option<InputMode>,
     /// Transient one-line status/error shown in the footer.
     pub status_msg: Option<String>,
+    /// Self-dismissing footer confirmation (message, ticks remaining). Used for
+    /// brief success notices like "URL copied" that should fade on their own.
+    pub toast: Option<(String, u16)>,
     pub resources: resources::Snapshot,
     pub pr_snapshot: PrSnapshot,
     pub resource_scroll: u16,
