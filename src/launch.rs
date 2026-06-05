@@ -1,4 +1,4 @@
-use crate::config::{self, ConfigPaths};
+use crate::config::{self, ConfigPaths, Harness, resolve_harness};
 use crate::daemon;
 use crate::daemon::socket::{ClientMsg, ServerMsg};
 use crate::worktree::{
@@ -167,7 +167,14 @@ fn spawn_new_session(
 /// `$SHELL`-aware layout rather than an externally-installed one.
 pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
     let cfg = config::ensure_configs()?;
-    let layout = write_worktree_layout(&cfg)?;
+    // Resolve this worktree's harness: the repo setting, plus its persisted
+    // override when the setting is `choose`.
+    let override_ = git_common_dir(&resolve_git_dir(path))
+        .ok()
+        .map(|c| load_harness_overrides(&c))
+        .and_then(|m| m.get(name).copied());
+    let harness = resolve_harness(cfg.harness, override_);
+    let layout = write_worktree_layout(&cfg, harness)?;
     let res = zellij::new_tab(&layout.to_string_lossy(), path, name);
     let _ = std::fs::remove_file(&layout);
     res
@@ -211,8 +218,12 @@ fn write_multi_tab_layout(
     // still exists and had an active session gets its Claude pane launched with
     // `claude --resume <id>` so a swamp restart picks the conversation back up
     // (#33).
-    let session_ids = git_common_dir(git_dir)
-        .map(|c| load_session_ids(&c))
+    let common = git_common_dir(git_dir).ok();
+    let session_ids = common.as_deref().map(load_session_ids).unwrap_or_default();
+    // Per-worktree harness overrides, honored when the repo setting is `choose`.
+    let harness_overrides = common
+        .as_deref()
+        .map(load_harness_overrides)
         .unwrap_or_default();
 
     for (i, wt) in worktrees.iter().enumerate() {
@@ -224,7 +235,8 @@ fn write_multi_tab_layout(
             wt.path.display()
         ));
         let resume = session_ids.get(&wt.name()).map(|s| s.as_str());
-        push_worktree_panes(&mut s, cfg, &swamp_bin, nix, resume);
+        let harness = resolve_harness(cfg.harness, harness_overrides.get(&wt.name()).copied());
+        push_worktree_panes(&mut s, cfg, &swamp_bin, nix, resume, harness);
         s.push_str("  }\n");
     }
     s.push_str("}\n");
@@ -264,6 +276,31 @@ fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<String, Stri
         .collect()
 }
 
+/// Load the worktree → harness override map from `.swamp-status.json`. Only
+/// consulted when the repo setting is `choose`; an unrecognized value is
+/// dropped so a hand-edited file can't pick a non-existent agent.
+fn load_harness_overrides(common_dir: &Path) -> std::collections::HashMap<String, Harness> {
+    let path = common_dir.join(".swamp-status.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Default::default();
+    };
+    let Ok(map) =
+        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
+    else {
+        return Default::default();
+    };
+    map.into_iter()
+        .filter_map(|(name, v)| {
+            let h = match v.get("harness").and_then(|s| s.as_str()) {
+                Some("claude") => Harness::Claude,
+                Some("codex") => Harness::Codex,
+                _ => return None,
+            };
+            Some((name, h))
+        })
+        .collect()
+}
+
 /// A session id is safe to splice into a shell command only if it's a plain
 /// token — Claude session ids are UUIDs, so restrict to `[A-Za-z0-9_-]`.
 fn is_safe_session_id(s: &str) -> bool {
@@ -275,7 +312,7 @@ fn is_safe_session_id(s: &str) -> bool {
 /// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
 /// the externally-installed `swamp` layout we used to depend on, but built from
 /// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
-fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
+fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Result<PathBuf> {
     let swamp_bin = std::env::current_exe()
         .context("resolve current executable")?
         .display()
@@ -299,7 +336,7 @@ fn write_worktree_layout(cfg: &ConfigPaths) -> Result<PathBuf> {
     s.push_str("  }\n");
     s.push_str("  tab {\n");
     // A freshly-opened worktree tab has no prior session to resume.
-    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None);
+    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None, harness);
     s.push_str("  }\n");
     s.push_str("}\n");
     std::fs::write(&tmp, s)?;
@@ -425,6 +462,7 @@ fn push_worktree_panes(
     swamp_bin: &str,
     nix: bool,
     resume_session: Option<&str>,
+    harness: Harness,
 ) {
     let lazygit_cfg = cfg.lazygit.display().to_string();
     let sh = user_shell();
@@ -435,21 +473,23 @@ fn push_worktree_panes(
         format!("export LG_CONFIG_FILE={lazygit_cfg}; exec lazygit")
     };
 
-    // Resolve claude on the host's PATH first, then carry that path into the
-    // nix shell (whose PATH may not include it). When a session id was recorded
-    // for this worktree, resume it rather than starting a fresh conversation.
-    let claude_prefix = if sh.is_fish {
-        "set -l cp (command -s claude); "
+    // Resolve the agent binary on the host's PATH first, then carry that path
+    // into the nix shell (whose PATH may not include it). Resume is Claude-only:
+    // Codex's notify gives us no resumable id, so a Codex pane always starts
+    // fresh. When a Claude session id was recorded, resume it.
+    let bin = harness.bin();
+    let agent_prefix = if sh.is_fish {
+        format!("set -l cp (command -s {bin}); ")
     } else {
-        "cp=$(command -v claude); "
+        format!("cp=$(command -v {bin}); ")
     };
-    let claude_cmd = match resume_session {
-        Some(id) => format!("$cp --resume {id}"),
-        None => "$cp".to_string(),
+    let agent_cmd = match (harness, resume_session) {
+        (Harness::Claude, Some(id)) => format!("$cp --resume {id}"),
+        _ => "$cp".to_string(),
     };
-    let claude_glue = format!(
-        "{claude_prefix}{}",
-        nix_entry(&sh, nix, &claude_cmd, &claude_cmd)
+    let agent_glue = format!(
+        "{agent_prefix}{}",
+        nix_entry(&sh, nix, &agent_cmd, &agent_cmd)
     );
 
     let shell_glue = nix_entry(&sh, nix, &format!("bash -c 'exec {}'", sh.path), &sh.path);
@@ -468,8 +508,8 @@ fn push_worktree_panes(
       }}
       pane split_direction="horizontal" size="50%" {{
         pane command="{shell_path}" size="60%" start_suspended=true {{
-          args "{run_flag}" "{claude_glue}"
-          name "claude"
+          args "{run_flag}" "{agent_glue}"
+          name "{bin}"
         }}
         pane command="{shell_path}" size="40%" {{
           args "{run_flag}" "{shell_glue}"
@@ -549,6 +589,7 @@ mod tests {
         ConfigPaths {
             lazygit: PathBuf::from("/tmp/swamp/lazygit.yml"),
             dashboard: crate::config::DashboardConfig::default(),
+            harness: crate::config::HarnessSetting::Claude,
         }
     }
 
@@ -657,7 +698,14 @@ mod tests {
         // SAFETY: single-threaded test; no other thread reads the environment here.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
-        push_worktree_panes(&mut s, &dummy_cfg(), "/usr/bin/swamp", true, None);
+        push_worktree_panes(
+            &mut s,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            true,
+            None,
+            Harness::Claude,
+        );
         assert!(
             s.contains("command=\"/bin/bash\""),
             "panes should launch $SHELL; got:\n{s}"
@@ -680,7 +728,14 @@ mod tests {
 
         // With nix absent (`nix=false`), no pane emits nix-entry glue (#34).
         let mut sn = String::new();
-        push_worktree_panes(&mut sn, &dummy_cfg(), "/usr/bin/swamp", false, None);
+        push_worktree_panes(
+            &mut sn,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            false,
+            None,
+            Harness::Claude,
+        );
         assert!(
             !sn.contains("nix develop"),
             "no nix develop when nix absent; got:\n{sn}"
@@ -705,6 +760,7 @@ mod tests {
             "/usr/bin/swamp",
             false,
             Some("abc-123"),
+            Harness::Claude,
         );
         assert!(
             with.contains("$cp --resume abc-123"),
@@ -712,10 +768,48 @@ mod tests {
         );
 
         let mut without = String::new();
-        push_worktree_panes(&mut without, &dummy_cfg(), "/usr/bin/swamp", false, None);
+        push_worktree_panes(
+            &mut without,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            false,
+            None,
+            Harness::Claude,
+        );
         assert!(
             !without.contains("--resume"),
             "no session → plain claude, no --resume; got:\n{without}"
+        );
+    }
+
+    /// A Codex harness resolves `codex` on PATH, names the pane `codex`, and
+    /// never resumes — Codex notify gives us no resumable id.
+    #[test]
+    fn worktree_panes_codex_launches_codex_fresh() {
+        // SAFETY: single-threaded test; no other thread reads the environment.
+        unsafe { std::env::set_var("SHELL", "/bin/bash") };
+
+        let mut s = String::new();
+        push_worktree_panes(
+            &mut s,
+            &dummy_cfg(),
+            "/usr/bin/swamp",
+            false,
+            Some("abc-123"),
+            Harness::Codex,
+        );
+        assert!(
+            s.contains("command -v codex"),
+            "codex resolved on PATH; got:\n{s}"
+        );
+        assert!(s.contains("name \"codex\""), "pane named codex; got:\n{s}");
+        assert!(
+            !s.contains("--resume"),
+            "codex never resumes even with a recorded id; got:\n{s}"
+        );
+        assert!(
+            !s.contains("command -v claude"),
+            "codex harness must not invoke claude; got:\n{s}"
         );
     }
 

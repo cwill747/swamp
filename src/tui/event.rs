@@ -295,6 +295,14 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                             });
                         }
                     }
+                    KeyCode::Char('h') => {
+                        if let Some(row) = app.snapshot.rows.get(app.selected) {
+                            app.status_msg = None;
+                            app.input = Some(InputMode::PickHarness {
+                                name: row.name.clone(),
+                            });
+                        }
+                    }
                     KeyCode::Char('r') if !app.refreshing => {
                         app.refreshing = true;
                         let tx = tx.clone();

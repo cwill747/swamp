@@ -16,6 +16,10 @@ pub enum InputMode {
     /// worktree has uncommitted work, which turns the prompt into a force
     /// override (deletion proceeds with `force: true`).
     ConfirmDelete { name: String, dirty: bool },
+    /// Choosing the harness (Claude/Codex) for the named worktree. Applies on
+    /// the next launch of that worktree's tab; only honored when the repo's
+    /// harness setting is `choose`.
+    PickHarness { name: String },
 }
 
 /// Which step of the [`CreatePicker`] is active.

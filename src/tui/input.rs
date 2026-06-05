@@ -3,6 +3,7 @@ use super::event::AppEvent;
 use super::state::{AppState, CreateAction, CreateEntry, CreateStep, InputMode};
 use super::view;
 use crate::cli::TuiView;
+use crate::config::Harness;
 use crate::daemon::socket::ClientMsg;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -176,6 +177,33 @@ pub(super) fn handle_input_key(
             }
             _ => {} // n / Esc / anything else cancels
         },
+        InputMode::PickHarness { name } => {
+            let harness = match k.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => Some(Harness::Claude),
+                KeyCode::Char('x') | KeyCode::Char('X') => Some(Harness::Codex),
+                _ => None, // Esc / anything else cancels
+            };
+            if let Some(harness) = harness {
+                app.status_msg = Some(format!(
+                    "{name} → {} (applies on next launch)",
+                    harness.label()
+                ));
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                let worktree = name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = send_action(
+                        &common,
+                        ClientMsg::SetHarness { worktree, harness },
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                    }
+                });
+            }
+        }
     }
 }
 

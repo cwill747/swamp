@@ -12,6 +12,62 @@ const DEFAULT_CONFIG_TOML: &str = include_str!("config/config.toml");
 #[serde(default)]
 pub struct SwampConfig {
     pub dashboard: DashboardConfig,
+    pub harness: HarnessConfig,
+}
+
+/// The AI coding agent launched in a worktree's agent pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+impl Harness {
+    /// The binary name resolved on `$PATH` to launch this harness.
+    pub fn bin(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+            Harness::Codex => "codex",
+        }
+    }
+
+    /// Short human label for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+            Harness::Codex => "codex",
+        }
+    }
+}
+
+/// The tri-state harness preference: pin every pane to one agent, or `Choose`
+/// to honor each worktree's own override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessSetting {
+    #[default]
+    Claude,
+    Codex,
+    Choose,
+}
+
+/// Harness selection knobs. `default` is the repo-wide preference; in `choose`
+/// mode each worktree's persisted override (see `.swamp-status.json`) wins.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct HarnessConfig {
+    pub default: HarnessSetting,
+}
+
+/// Resolve the effective harness for one worktree: a pinned setting forces its
+/// agent; `choose` falls back to the worktree's override, defaulting to Claude.
+pub fn resolve_harness(setting: HarnessSetting, override_: Option<Harness>) -> Harness {
+    match setting {
+        HarnessSetting::Claude => Harness::Claude,
+        HarnessSetting::Codex => Harness::Codex,
+        HarnessSetting::Choose => override_.unwrap_or(Harness::Claude),
+    }
 }
 
 /// Dashboard layout knobs. The dashboard is three side-by-side columns; these
@@ -41,6 +97,8 @@ impl Default for DashboardConfig {
 pub struct ConfigPaths {
     pub lazygit: PathBuf,
     pub dashboard: DashboardConfig,
+    /// Repo-wide harness preference (per-worktree overrides apply in `choose`).
+    pub harness: HarnessSetting,
 }
 
 /// Returns the `$XDG_CONFIG_HOME/swamp` directory (falls back to `~/.config/swamp`).
@@ -114,9 +172,11 @@ pub fn ensure_configs() -> Result<ConfigPaths> {
 
     write_if_changed(&lazygit, LAZYGIT_CONFIG)?;
 
+    let cfg = load_config();
     Ok(ConfigPaths {
         lazygit,
-        dashboard: load_config().dashboard,
+        dashboard: cfg.dashboard,
+        harness: cfg.harness.default,
     })
 }
 
@@ -323,8 +383,97 @@ pub fn ensure_claude_hooks() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Codex notify management
+// ---------------------------------------------------------------------------
+
+/// Path to Codex's `config.toml` (honors `CODEX_HOME`, default `~/.codex`).
+fn codex_config_path() -> PathBuf {
+    let base = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"));
+    base.join("config.toml")
+}
+
+/// The `notify` array swamp wants Codex to call on each `agent-turn-complete`.
+/// `swamp codex-notify` parses the JSON payload Codex appends and forwards the
+/// status to the daemon.
+const CODEX_NOTIFY: &[&str] = &["swamp", "codex-notify"];
+
+/// Set Codex's `notify` to swamp's forwarder in `doc`, preserving every other
+/// key/comment. Returns `true` if the document changed.
+fn apply_codex_notify(doc: &mut toml_edit::DocumentMut) -> bool {
+    let desired = {
+        let mut arr = toml_edit::Array::new();
+        for s in CODEX_NOTIFY {
+            arr.push(*s);
+        }
+        arr
+    };
+    // Already pointing at swamp's forwarder? Leave it (and its formatting) alone.
+    if let Some(existing) = doc.get("notify").and_then(|v| v.as_array())
+        && existing.len() == desired.len()
+        && existing
+            .iter()
+            .zip(CODEX_NOTIFY)
+            .all(|(v, want)| v.as_str() == Some(*want))
+    {
+        return false;
+    }
+    doc["notify"] = toml_edit::value(desired);
+    true
+}
+
+/// Install or update swamp's Codex `notify` hook in Codex's `config.toml`, so
+/// Codex panes report agent status back to swamp. Mirrors [`ensure_claude_hooks`]:
+/// a read-only file (nix/home-manager) is left untouched with a warning.
+pub fn ensure_codex_notify() -> Result<()> {
+    let path = codex_config_path();
+    let original = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = original
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+
+    if !apply_codex_notify(&mut doc) {
+        println!(
+            "swamp: Codex notify already up to date in {}",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    if path.exists() && is_read_only(&path) {
+        println!(
+            "swamp: {} is read-only (common under nix/home-manager); not modifying it.",
+            path.display()
+        );
+        eprintln!(
+            "swamp: warning: Codex notify is missing or out of date. Add \
+             `notify = [\"swamp\", \"codex-notify\"]` to your Codex config manually."
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+    std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "swamp: {} Codex notify in {}",
+        if original.is_empty() {
+            "wrote"
+        } else {
+            "updated"
+        },
+        path.display()
+    );
+    Ok(())
+}
+
 /// `swamp init`: write the default TOML config, refresh the embedded configs,
-/// and install/update Claude Code hooks.
+/// and install/update Claude Code hooks + Codex notify.
 pub fn init() -> Result<()> {
     let (cfg_path, wrote) = ensure_config_toml()?;
     println!(
@@ -337,6 +486,7 @@ pub fn init() -> Result<()> {
     println!("swamp: lazygit config at {}", paths.lazygit.display());
 
     ensure_claude_hooks()?;
+    ensure_codex_notify()?;
     Ok(())
 }
 
@@ -406,6 +556,7 @@ mod tests {
         assert_eq!(cfg.dashboard.worktrees_column, def.worktrees_column);
         assert_eq!(cfg.dashboard.ai_column, def.ai_column);
         assert_eq!(cfg.dashboard.shell_column, def.shell_column);
+        assert_eq!(cfg.harness.default, HarnessSetting::Claude);
     }
 
     #[test]
@@ -415,6 +566,53 @@ mod tests {
         // Unset fields keep their defaults.
         assert_eq!(cfg.dashboard.worktrees_column, 33);
         assert_eq!(cfg.dashboard.ai_column, 34);
+        // An absent [harness] block defaults to Claude.
+        assert_eq!(cfg.harness.default, HarnessSetting::Claude);
+    }
+
+    #[test]
+    fn harness_setting_parses() {
+        let cfg: SwampConfig = toml::from_str("[harness]\ndefault = \"codex\"\n").unwrap();
+        assert_eq!(cfg.harness.default, HarnessSetting::Codex);
+        let cfg: SwampConfig = toml::from_str("[harness]\ndefault = \"choose\"\n").unwrap();
+        assert_eq!(cfg.harness.default, HarnessSetting::Choose);
+    }
+
+    #[test]
+    fn resolve_harness_pins_and_chooses() {
+        // Pinned settings ignore the override.
+        assert_eq!(
+            resolve_harness(HarnessSetting::Claude, Some(Harness::Codex)),
+            Harness::Claude
+        );
+        assert_eq!(
+            resolve_harness(HarnessSetting::Codex, Some(Harness::Claude)),
+            Harness::Codex
+        );
+        // Choose honors the override, defaulting to Claude when absent.
+        assert_eq!(
+            resolve_harness(HarnessSetting::Choose, Some(Harness::Codex)),
+            Harness::Codex
+        );
+        assert_eq!(
+            resolve_harness(HarnessSetting::Choose, None),
+            Harness::Claude
+        );
+    }
+
+    #[test]
+    fn apply_codex_notify_sets_and_is_idempotent() {
+        let mut doc = "model = \"o3\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(apply_codex_notify(&mut doc), "notify must be added");
+        // The unrelated key survives.
+        assert_eq!(doc.get("model").and_then(|v| v.as_str()), Some("o3"));
+        let arr = doc.get("notify").and_then(|v| v.as_array()).unwrap();
+        let got: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(got, CODEX_NOTIFY);
+        // Second pass is a no-op.
+        assert!(!apply_codex_notify(&mut doc));
     }
 
     #[test]

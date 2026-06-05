@@ -178,8 +178,9 @@ Behaviour:
 ### `swamp init`
 
 One-shot setup. Writes swamp's TOML config (if absent), refreshes the embedded
-managed configs (lazygit), and installs or updates swamp's
-[Claude Code hooks](#claude-code-hooks) in your user `settings.json`.
+managed configs (lazygit), installs or updates swamp's
+[Claude Code hooks](#claude-code-hooks) in your user `settings.json`, and wires
+[Codex notify](#codex-notify) into your Codex `config.toml`.
 
 ```bash
 swamp init
@@ -196,6 +197,9 @@ Behaviour:
   a symlink into the store), swamp won't modify it. Instead it tells you the
   file is read-only and, if your hooks are missing or out of date, warns so you
   can update the source manually.
+- Sets `notify = ["swamp", "codex-notify"]` in Codex's `config.toml` (honors
+  `CODEX_HOME`), preserving your other Codex settings. A read-only config is
+  left untouched with the line to add printed out.
 
 Re-running is safe and idempotent. See [Configuration](#configuration) for the
 config file.
@@ -292,9 +296,33 @@ so the config is entirely optional.
 worktrees_column = 33   # left column: worktrees + resources panes
 ai_column        = 34   # middle column: ai-status + pr-status panes
 shell_column     = 33   # right column: an interactive shell
+
+[harness]
+# Which AI coding agent runs in each worktree's agent pane:
+#   "claude" — always Claude Code
+#   "codex"  — always Codex
+#   "choose" — pick per-worktree; press `h` in the worktrees pane to choose
+default = "claude"
 ```
 
 A malformed config doesn't block a launch — swamp warns and uses defaults.
+
+### Swapping the agent harness (Claude Code ↔ Codex)
+
+The `[harness] default` setting is tri-state. `claude` or `codex` pin every
+worktree's agent pane to that agent. `choose` lets you pick per-worktree:
+highlight a worktree in the worktrees pane and press **`h`**, then `c` (Claude)
+or `x` (Codex). The choice is persisted in `.swamp-status.json` and takes effect
+the next time swamp builds that worktree's tab (e.g. after `swamp kill` +
+relaunch, or when the tab is reopened). A small `C`/`X` indicator in the
+worktrees table shows the recorded override.
+
+Codex reports agent status through its [`notify`](#codex-notify) hook, which
+[`swamp init`](#swamp-init) wires up. Because Codex only emits an
+`agent-turn-complete` event (it has no "turn started" signal), a Codex pane is
+reported **idle** when a turn finishes but never shows a live "working" state,
+and Codex panes don't resume sessions. Claude panes keep full
+working/waiting/idle status plus `--resume`.
 
 ## Claude Code hooks
 
@@ -427,6 +455,25 @@ The hook resolves the current worktree from `$PWD` (override with `--dir`) and
 writes through the swamp daemon when running, falling back to
 `.swamp-status.json` in the repo's git common dir.
 
+## Codex notify
+
+For Codex panes (see [Swapping the agent
+harness](#swapping-the-agent-harness-claude-code--codex)), swamp reports status
+through Codex's `notify` program. [`swamp init`](#swamp-init) sets this for you
+in Codex's `config.toml` (honors `$CODEX_HOME`, default `~/.codex`), preserving
+your other settings:
+
+```toml
+notify = ["swamp", "codex-notify"]
+```
+
+Codex invokes the program with a single JSON payload argument on each
+`agent-turn-complete` event; `swamp codex-notify` parses it, resolves the
+worktree from the payload's `cwd`, and records an `idle` status. Codex emits no
+"turn started" event, so a Codex pane never shows a live `working` state. If your
+Codex config is read-only (common under nix/home-manager), swamp won't modify it
+and will print the line to add manually.
+
 ## How it works
 
 ### Layout
@@ -437,8 +484,9 @@ the layout has:
 - A `dashboard` tab with lazygit + swamp TUI + a shell, rooted in the first
   real worktree (the bare container itself isn't a valid git working tree, so
   lazygit would otherwise fail).
-- One tab per worktree, each with lazygit, a swamp TUI sidebar, a Claude pane,
-  and a shell.
+- One tab per worktree, each with lazygit, a swamp TUI sidebar, an agent pane
+  (Claude Code or Codex — see [Swapping the agent
+  harness](#swapping-the-agent-harness-claude-code--codex)), and a shell.
 
 A non-bare repo with a single worktree gets the same generated single-tab
 worktree layout.
