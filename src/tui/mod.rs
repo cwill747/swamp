@@ -987,9 +987,16 @@ async fn send_update(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> Re
     let sock = daemon::socket_path(common);
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::UpdateDefault).await?;
-    let done = match read_server_msg(&mut stream).await? {
-        Some(ServerMsg::Err { message }) => Err(message),
-        _ => Ok(()),
+    // Skip unrelated broadcasts (Snapshot/Resources/PrStatus) that may race
+    // ahead of the actual reply on this subscribed connection, so we report the
+    // true update outcome rather than clearing on the first frame.
+    let done = loop {
+        match read_server_msg(&mut stream).await? {
+            Some(ServerMsg::Ok) => break Ok(()),
+            Some(ServerMsg::Err { message }) => break Err(message),
+            Some(_) => continue, // stray broadcast; keep reading
+            None => break Ok(()),
+        }
     };
     let _ = tx.send(AppEvent::UpdateDone(done)).await;
     Ok(())

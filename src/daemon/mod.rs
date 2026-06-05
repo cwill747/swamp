@@ -304,17 +304,25 @@ impl Daemon {
         }
 
         // Fast-forward the default branch in its worktree (if it's checked out).
+        // Merge the remote-tracking ref explicitly rather than `@{u}`: in a
+        // bare/git-wt layout the default branch often has no upstream
+        // configured, which would make `@{u}` fail with "no upstream
+        // configured".
         let common = self.common_dir.clone();
-        let wt = tokio::task::spawn_blocking(move || {
-            crate::worktree::default_worktree_path(&common)
+        let (wt, branch) = tokio::task::spawn_blocking(move || {
+            (
+                crate::worktree::default_worktree_path(&common),
+                crate::worktree::default_branch(&common),
+            )
         })
         .await
         .context("locate default worktree")?;
         if let Some(path) = wt {
+            let remote_ref = format!("origin/{branch}");
             let out = tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&path)
-                .args(["merge", "--ff-only", "@{u}"])
+                .args(["merge", "--ff-only", &remote_ref])
                 .output()
                 .await
                 .context("git merge --ff-only")?;
