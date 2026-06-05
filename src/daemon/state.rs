@@ -76,10 +76,15 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub async fn load(_common_dir: &Path) -> Result<Self> {
+    pub async fn load(common_dir: &Path) -> Result<Self> {
+        // Hydrate the agent records persisted by a prior run. `persist` rewrites
+        // the whole `agents` map, so without this an empty in-memory map would
+        // clobber other worktrees' session ids / harness overrides the first
+        // time any record changes (a hook ping or `set_harness`).
+        let agents = load_agents(common_dir).await;
         Ok(Self {
             rows: HashMap::new(),
-            agents: HashMap::new(),
+            agents,
             prs: HashMap::new(),
         })
     }
@@ -172,6 +177,17 @@ impl DaemonState {
             prs: self.prs.clone(),
         }
     }
+}
+
+/// Read the persisted `name → AgentRecord` map from `.swamp-status.json`.
+/// A missing or malformed file yields an empty map, so a fresh repo (or a typo)
+/// simply starts with no recorded agents rather than failing the daemon.
+async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
+    let path = common_dir.join(".swamp-status.json");
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
@@ -340,6 +356,47 @@ mod tests {
             state.agents.get("main").unwrap().session_id.as_deref(),
             Some("abc-123")
         );
+    }
+
+    /// A daemon hydrates persisted agent records on load, so changing one
+    /// worktree's harness and re-persisting must not clobber another worktree's
+    /// recorded Claude `session_id` (needed to resume on the next launch).
+    #[tokio::test]
+    async fn set_harness_persist_preserves_other_session_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-state-hydrate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = dir.join(".swamp-status.json");
+        // A prior run recorded a session id for `feat`.
+        std::fs::write(
+            &status,
+            r#"{"feat":{"status":"idle","ts":1,"session_id":"keep-me"}}"#,
+        )
+        .unwrap();
+
+        let mut state = DaemonState::load(&dir).await.unwrap();
+        assert_eq!(
+            state.agents.get("feat").unwrap().session_id.as_deref(),
+            Some("keep-me"),
+            "load must hydrate existing records"
+        );
+
+        // Pick a harness for a *different* worktree, then persist.
+        state.set_harness("main", Harness::Codex);
+        state.persist(&dir).await.unwrap();
+
+        // Re-read from disk: feat's session id survives, main's harness is saved.
+        let reread = load_agents(&dir).await;
+        assert_eq!(
+            reread.get("feat").unwrap().session_id.as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(reread.get("main").unwrap().harness, Some(Harness::Codex));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `set_harness` records the override, updates the row, and survives a later
