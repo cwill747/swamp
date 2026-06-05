@@ -361,14 +361,18 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
     let repo = Repository::open(common_dir)
         .with_context(|| format!("open bare repo at {}", common_dir.display()))?;
 
-    let reference = match repo.find_branch(branch, BranchType::Local) {
-        Ok(b) => b.into_reference(),
+    let (reference, remote) = match repo.find_branch(branch, BranchType::Local) {
+        // Existing local branch: pull LFS from whatever remote it tracks.
+        Ok(b) => {
+            let remote = branch_remote(&repo, branch);
+            (b.into_reference(), remote)
+        }
         Err(_) => {
             if let Some((remote, oid)) = find_remote_tracking_branch(&repo, branch) {
                 let commit = repo.find_commit(oid)?;
                 let mut local = repo.branch(branch, &commit, false)?;
                 let _ = local.set_upstream(Some(&format!("{}/{}", remote, branch)));
-                local.into_reference()
+                (local.into_reference(), Some(remote))
             } else {
                 let name = default_branch_name(&repo).unwrap_or_else(|| "main".into());
                 let base = repo
@@ -380,12 +384,12 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
                     })
                     .or_else(|_| repo.head())?
                     .peel_to_commit()?;
-                repo.branch(branch, &base, false)?.into_reference()
+                (repo.branch(branch, &base, false)?.into_reference(), None)
             }
         }
     };
 
-    add_worktree(&repo, branch, &reference)
+    add_worktree(&repo, branch, &reference, remote.as_deref())
 }
 
 /// Create a worktree for a brand-new `new_branch` cut from `base`.
@@ -418,14 +422,24 @@ pub fn create_worktree_from_base(
         .with_context(|| format!("create branch {} from {}", new_branch, base))?
         .into_reference();
 
-    add_worktree(&repo, new_branch, &reference)
+    // The new branch has no upstream, so resolve the remote the *base* tracks
+    // (which may not be `origin`) for the LFS pull. Falls back to None →
+    // git-lfs's own default when the base is a tag/sha or tracks nothing.
+    let remote = base_remote(&repo, base);
+
+    add_worktree(&repo, new_branch, &reference, remote.as_deref())
 }
 
 /// Materialize the worktree directory for `branch` pointed at `reference`. The
 /// worktree dir is a sibling of `.bare` named after the branch (git-wt layout);
 /// since git can't name a worktree with slashes, the registry name uses the
 /// branch basename.
-fn add_worktree(repo: &Repository, branch: &str, reference: &git2::Reference) -> Result<Worktree> {
+fn add_worktree(
+    repo: &Repository,
+    branch: &str,
+    reference: &git2::Reference,
+    remote: Option<&str>,
+) -> Result<Worktree> {
     let root = workon_root(repo)?;
     let wt_name = Path::new(branch)
         .file_name()
@@ -442,10 +456,84 @@ fn add_worktree(repo: &Repository, branch: &str, reference: &git2::Reference) ->
         .worktree(wt_name, &wt_path, Some(&opts))
         .with_context(|| format!("create worktree {} at {}", wt_name, wt_path.display()))?;
 
+    let path = wt.path().to_path_buf();
+    inflate_lfs(&path, remote);
+
     Ok(Worktree {
-        path: wt.path().to_path_buf(),
+        path,
         branch: branch.to_string(),
     })
+}
+
+/// The remote that local `branch` tracks (e.g. `origin`, `upstream`), if any.
+fn branch_remote(repo: &Repository, branch: &str) -> Option<String> {
+    let refname = format!("refs/heads/{}", branch);
+    repo.branch_upstream_remote(&refname)
+        .ok()
+        .and_then(|buf| buf.as_str().map(String::from))
+}
+
+/// The remote that a `base` (for a brand-new branch) draws its objects from:
+/// the remote a local base branch tracks, else the `<remote>/` of a matching
+/// remote-tracking branch. `None` for a tag/sha or an untracked local branch.
+fn base_remote(repo: &Repository, base: &str) -> Option<String> {
+    if repo.find_branch(base, BranchType::Local).is_ok()
+        && let Some(remote) = branch_remote(repo, base)
+    {
+        return Some(remote);
+    }
+    find_remote_tracking_branch(repo, base).map(|(remote, _)| remote)
+}
+
+/// Inflate any Git LFS pointer files in the freshly-created worktree at `path`.
+///
+/// libgit2's checkout doesn't run Git's clean/smudge filters, so LFS-tracked
+/// files land as pointer files rather than their real contents. We shell out to
+/// `git lfs pull` (fetch missing objects + smudge) to materialize them — the
+/// same subprocess-for-credentials rationale as the daemon's periodic fetch.
+///
+/// `remote` pins the pull to the remote the branch/base actually tracks; a new
+/// branch has no upstream, so without this `git lfs` would silently default to
+/// `origin` and miss objects that live only on a non-`origin` remote. `None`
+/// falls back to git-lfs's own default.
+///
+/// Best-effort: a repo that doesn't use LFS, or a missing `git-lfs` install,
+/// is not an error — worktree creation must still succeed, so failures are
+/// only logged.
+fn inflate_lfs(path: &Path, remote: Option<&str>) {
+    if !uses_lfs(path) {
+        return;
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(path).args(["lfs", "pull"]);
+    if let Some(remote) = remote {
+        cmd.arg(remote);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::warn!(
+            "git lfs pull in {} exited {}: {}",
+            path.display(),
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("git lfs pull in {} failed: {e}", path.display()),
+    }
+}
+
+/// Whether the worktree at `path` has LFS-tracked files at HEAD.
+///
+/// `git lfs ls-files` lists exactly the pointer files that need inflating; an
+/// empty list (non-LFS repo) or a non-zero exit (`git-lfs` not installed) both
+/// mean there's nothing for us to do.
+fn uses_lfs(path: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["lfs", "ls-files", "-n"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// List local + remote-tracking branches for the create picker.
