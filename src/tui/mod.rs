@@ -405,6 +405,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         app.pending_create = false;
                         app.status_msg = None;
                     }
+                } else {
+                    reconcile_tabs(&app);
                 }
             }
             AppEvent::Tick => {
@@ -854,6 +856,33 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
         }
         // Nothing selectable, or an impossible combo: reopen unchanged.
         _ => app.input = Some(InputMode::Create(picker)),
+    }
+}
+
+/// Create zellij tabs for any worktrees in the snapshot that don't have one.
+///
+/// Swamp opens a tab itself when *it* creates a worktree (the `pending_create`
+/// path), but a worktree born outside swamp — `git worktree add` in another
+/// terminal, an agent spinning one up — only shows up in the daemon snapshot. It
+/// lists in the dashboard, yet double-clicking it can't focus anything because
+/// no tab exists. Reconcile fills that gap.
+///
+/// Only the dashboard's worktrees pane runs this: it's the single instance with
+/// `view == Worktrees && !pin_cwd`, so the several swamp panes (one per worktree
+/// tab, plus the dashboard's other views) don't race to create duplicate tabs.
+/// `query-tab-names` is the dedupe — a worktree that already has a tab is
+/// skipped, which also makes the first post-launch snapshot a no-op.
+fn reconcile_tabs(app: &AppState) {
+    if app.view != TuiView::Worktrees || app.pin_cwd {
+        return;
+    }
+    let Ok(tabs) = zellij::list_tab_names() else {
+        return;
+    };
+    for row in &app.snapshot.rows {
+        if !tabs.iter().any(|t| t == &row.name) {
+            let _ = crate::launch::open_worktree_tab(&row.path, &row.name);
+        }
     }
 }
 
