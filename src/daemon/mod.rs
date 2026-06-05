@@ -390,7 +390,7 @@ impl Daemon {
     }
 }
 
-async fn probe(sock: &Path) -> Result<()> {
+pub(crate) async fn probe(sock: &Path) -> Result<()> {
     // Connect + send Ping; if it succeeds someone's home.
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
