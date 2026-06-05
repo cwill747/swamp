@@ -180,17 +180,15 @@ impl AppState {
     /// Identify the active worktree row: prefer the one whose path contains
     /// this pane's working directory, falling back to the zellij tab name.
     fn resolve_current_tab(&self) -> Option<String> {
-        if self.pin_cwd {
-            if let Some(ref dir) = self.current_dir {
-                if let Some(row) = self
-                    .snapshot
-                    .rows
-                    .iter()
-                    .find(|r| path_matches_worktree(dir, &r.path))
-                {
-                    return Some(row.name.clone());
-                }
-            }
+        if self.pin_cwd
+            && let Some(ref dir) = self.current_dir
+            && let Some(row) = self
+                .snapshot
+                .rows
+                .iter()
+                .find(|r| path_matches_worktree(dir, &r.path))
+        {
+            return Some(row.name.clone());
         }
         self.tab_env.clone()
     }
@@ -200,11 +198,11 @@ impl AppState {
         if self.view != TuiView::Worktrees {
             return;
         }
-        if let Some(ref tab) = self.current_tab {
-            if let Some(pos) = self.snapshot.rows.iter().position(|r| &r.name == tab) {
-                let row = self.snapshot.rows.remove(pos);
-                self.snapshot.rows.insert(0, row);
-            }
+        if let Some(ref tab) = self.current_tab
+            && let Some(pos) = self.snapshot.rows.iter().position(|r| &r.name == tab)
+        {
+            let row = self.snapshot.rows.remove(pos);
+            self.snapshot.rows.insert(0, row);
         }
     }
 }
@@ -322,12 +320,11 @@ async fn event_loop<B: ratatui::backend::Backend>(
         let tx = tx.clone();
         std::thread::spawn(move || {
             loop {
-                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                    if let Ok(evt) = event::read() {
-                        if tx.blocking_send(AppEvent::Input(evt)).is_err() {
-                            return;
-                        }
-                    }
+                if event::poll(Duration::from_millis(100)).unwrap_or(false)
+                    && let Ok(evt) = event::read()
+                    && tx.blocking_send(AppEvent::Input(evt)).is_err()
+                {
+                    return;
                 }
             }
         });
@@ -384,12 +381,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 if app.selected >= app.snapshot.rows.len() {
                     app.selected = app.snapshot.rows.len().saturating_sub(1);
                 }
-                if let Some(ref name) = app.pending_delete {
-                    if !app.snapshot.rows.iter().any(|r| &r.name == name) {
-                        let _ = zellij::close_tab_by_name(name);
-                        app.pending_delete = None;
-                        app.status_msg = None;
-                    }
+                if let Some(ref name) = app.pending_delete
+                    && !app.snapshot.rows.iter().any(|r| &r.name == name)
+                {
+                    let _ = zellij::close_tab_by_name(name);
+                    app.pending_delete = None;
+                    app.status_msg = None;
                 }
                 if app.pending_create {
                     let new_rows: Vec<_> = app
@@ -433,10 +430,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 }
             }
             AppEvent::UpdateDone(res) => {
-                app.status_msg = match res {
-                    Ok(()) => None,
-                    Err(msg) => Some(msg),
-                };
+                app.status_msg = res.err();
             }
             AppEvent::Branches(branches) => {
                 if let Some(InputMode::Create(p)) = app.input.as_mut() {
@@ -641,34 +635,25 @@ fn handle_mouse(
     match m.kind {
         // Scroll routes to whatever panel the cursor is over.
         MouseEventKind::ScrollDown => {
-            if app
-                .regions
-                .resources
-                .map_or(false, |r| point_in(r, col, row))
-            {
+            if app.regions.resources.is_some_and(|r| point_in(r, col, row)) {
                 let max = view::max_resource_scroll(&app.resources, app.resource_viewport_height);
                 app.resource_scroll = (app.resource_scroll + 3).min(max);
             } else if app
                 .regions
                 .worktrees
-                .map_or(false, |(r, _)| point_in(r, col, row))
+                .is_some_and(|(r, _)| point_in(r, col, row))
+                && !app.snapshot.rows.is_empty()
             {
-                if !app.snapshot.rows.is_empty() {
-                    app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
-                }
+                app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
             }
         }
         MouseEventKind::ScrollUp => {
-            if app
-                .regions
-                .resources
-                .map_or(false, |r| point_in(r, col, row))
-            {
+            if app.regions.resources.is_some_and(|r| point_in(r, col, row)) {
                 app.resource_scroll = app.resource_scroll.saturating_sub(3);
             } else if app
                 .regions
                 .worktrees
-                .map_or(false, |(r, _)| point_in(r, col, row))
+                .is_some_and(|(r, _)| point_in(r, col, row))
             {
                 app.selected = app.selected.saturating_sub(1);
             }
@@ -678,29 +663,28 @@ fn handle_mouse(
 
             // Worktree table: click selects, double-click jumps. Clicking the
             // PR-icon column opens the PR instead.
-            if let Some((area, count)) = app.regions.worktrees {
-                if let Some(idx) = row_index(area, count, col, row) {
-                    // Fixed leading columns: #(3) + sp + agent(2) + sp = 7,
-                    // then the 1-wide PR icon.
-                    let pr_col = area.x + 7;
-                    if col == pr_col {
-                        if let Some(url) = app
-                            .snapshot
-                            .rows
-                            .get(idx)
-                            .and_then(|r| app.pr_snapshot.prs.get(&r.branch))
-                            .and_then(|pr| pr.url.clone())
-                        {
-                            crate::util::open_url(&url);
-                            return;
-                        }
-                    }
-                    app.selected = idx;
-                    if dbl {
-                        jump_to_worktree(app, idx);
-                    }
+            if let Some((area, count)) = app.regions.worktrees
+                && let Some(idx) = row_index(area, count, col, row)
+            {
+                // Fixed leading columns: #(3) + sp + agent(2) + sp = 7,
+                // then the 1-wide PR icon.
+                let pr_col = area.x + 7;
+                if col == pr_col
+                    && let Some(url) = app
+                        .snapshot
+                        .rows
+                        .get(idx)
+                        .and_then(|r| app.pr_snapshot.prs.get(&r.branch))
+                        .and_then(|pr| pr.url.clone())
+                {
+                    crate::util::open_url(&url);
                     return;
                 }
+                app.selected = idx;
+                if dbl {
+                    jump_to_worktree(app, idx);
+                }
+                return;
             }
 
             // AI status: click selects the matching worktree, double-click jumps.
@@ -781,14 +765,14 @@ fn handle_create_key(
         KeyCode::Esc => {
             // From the Base step, Esc steps back to the Branch step (restoring
             // the typed name); from the Branch step it cancels the picker.
-            if let Some(InputMode::Create(p)) = app.input.as_mut() {
-                if p.step == CreateStep::Base {
-                    p.step = CreateStep::Branch;
-                    p.filter = p.new_branch.take().unwrap_or_default();
-                    p.selected = 0;
-                    p.scroll = 0;
-                    return;
-                }
+            if let Some(InputMode::Create(p)) = app.input.as_mut()
+                && p.step == CreateStep::Base
+            {
+                p.step = CreateStep::Branch;
+                p.filter = p.new_branch.take().unwrap_or_default();
+                p.selected = 0;
+                p.scroll = 0;
+                return;
             }
             app.input = None;
         }
@@ -973,10 +957,10 @@ async fn send_refresh(common: &std::path::Path, tx: mpsc::Sender<AppEvent>) -> R
     let sock = daemon::socket_path(common);
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Refresh).await?;
-    if let Some(msg) = read_server_msg(&mut stream).await? {
-        if let ServerMsg::RefreshDone { worktree_names } = msg {
-            let _ = tx.send(AppEvent::RefreshDone(worktree_names)).await;
-        }
+    if let Some(msg) = read_server_msg(&mut stream).await?
+        && let ServerMsg::RefreshDone { worktree_names } = msg
+    {
+        let _ = tx.send(AppEvent::RefreshDone(worktree_names)).await;
     }
     Ok(())
 }

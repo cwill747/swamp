@@ -23,22 +23,21 @@ pub async fn run(
 
     let sock = daemon::socket_path(&common);
     // Try daemon first.
-    if sock.exists() {
-        if let Ok(Ok(mut s)) =
+    if sock.exists()
+        && let Ok(Ok(mut s)) =
             tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(&sock)).await
-        {
-            let _ = write_client_msg(
-                &mut s,
-                &ClientMsg::Hook {
-                    worktree: wt_name.clone(),
-                    status: status.clone(),
-                    session_name: session_name.clone(),
-                    session_id: session_id.clone(),
-                },
-            )
-            .await;
-            return Ok(());
-        }
+    {
+        let _ = write_client_msg(
+            &mut s,
+            &ClientMsg::Hook {
+                worktree: wt_name.clone(),
+                status: status.clone(),
+                session_name: session_name.clone(),
+                session_id: session_id.clone(),
+            },
+        )
+        .await;
+        return Ok(());
     }
 
     // Fallback: mutate .swamp-status.json directly.

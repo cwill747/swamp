@@ -27,7 +27,7 @@ pub fn socket_path(common_dir: &Path) -> PathBuf {
     let id = repo_id(common_dir);
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     base.join("swamp").join(format!("{}.sock", id))
 }
 

@@ -152,9 +152,9 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                 }
             }
             ev = rx.recv() => {
-                match ev {
-                    Ok(m) => write_msg(&mut stream, &m).await?,
-                    Err(_) => {} // lagged or closed; keep going
+                // Err means lagged or closed; keep going
+                if let Ok(m) = ev {
+                    write_msg(&mut stream, &m).await?;
                 }
             }
         }
