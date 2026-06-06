@@ -67,12 +67,30 @@ pub enum Cmd {
         session_id: Option<String>,
     },
 
+    /// Forward a Codex `notify` event to swamp (set as Codex's `notify` program).
+    /// Codex appends a single JSON payload argument describing the event.
+    CodexNotify {
+        /// The JSON payload Codex passes (captured as trailing args).
+        #[arg(trailing_var_arg = true)]
+        payload: Vec<String>,
+    },
+
+    /// Close and reopen a worktree's tab so a harness swap takes effect live.
+    /// Spawned detached by the TUI; not typically run by hand.
+    RelaunchTab {
+        /// The worktree (tab) name.
+        name: String,
+        /// The worktree's path.
+        dir: PathBuf,
+    },
+
     /// Kill the swamp daemon and zellij session for this repo.
     Kill {
         /// Path inside the repo (default: cwd).
         dir: Option<PathBuf>,
     },
 
-    /// Write swamp's config file and install/update Claude Code hooks.
+    /// Write swamp's config file and install/update Claude Code hooks +
+    /// Codex notify.
     Init,
 }

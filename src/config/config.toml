@@ -14,3 +14,12 @@
 worktrees_column = 33
 ai_column = 34
 shell_column = 33
+
+[harness]
+# Which AI coding agent runs in each worktree's agent pane:
+#   "claude" — always Claude Code
+#   "codex"  — always Codex
+#   "choose" — pick per-worktree; press `h` in the worktrees pane to choose
+#              (defaults to claude until you pick). The choice applies the next
+#              time swamp builds that worktree's tab.
+default = "claude"

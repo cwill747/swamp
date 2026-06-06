@@ -3,6 +3,7 @@ use super::event::AppEvent;
 use super::state::{AppState, CreateAction, CreateEntry, CreateStep, InputMode};
 use super::view;
 use crate::cli::TuiView;
+use crate::config::Harness;
 use crate::daemon::socket::ClientMsg;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -139,6 +140,29 @@ pub(super) fn handle_mouse(
     }
 }
 
+/// Spawn a detached `swamp relaunch-tab` to apply a harness swap live. It runs
+/// in its own process group so that closing the worktree's tab — which happens
+/// when `h` is pressed from that worktree's own sidebar pane — can't kill the
+/// process mid-relaunch.
+fn spawn_relaunch_tab(name: &str, path: &std::path::Path) {
+    use std::os::unix::process::CommandExt;
+    if !crate::zellij::in_zellij() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .arg("relaunch-tab")
+        .arg(name)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+}
+
 /// Handle a keystroke while a footer prompt is active. `app.input` was already
 /// taken by the caller, so each branch re-stores it to stay open, or leaves it
 /// `None` to dismiss the prompt. (The create picker is handled separately by
@@ -176,6 +200,48 @@ pub(super) fn handle_input_key(
             }
             _ => {} // n / Esc / anything else cancels
         },
+        InputMode::PickHarness { name } => {
+            let harness = match k.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => Some(Harness::Claude),
+                KeyCode::Char('x') | KeyCode::Char('X') => Some(Harness::Codex),
+                _ => None, // Esc / anything else cancels
+            };
+            if let Some(harness) = harness {
+                // The worktree's path, needed to reopen its tab with the new
+                // harness once the choice is persisted.
+                let path = app
+                    .snapshot
+                    .rows
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.path.clone());
+                app.status_msg = Some(format!("{name} → {}", harness.label()));
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                let worktree = name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = send_action(
+                        &common,
+                        ClientMsg::SetHarness {
+                            worktree: worktree.clone(),
+                            harness,
+                        },
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                        return;
+                    }
+                    // The daemon has persisted the override by the time it replies
+                    // Ok, so reopening the tab now reads the new harness. Run it
+                    // detached so closing this worktree's own tab can't abort it.
+                    if let Some(path) = path {
+                        spawn_relaunch_tab(&worktree, &path);
+                    }
+                });
+            }
+        }
     }
 }
 

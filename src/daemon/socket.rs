@@ -1,6 +1,7 @@
 use super::Daemon;
 use super::resources;
 use super::state::{PrSnapshot, Snapshot};
+use crate::config::Harness;
 use crate::worktree::BranchInfo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,12 @@ pub enum ClientMsg {
         name: String,
         #[serde(default)]
         force: bool,
+    },
+    /// Set the per-worktree harness override (worktrees pane `h`); applies the
+    /// next time swamp builds that worktree's tab.
+    SetHarness {
+        worktree: String,
+        harness: Harness,
     },
 }
 
@@ -131,6 +138,12 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     }
                     ClientMsg::CreateWorktreeFromBase { branch, base } => {
                         match daemon.create_worktree_from_base(&branch, &base).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
+                    }
+                    ClientMsg::SetHarness { worktree, harness } => {
+                        match daemon.set_harness(&worktree, harness).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
@@ -236,6 +249,7 @@ mod tests {
                     agent_ts: 0,
                     session_name: None,
                     head_ts: 0,
+                    harness: None,
                 })
                 .collect(),
         }
@@ -268,6 +282,10 @@ mod tests {
             ClientMsg::RemoveWorktree {
                 name: "feature-x".into(),
                 force: false,
+            },
+            ClientMsg::SetHarness {
+                worktree: "feature-x".into(),
+                harness: Harness::Codex,
             },
         ];
         for msg in &msgs {

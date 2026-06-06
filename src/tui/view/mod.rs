@@ -125,6 +125,15 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
+    if let Some(InputMode::PickHarness { name }) = &app.input {
+        let line = Line::from(vec![
+            Span::styled("Harness for ", Theme::accent_bold()),
+            Span::styled(format!("'{name}'"), Theme::accent_bold()),
+            Span::styled(": (c)laude / (x)odex", Theme::muted()),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if let Some(msg) = &app.status_msg {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -144,7 +153,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
     spans.push(Span::styled(
-        "j/k move · enter jump · c create · d delete · r refresh · u update · K kill · q quit",
+        "j/k move · enter jump · c create · d delete · h harness · r refresh · u update · K kill · q quit",
         Theme::muted(),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);

@@ -1,6 +1,7 @@
 use super::bordered_inner;
 use super::pr::pr_state_icon_color;
 use crate::cli::TuiView;
+use crate::config::Harness;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
 use crate::github::ReviewDecision;
 use crate::tui::AppState;
@@ -37,6 +38,7 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
             Constraint::Min(10),   // branch
             Constraint::Min(12),   // git
             Constraint::Length(5), // age
+            Constraint::Length(1), // harness override (C/X)
         ],
     )
     .block(
@@ -147,6 +149,14 @@ fn build_row<'a>(
         Cell::from(Span::styled(txt, style))
     };
 
+    // Per-worktree harness override (set with `h`); only honored when the repo
+    // setting is `choose`, but shown whenever recorded. Blank if unset.
+    let harness_cell = match r.harness {
+        Some(Harness::Claude) => Cell::from(Span::styled("C", Style::default().fg(Theme::BRANCH))),
+        Some(Harness::Codex) => Cell::from(Span::styled("X", Style::default().fg(Theme::BRANCH))),
+        None => Cell::from(Span::raw(" ")),
+    };
+
     let row = Row::new(vec![
         idx_cell,
         agent_cell,
@@ -155,6 +165,7 @@ fn build_row<'a>(
         branch_cell,
         git_cell,
         age_cell,
+        harness_cell,
     ]);
     if i == app.selected {
         row.style(Theme::selected())
