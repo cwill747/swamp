@@ -100,6 +100,7 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
         pre_create_names: HashSet::new(),
         input: None,
         status_msg: None,
+        toast: None,
         resources: resources::Snapshot::default(),
         pr_snapshot: PrSnapshot::default(),
         resource_scroll: 0,
@@ -155,6 +156,12 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
             }
             AppEvent::Tick => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                if let Some((_, ticks)) = &mut app.toast {
+                    *ticks = ticks.saturating_sub(1);
+                    if *ticks == 0 {
+                        app.toast = None;
+                    }
+                }
             }
             AppEvent::Resources(snap) => {
                 app.resources = snap;
