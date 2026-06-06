@@ -31,13 +31,16 @@ pub async fn run(payload: Vec<String>) -> Result<()> {
     }
 
     let dir = json.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-    let session_id = json
-        .get("thread-id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
 
+    // Deliberately do *not* forward Codex's `thread-id`. The generic `session_id`
+    // field is a Claude resume token: the daemon persists it and `launch.rs`
+    // emits `claude --resume <id>` for any stored id when the effective harness
+    // is Claude. Codex never resumes from it (it has no `--resume` path), so
+    // passing a Codex thread id here would overwrite a worktree's saved Claude
+    // UUID and break resuming that conversation after switching back to Claude.
+    //
     // Best-effort: never let a notify failure surface to Codex.
-    let _ = crate::hook::run("idle".to_string(), dir, None, session_id).await;
+    let _ = crate::hook::run("idle".to_string(), dir, None, None).await;
     Ok(())
 }
 
@@ -56,7 +59,6 @@ mod tests {
             Some("agent-turn-complete")
         );
         assert_eq!(json.get("cwd").and_then(|v| v.as_str()), Some("/repo/feat"));
-        assert_eq!(json.get("thread-id").and_then(|v| v.as_str()), Some("t-1"));
     }
 
     /// A malformed payload and an unhandled event type are both silent no-ops.
