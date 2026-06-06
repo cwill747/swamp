@@ -47,9 +47,10 @@ pub async fn run(
     } else {
         Default::default()
     };
-    // Carry forward prior session_name / session_id when this hook omits them,
-    // so transient `working`/`idle` pings don't erase the data we need to
-    // resume the session (#33). Mirrors DaemonState::apply_hook.
+    // Carry forward prior session_name / session_id / harness when this hook
+    // omits them, so transient `working`/`idle` pings don't erase data we need
+    // later: the session id to resume Claude (#33), and the per-worktree harness
+    // override the user picked with `h`. Mirrors DaemonState::apply_hook.
     let prior = map.get(&wt_name).cloned();
     let prior_field = |key: &str| {
         prior
@@ -65,6 +66,9 @@ pub async fn run(
     let session_id = session_id
         .filter(|s| !s.is_empty())
         .or_else(|| prior_field("session_id"));
+    // A hook never carries the harness override; always preserve the saved one,
+    // otherwise this fallback silently reverts `choose` repos to Claude.
+    let harness = prior_field("harness");
 
     let mut entry = serde_json::Map::new();
     entry.insert("status".into(), json!(status.to_lowercase()));
@@ -74,6 +78,9 @@ pub async fn run(
     }
     if let Some(ref id) = session_id {
         entry.insert("session_id".into(), json!(id));
+    }
+    if let Some(ref h) = harness {
+        entry.insert("harness".into(), json!(h));
     }
     map.insert(wt_name, json!(entry));
     let tmp = path.with_extension("json.tmp");

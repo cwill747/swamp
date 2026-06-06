@@ -388,6 +388,18 @@ impl Daemon {
         let _ = self.tx.send(ServerMsg::Snapshot(snap));
         Ok(())
     }
+
+    /// Record the per-worktree harness override, persist it, and broadcast the
+    /// refreshed snapshot so the indicator updates.
+    pub async fn set_harness(&self, wt_name: &str, harness: crate::config::Harness) -> Result<()> {
+        let mut s = self.state.write().await;
+        s.set_harness(wt_name, harness);
+        s.persist(&self.common_dir).await?;
+        let snap = s.snapshot();
+        drop(s);
+        let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        Ok(())
+    }
 }
 
 pub(crate) async fn probe(sock: &Path) -> Result<()> {

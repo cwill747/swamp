@@ -1,3 +1,4 @@
+use crate::config::Harness;
 use crate::github::PrSummary;
 use crate::util::now_unix;
 use crate::worktree::{self, GitInfo, Worktree};
@@ -27,6 +28,11 @@ pub struct AgentRecord {
     /// `claude --resume <id>` while the worktree still exists (#33).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Per-worktree harness override, honored when the repo setting is `choose`.
+    /// Set from the worktrees pane (`h`) and read at launch to build the agent
+    /// pane for the right agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<Harness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +54,9 @@ pub struct WorktreeRow {
     pub session_name: Option<String>,
     #[serde(default)]
     pub head_ts: u64,
+    /// Effective harness override for this worktree (see [`AgentRecord::harness`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<Harness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,10 +76,15 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub async fn load(_common_dir: &Path) -> Result<Self> {
+    pub async fn load(common_dir: &Path) -> Result<Self> {
+        // Hydrate the agent records persisted by a prior run. `persist` rewrites
+        // the whole `agents` map, so without this an empty in-memory map would
+        // clobber other worktrees' session ids / harness overrides the first
+        // time any record changes (a hook ping or `set_harness`).
+        let agents = load_agents(common_dir).await;
         Ok(Self {
             rows: HashMap::new(),
-            agents: HashMap::new(),
+            agents,
             prs: HashMap::new(),
         })
     }
@@ -120,11 +134,14 @@ impl DaemonState {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .or_else(|| existing.and_then(|r| r.session_id.clone()));
+        // Preserve any per-worktree harness override across status pings.
+        let harness = existing.and_then(|r| r.harness);
         let rec = AgentRecord {
             status: agent_status,
             ts: now_unix(),
             session_name: session,
             session_id: sid,
+            harness,
         };
         self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
@@ -133,6 +150,16 @@ impl DaemonState {
             row.session_name = rec.session_name;
         }
         Ok(())
+    }
+
+    /// Record the per-worktree harness override (worktrees pane `h`). Preserves
+    /// the rest of the agent record so an existing session/status isn't lost.
+    pub fn set_harness(&mut self, wt_name: &str, harness: Harness) {
+        let rec = self.agents.entry(wt_name.to_string()).or_default();
+        rec.harness = Some(harness);
+        if let Some(row) = self.rows.get_mut(wt_name) {
+            row.harness = Some(harness);
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -150,6 +177,17 @@ impl DaemonState {
             prs: self.prs.clone(),
         }
     }
+}
+
+/// Read the persisted `name → AgentRecord` map from `.swamp-status.json`.
+/// A missing or malformed file yields an empty map, so a fresh repo (or a typo)
+/// simply starts with no recorded agents rather than failing the daemon.
+async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
+    let path = common_dir.join(".swamp-status.json");
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
@@ -174,6 +212,7 @@ fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow 
         agent_ts: agent.ts,
         session_name: agent.session_name.clone(),
         head_ts: info.head_ts,
+        harness: agent.harness,
     }
 }
 
@@ -203,6 +242,7 @@ mod tests {
             agent_ts: 0,
             session_name: None,
             head_ts,
+            harness: None,
         }
     }
 
@@ -315,6 +355,76 @@ mod tests {
         assert_eq!(
             state.agents.get("main").unwrap().session_id.as_deref(),
             Some("abc-123")
+        );
+    }
+
+    /// A daemon hydrates persisted agent records on load, so changing one
+    /// worktree's harness and re-persisting must not clobber another worktree's
+    /// recorded Claude `session_id` (needed to resume on the next launch).
+    #[tokio::test]
+    async fn set_harness_persist_preserves_other_session_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-state-hydrate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = dir.join(".swamp-status.json");
+        // A prior run recorded a session id for `feat`.
+        std::fs::write(
+            &status,
+            r#"{"feat":{"status":"idle","ts":1,"session_id":"keep-me"}}"#,
+        )
+        .unwrap();
+
+        let mut state = DaemonState::load(&dir).await.unwrap();
+        assert_eq!(
+            state.agents.get("feat").unwrap().session_id.as_deref(),
+            Some("keep-me"),
+            "load must hydrate existing records"
+        );
+
+        // Pick a harness for a *different* worktree, then persist.
+        state.set_harness("main", Harness::Codex);
+        state.persist(&dir).await.unwrap();
+
+        // Re-read from disk: feat's session id survives, main's harness is saved.
+        let reread = load_agents(&dir).await;
+        assert_eq!(
+            reread.get("feat").unwrap().session_id.as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(reread.get("main").unwrap().harness, Some(Harness::Codex));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `set_harness` records the override, updates the row, and survives a later
+    /// status hook that doesn't mention the harness.
+    #[test]
+    fn set_harness_records_and_survives_hooks() {
+        let mut state = DaemonState {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+            prs: HashMap::new(),
+        };
+        state.rows.insert("main".into(), make_row("main"));
+
+        state.set_harness("main", Harness::Codex);
+        assert_eq!(
+            state.agents.get("main").unwrap().harness,
+            Some(Harness::Codex)
+        );
+        assert_eq!(
+            state.rows.get("main").unwrap().harness,
+            Some(Harness::Codex)
+        );
+
+        // A later status ping must not wipe the override.
+        state.apply_hook("main", "working", None, None).unwrap();
+        assert_eq!(
+            state.agents.get("main").unwrap().harness,
+            Some(Harness::Codex)
         );
     }
 }
