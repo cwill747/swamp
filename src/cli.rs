@@ -1,8 +1,15 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "swamp", version, about = "Zellij worktree dashboard")]
+#[command(
+    name = "swamp",
+    version,
+    about = "Zellij worktree dashboard",
+    long_about = "swamp launches a Zellij session for a git repo, with one tab per worktree plus panes for lazygit, an agent harness, a shell, and live repo status."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Cmd>,
@@ -23,74 +30,210 @@ pub enum TuiView {
     PrStatus,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HookStatus {
+    /// Agent is actively processing a prompt or tool call.
+    Working,
+    /// Agent is blocked on user input or a permission prompt.
+    Waiting,
+    /// Agent finished its turn.
+    Idle,
+}
+
+impl fmt::Display for HookStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            HookStatus::Working => "working",
+            HookStatus::Waiting => "waiting",
+            HookStatus::Idle => "idle",
+        })
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Launch a zellij session with a tab per worktree (default).
-    Launch { dir: Option<PathBuf> },
+    #[command(
+        about = "Launch or attach to a repo session",
+        long_about = "Launch or attach to a Zellij session for a git repo. With no DIR, swamp uses the current directory. This is also the default command when `swamp` is run with no subcommand."
+    )]
+    Launch(LaunchArgs),
 
-    /// Run the per-repo daemon: state + watcher + socket server.
-    Serve {
-        /// Path inside the repo (default: cwd).
-        dir: Option<PathBuf>,
-        /// Stay in foreground (default: detach).
-        #[arg(long)]
-        foreground: bool,
-    },
+    #[command(
+        about = "Run the repo status daemon",
+        long_about = "Run the per-repo daemon that scans worktrees, watches git state, stores agent status, and serves TUI clients over a Unix socket. Most users do not need to run this directly."
+    )]
+    Serve(ServeArgs),
 
-    /// Long-running TUI client; renders into the current pane.
-    Tui {
-        /// Path inside the repo (default: cwd).
-        dir: Option<PathBuf>,
-        /// Which panel to render (default: all).
-        #[arg(long, value_enum, default_value_t = TuiView::All)]
-        view: TuiView,
-        /// Pin the worktree matching this pane's cwd to the top. Set for the
-        /// swamp pane inside a worktree tab; omitted on the dashboard, whose
-        /// cwd is the default worktree and should stay recency-sorted.
-        #[arg(long)]
-        pin_cwd: bool,
-    },
+    #[command(
+        about = "Render the status TUI",
+        long_about = "Render the long-running status TUI in the current terminal pane. swamp launch embeds this in generated Zellij layouts, but it can also be run directly."
+    )]
+    Tui(TuiArgs),
 
-    /// Record an agent status update (called from Claude Code hooks).
-    Hook {
-        /// New status: working | waiting | idle
-        status: String,
-        /// Path inside the worktree (default: cwd).
-        #[arg(long)]
-        dir: Option<PathBuf>,
-        /// Claude Code session/conversation name.
-        #[arg(long)]
-        session_name: Option<String>,
-        /// Claude Code session id (UUID). Recorded so a restarted swamp can
-        /// resume this worktree's session via `claude --resume <id>`.
-        #[arg(long)]
-        session_id: Option<String>,
-    },
+    #[command(
+        about = "Record an agent status update",
+        long_about = "Record an agent status update for the current worktree. This is intended for Claude Code hooks and other automation; `swamp init` installs the recommended hooks."
+    )]
+    Hook(HookArgs),
 
-    /// Forward a Codex `notify` event to swamp (set as Codex's `notify` program).
-    /// Codex appends a single JSON payload argument describing the event.
-    CodexNotify {
-        /// The JSON payload Codex passes (captured as trailing args).
-        #[arg(trailing_var_arg = true)]
-        payload: Vec<String>,
-    },
+    #[command(
+        hide = true,
+        about = "Forward a Codex notify event",
+        long_about = "Forward a Codex `notify` event to swamp. `swamp init` configures Codex to call this command with the JSON payload Codex appends."
+    )]
+    CodexNotify(CodexNotifyArgs),
 
-    /// Close and reopen a worktree's tab so a harness swap takes effect live.
-    /// Spawned detached by the TUI; not typically run by hand.
-    RelaunchTab {
-        /// The worktree (tab) name.
-        name: String,
-        /// The worktree's path.
-        dir: PathBuf,
-    },
+    #[command(
+        hide = true,
+        about = "Relaunch a worktree tab",
+        long_about = "Close and reopen one worktree tab so a harness swap takes effect live. The TUI spawns this command detached; it is not intended for interactive use."
+    )]
+    RelaunchTab(RelaunchTabArgs),
 
-    /// Kill the swamp daemon and zellij session for this repo.
-    Kill {
-        /// Path inside the repo (default: cwd).
-        dir: Option<PathBuf>,
-    },
+    #[command(
+        about = "Stop the repo session",
+        long_about = "Stop the per-repo daemon, kill the matching Zellij session, and remove swamp's runtime socket and PID files."
+    )]
+    Kill(KillArgs),
 
-    /// Write swamp's config file and install/update Claude Code hooks +
-    /// Codex notify.
+    #[command(
+        about = "Install user config and agent hooks",
+        long_about = "Write swamp's config file if it is missing, refresh managed config files, install or update Claude Code hooks, and configure Codex notify."
+    )]
     Init,
+
+    #[command(
+        about = "Generate shell completions",
+        long_about = "Generate shell completions for swamp. Packagers should use this command to install completions from the exact binary they ship."
+    )]
+    Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+pub struct LaunchArgs {
+    /// Path inside the repo to launch (default: current directory).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct ServeArgs {
+    /// Path inside the repo to serve (default: current directory).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Stay attached and log to stderr instead of detaching.
+    #[arg(long)]
+    pub foreground: bool,
+}
+
+#[derive(Args)]
+pub struct TuiArgs {
+    /// Path inside the repo to inspect (default: current directory).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Panel to render.
+    #[arg(long, value_enum, default_value_t = TuiView::All)]
+    pub view: TuiView,
+    /// Pin the worktree matching this pane's cwd to the top.
+    #[arg(long)]
+    pub pin_cwd: bool,
+}
+
+#[derive(Args)]
+pub struct HookArgs {
+    /// New status to record: working, waiting, or idle.
+    #[arg(value_enum, value_name = "STATUS")]
+    pub status: HookStatus,
+    /// Path inside the worktree to update (default: current directory).
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Claude Code session or conversation name to show in the TUI.
+    #[arg(long, value_name = "NAME")]
+    pub session_name: Option<String>,
+    /// Claude Code session UUID to resume on a later launch.
+    #[arg(long, value_name = "ID")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct CodexNotifyArgs {
+    /// JSON payload Codex passes to notify.
+    #[arg(value_name = "JSON", trailing_var_arg = true)]
+    pub payload: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct RelaunchTabArgs {
+    /// Worktree tab name to relaunch.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Worktree path for the relaunched tab.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+}
+
+#[derive(Args)]
+pub struct KillArgs {
+    /// Path inside the repo session to stop (default: current directory).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for.
+    #[arg(value_enum, value_name = "SHELL")]
+    pub shell: Shell,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    fn top_level_help() -> String {
+        Cli::command().render_long_help().to_string()
+    }
+
+    #[test]
+    fn top_level_help_hides_internal_commands() {
+        let help = top_level_help();
+
+        assert!(help.contains("launch"));
+        assert!(help.contains("init"));
+        assert!(help.contains("completions"));
+        assert!(!help.contains("codex-notify"));
+        assert!(!help.contains("relaunch-tab"));
+    }
+
+    #[test]
+    fn launch_help_documents_dir_argument() {
+        let mut cmd = Cli::command();
+        let launch = cmd.find_subcommand_mut("launch").unwrap();
+        let help = launch.render_long_help().to_string();
+
+        assert!(help.contains("[DIR]"));
+        assert!(help.contains("Path inside the repo to launch"));
+    }
+
+    #[test]
+    fn completions_help_lists_supported_shells() {
+        let mut cmd = Cli::command();
+        let completions = cmd.find_subcommand_mut("completions").unwrap();
+        let help = completions.render_long_help().to_string();
+
+        assert!(help.contains("bash"));
+        assert!(help.contains("fish"));
+        assert!(help.contains("zsh"));
+    }
+
+    #[test]
+    fn hook_rejects_unknown_status() {
+        let err = match Cli::try_parse_from(["swamp", "hook", "blocked"]) {
+            Ok(_) => panic!("unknown hook status should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
 }
