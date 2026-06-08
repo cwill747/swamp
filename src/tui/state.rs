@@ -3,7 +3,7 @@ use crate::daemon::resources;
 use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::worktree::BranchInfo;
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -131,8 +131,7 @@ pub struct AppState {
     pub view: TuiView,
     pub refreshing: bool,
     pub pending_delete: Option<String>,
-    pub pending_create: bool,
-    pub pre_create_names: HashSet<String>,
+    pub pending_create: Option<String>,
     /// Worktree name -> last time swamp issued a `new-tab` for it. `zellij
     /// action new-tab` returns before the tab is visible to `query-tab-names`,
     /// and worktree creation emits a burst of filesystem events the daemon

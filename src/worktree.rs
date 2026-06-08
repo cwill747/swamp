@@ -57,6 +57,15 @@ impl Worktree {
     }
 }
 
+/// Registry/tab name used for a branch's worktree. Git worktree names cannot
+/// contain slashes, so git-wt-style branch paths use the branch basename.
+pub fn worktree_name_for_branch(branch: &str) -> &str {
+    Path::new(branch)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(branch)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GitInfo {
     pub branch: String,
@@ -441,10 +450,7 @@ fn add_worktree(
     remote: Option<&str>,
 ) -> Result<Worktree> {
     let root = workon_root(repo)?;
-    let wt_name = Path::new(branch)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(branch);
+    let wt_name = worktree_name_for_branch(branch);
     let wt_path = root.join(branch);
     if let Some(parent) = wt_path.parent() {
         fs::create_dir_all(parent)?;
@@ -668,6 +674,12 @@ mod tests {
 
     fn git_available() -> bool {
         Command::new("git").arg("--version").output().is_ok()
+    }
+
+    #[test]
+    fn worktree_name_uses_branch_basename() {
+        assert_eq!(worktree_name_for_branch("feature"), "feature");
+        assert_eq!(worktree_name_for_branch("users/alice/feature"), "feature");
     }
 
     fn run(dir: &Path, args: &[&str]) {
