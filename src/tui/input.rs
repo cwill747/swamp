@@ -5,6 +5,7 @@ use super::view;
 use crate::cli::TuiView;
 use crate::config::Harness;
 use crate::daemon::socket::ClientMsg;
+use crate::worktree::worktree_name_for_branch;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -359,11 +360,11 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 
 /// Create zellij tabs for any worktrees in the snapshot that don't have one.
 ///
-/// Swamp opens a tab itself when *it* creates a worktree (the `pending_create`
-/// path), but a worktree born outside swamp — `git worktree add` in another
-/// terminal, an agent spinning one up — only shows up in the daemon snapshot. It
-/// lists in the dashboard, yet double-clicking it can't focus anything because
-/// no tab exists. Reconcile fills that gap.
+/// Swamp opens the requested target tab itself when *it* creates a worktree
+/// (the `pending_create` path), but a worktree born outside swamp — `git
+/// worktree add` in another terminal, an agent spinning one up — only shows up
+/// in the daemon snapshot. It lists in the dashboard, yet double-clicking it
+/// can't focus anything because no tab exists. Reconcile fills that gap.
 ///
 /// Only the dashboard's worktrees pane runs this: it's the single instance with
 /// `view == Worktrees && !pin_cwd`, so the several swamp panes (one per worktree
@@ -404,9 +405,9 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
 const TAB_OPEN_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Open a worktree tab unless we issued one for the same name within
-/// [`TAB_OPEN_COOLDOWN`]. Both the `pending_create` path and [`reconcile_tabs`]
-/// route through here so the freshly-opened tab isn't reopened by the snapshots
-/// that arrive before zellij registers it.
+/// [`TAB_OPEN_COOLDOWN`]. Both the targeted `pending_create` path and
+/// [`reconcile_tabs`] route through here so the freshly-opened tab isn't
+/// reopened by the snapshots that arrive before zellij registers it.
 pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name: &str) {
     let now = Instant::now();
     app.recent_tab_opens
@@ -418,8 +419,9 @@ pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name:
     let _ = crate::launch::open_worktree_tab(path, name);
 }
 
-/// Fire a worktree-create request and arm the pending-create tracking so the
-/// new tab opens when the next snapshot arrives. Leaves `app.input` closed.
+/// Fire a worktree-create request and arm the pending-create tracking so only
+/// that target's tab opens when the next snapshot arrives. Leaves `app.input`
+/// closed.
 fn start_create(
     app: &mut AppState,
     tx: &mpsc::Sender<AppEvent>,
@@ -432,8 +434,7 @@ fn start_create(
         }
         _ => String::new(),
     };
-    app.pre_create_names = app.snapshot.rows.iter().map(|r| r.name.clone()).collect();
-    app.pending_create = true;
+    app.pending_create = Some(worktree_name_for_branch(&label).to_string());
     app.status_msg = Some(format!("Creating {label}…"));
     let tx = tx.clone();
     let common = common.to_path_buf();

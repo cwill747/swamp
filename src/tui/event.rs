@@ -13,7 +13,6 @@ use crate::zellij;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -98,8 +97,7 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
         view,
         refreshing: false,
         pending_delete: None,
-        pending_create: false,
-        pre_create_names: HashSet::new(),
+        pending_create: None,
         recent_tab_opens: std::collections::HashMap::new(),
         input: None,
         status_msg: None,
@@ -139,22 +137,17 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                     app.pending_delete = None;
                     app.status_msg = None;
                 }
-                if app.pending_create {
-                    let new_rows: Vec<(PathBuf, String)> = app
+                if let Some(name) = app.pending_create.clone() {
+                    let created = app
                         .snapshot
                         .rows
                         .iter()
-                        .filter(|r| !app.pre_create_names.contains(&r.name))
-                        .map(|r| (r.path.clone(), r.name.clone()))
-                        .collect();
-                    if !new_rows.is_empty() {
-                        for (path, name) in &new_rows {
-                            open_worktree_tab_debounced(&mut app, path, name);
-                        }
-                        if let Some((_, name)) = new_rows.last() {
-                            let _ = zellij::go_to_tab_name(name);
-                        }
-                        app.pending_create = false;
+                        .find(|r| r.name == name)
+                        .map(|r| (r.path.clone(), r.name.clone()));
+                    if let Some((path, name)) = created {
+                        open_worktree_tab_debounced(&mut app, &path, &name);
+                        let _ = zellij::go_to_tab_name(&name);
+                        app.pending_create = None;
                         app.status_msg = None;
                     }
                 } else {
@@ -203,7 +196,7 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                 }
             }
             AppEvent::ActionError(msg) => {
-                app.pending_create = false;
+                app.pending_create = None;
                 app.pending_delete = None;
                 app.input = None;
                 app.status_msg = Some(msg);
