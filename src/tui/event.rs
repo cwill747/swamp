@@ -1,5 +1,7 @@
 use super::client::{request_branches, send_refresh, send_update, subscribe_loop};
-use super::input::{handle_create_key, handle_input_key, handle_mouse, reconcile_tabs};
+use super::input::{
+    handle_create_key, handle_input_key, handle_mouse, open_worktree_tab_debounced, reconcile_tabs,
+};
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
 use crate::cli::TuiView;
@@ -98,6 +100,7 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
         pending_delete: None,
         pending_create: false,
         pre_create_names: HashSet::new(),
+        recent_tab_opens: std::collections::HashMap::new(),
         input: None,
         status_msg: None,
         toast: None,
@@ -134,24 +137,25 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                     app.status_msg = None;
                 }
                 if app.pending_create {
-                    let new_rows: Vec<_> = app
+                    let new_rows: Vec<(PathBuf, String)> = app
                         .snapshot
                         .rows
                         .iter()
                         .filter(|r| !app.pre_create_names.contains(&r.name))
+                        .map(|r| (r.path.clone(), r.name.clone()))
                         .collect();
                     if !new_rows.is_empty() {
-                        for row in &new_rows {
-                            let _ = crate::launch::open_worktree_tab(&row.path, &row.name);
+                        for (path, name) in &new_rows {
+                            open_worktree_tab_debounced(&mut app, path, name);
                         }
-                        if let Some(last) = new_rows.last() {
-                            let _ = zellij::go_to_tab_name(&last.name);
+                        if let Some((_, name)) = new_rows.last() {
+                            let _ = zellij::go_to_tab_name(name);
                         }
                         app.pending_create = false;
                         app.status_msg = None;
                     }
                 } else {
-                    reconcile_tabs(&app);
+                    reconcile_tabs(&mut app);
                 }
             }
             AppEvent::Tick => {

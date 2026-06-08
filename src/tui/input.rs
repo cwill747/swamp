@@ -8,6 +8,7 @@ use crate::daemon::socket::ClientMsg;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -375,18 +376,46 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 /// [`zellij::list_tab_names`] reports that failure as an empty tab set — which
 /// would read as "every worktree is missing a tab" and spawn a doomed `new-tab`
 /// per row on every snapshot.
-pub(super) fn reconcile_tabs(app: &AppState) {
+pub(super) fn reconcile_tabs(app: &mut AppState) {
     if app.view != TuiView::Worktrees || app.pin_cwd || !zellij::in_zellij() {
         return;
     }
     let Ok(tabs) = zellij::list_tab_names() else {
         return;
     };
-    for row in &app.snapshot.rows {
-        if !tabs.iter().any(|t| t == &row.name) {
-            let _ = crate::launch::open_worktree_tab(&row.path, &row.name);
-        }
+    // Collect first: opening a tab mutates `recent_tab_opens`, which can't
+    // alias the `snapshot.rows` borrow held by the loop.
+    let missing: Vec<(PathBuf, String)> = app
+        .snapshot
+        .rows
+        .iter()
+        .filter(|row| !tabs.iter().any(|t| t == &row.name))
+        .map(|row| (row.path.clone(), row.name.clone()))
+        .collect();
+    for (path, name) in missing {
+        open_worktree_tab_debounced(app, &path, &name);
     }
+}
+
+/// Window after swamp issues a `new-tab` during which we refuse to reopen the
+/// same worktree. Covers the gap between `zellij action new-tab` returning and
+/// the tab becoming visible to `query-tab-names`, plus the burst of snapshots
+/// a single worktree creation produces.
+const TAB_OPEN_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Open a worktree tab unless we issued one for the same name within
+/// [`TAB_OPEN_COOLDOWN`]. Both the `pending_create` path and [`reconcile_tabs`]
+/// route through here so the freshly-opened tab isn't reopened by the snapshots
+/// that arrive before zellij registers it.
+pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name: &str) {
+    let now = Instant::now();
+    app.recent_tab_opens
+        .retain(|_, t| now.duration_since(*t) < TAB_OPEN_COOLDOWN);
+    if app.recent_tab_opens.contains_key(name) {
+        return;
+    }
+    app.recent_tab_opens.insert(name.to_string(), now);
+    let _ = crate::launch::open_worktree_tab(path, name);
 }
 
 /// Fire a worktree-create request and arm the pending-create tracking so the
