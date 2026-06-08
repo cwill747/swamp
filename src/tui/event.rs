@@ -133,6 +133,9 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                     && !app.snapshot.rows.iter().any(|r| &r.name == name)
                 {
                     let _ = zellij::close_tab_by_name(name);
+                    // Drop any debounce record so a same-name worktree recreated
+                    // within the cooldown still gets a fresh tab.
+                    app.recent_tab_opens.remove(name);
                     app.pending_delete = None;
                     app.status_msg = None;
                 }
@@ -182,6 +185,7 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
                         }
                         if !wt_names.iter().any(|n| n == tab) {
                             let _ = zellij::close_tab_by_name(tab);
+                            app.recent_tab_opens.remove(tab);
                         }
                     }
                 }
