@@ -1,6 +1,7 @@
 /// User-tunable swamp settings, loaded from `$XDG_CONFIG_HOME/swamp/config.toml`.
 /// Every field has a default so a missing or partial file still yields a usable
-/// config (`#[serde(default)]` fills the gaps).
+/// config (`#[serde(default)]` fills the gaps). Malformed config is rejected by
+/// the loader.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct SwampConfig {
