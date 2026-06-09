@@ -394,6 +394,7 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
         .map(|row| (row.path.clone(), row.name.clone()))
         .collect();
     for (path, name) in missing {
+        tracing::info!(worktree = %name, "reconcile: worktree has no zellij tab");
         open_worktree_tab_debounced(app, &path, &name);
     }
 }
@@ -413,9 +414,11 @@ pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name:
     app.recent_tab_opens
         .retain(|_, t| now.duration_since(*t) < TAB_OPEN_COOLDOWN);
     if app.recent_tab_opens.contains_key(name) {
+        tracing::debug!(worktree = %name, "tab open suppressed (within cooldown)");
         return;
     }
     app.recent_tab_opens.insert(name.to_string(), now);
+    tracing::info!(worktree = %name, "opening worktree tab");
     let _ = crate::launch::open_worktree_tab(path, name);
 }
 

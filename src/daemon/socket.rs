@@ -101,12 +101,14 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         write_msg(&mut stream, &ServerMsg::Version { version: env!("CARGO_PKG_VERSION").to_string() }).await?;
                     }
                     ClientMsg::Refresh => {
+                        tracing::info!(trigger = "tui_refresh", "client requested refresh");
                         daemon.fetch_and_refresh().await;
                         let snap = daemon.state.read().await.snapshot();
                         let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
                         write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
                     }
                     ClientMsg::UpdateDefault => {
+                        tracing::info!(trigger = "update_default", "client requested default-branch update");
                         match daemon.update_default().await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,

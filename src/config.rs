@@ -9,7 +9,8 @@ pub use codex::ensure_codex_notify;
 pub use paths::{ConfigPaths, ensure_config_toml, ensure_configs, load_config};
 #[allow(unused_imports)]
 pub use types::{
-    DashboardConfig, Harness, HarnessConfig, HarnessSetting, SwampConfig, resolve_harness,
+    DashboardConfig, Harness, HarnessConfig, HarnessSetting, LogLevel, LoggingConfig, SwampConfig,
+    resolve_harness,
 };
 
 use anyhow::Result;

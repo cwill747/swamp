@@ -34,6 +34,7 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
                 }
             }
         }
+        tracing::debug!(trigger = "watcher", "filesystem change; git refresh");
         if let Err(e) = daemon.refresh_all().await {
             tracing::warn!("watcher refresh: {e:?}");
         }

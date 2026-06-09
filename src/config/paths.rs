@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::types::{DashboardConfig, HarnessSetting, SwampConfig};
+use super::types::{DashboardConfig, HarnessSetting, LoggingConfig, SwampConfig};
 
 const LAZYGIT_CONFIG: &str = include_str!("lazygit.yml");
 const DEFAULT_CONFIG_TOML: &str = include_str!("config.toml");
@@ -12,6 +12,8 @@ pub struct ConfigPaths {
     pub dashboard: DashboardConfig,
     /// Repo-wide harness preference (per-worktree overrides apply in `choose`).
     pub harness: HarnessSetting,
+    /// Diagnostic-logging settings, used to initialize the tracing subscriber.
+    pub logging: LoggingConfig,
 }
 
 /// Returns the `$XDG_CONFIG_HOME/swamp` directory (falls back to
@@ -33,10 +35,17 @@ fn config_toml_path() -> PathBuf {
 /// one aborts so typos do not silently change launch behavior.
 pub fn load_config() -> Result<SwampConfig> {
     let path = config_toml_path();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display())),
-        Err(_) => Ok(SwampConfig::default()),
+    let cfg: SwampConfig = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
+        Err(_) => SwampConfig::default(),
+    };
+    // A bad `[logging] filter` directive is rejected here, alongside other
+    // malformed config, rather than being silently dropped at subscriber init.
+    if let Some(filter) = &cfg.logging.filter {
+        tracing_subscriber::EnvFilter::try_new(filter)
+            .with_context(|| format!("invalid [logging] filter in {}", path.display()))?;
     }
+    Ok(cfg)
 }
 
 /// Write the default `config.toml` if it doesn't exist yet. Unlike the embedded
@@ -85,6 +94,7 @@ pub fn ensure_configs() -> Result<ConfigPaths> {
         lazygit,
         dashboard: cfg.dashboard,
         harness: cfg.harness.default,
+        logging: cfg.logging,
     })
 }
 
@@ -177,6 +187,20 @@ mod tests {
 
         let err = load_config().unwrap_err();
         assert!(err.to_string().contains("parse"));
+        assert!(err.to_string().contains("config.toml"));
+    }
+
+    #[test]
+    fn invalid_logging_filter_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let path = base.join("swamp").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A directive with an invalid level is rejected by EnvFilter parsing.
+        fs::write(&path, "[logging]\nfilter = \"swamp=notalevel\"\n").unwrap();
+
+        let err = load_config().unwrap_err();
         assert!(err.to_string().contains("config.toml"));
     }
 }

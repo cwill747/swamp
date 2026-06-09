@@ -6,6 +6,7 @@ mod github;
 mod hook;
 mod kill;
 mod launch;
+mod logging;
 mod tui;
 mod util;
 mod worktree;
@@ -32,6 +33,7 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::CodexNotify(args)) => codex_notify::run(args.payload).await,
         Some(cli::Cmd::RelaunchTab(args)) => launch::relaunch_worktree_tab(&args.name, &args.dir),
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
+        Some(cli::Cmd::Logs(args)) => logging::show(args.dir, args.follow, args.all).await,
         Some(cli::Cmd::Init) => config::init(),
         Some(cli::Cmd::Completions(args)) => {
             clap_complete::generate(

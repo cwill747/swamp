@@ -7,6 +7,45 @@
 pub struct SwampConfig {
     pub dashboard: DashboardConfig,
     pub harness: HarnessConfig,
+    pub logging: LoggingConfig,
+}
+
+/// Minimum severity recorded in the diagnostic log. Mirrors the standard
+/// tracing levels; an unknown value fails TOML parsing (caught by `load_config`)
+/// rather than silently defaulting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// The directive string understood by `tracing_subscriber::EnvFilter`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+/// Diagnostic-logging knobs. `level` is the common case (a bare severity);
+/// `filter` is the escape hatch accepting full `EnvFilter` directive syntax
+/// (e.g. `swamp::zellij=debug,info`) and, when set, wins over `level`. Both are
+/// overridden by the `RUST_LOG` environment variable at init time.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: LogLevel,
+    pub filter: Option<String>,
 }
 
 /// The AI coding agent launched in a worktree's agent pane.
@@ -112,6 +151,32 @@ mod tests {
         assert_eq!(cfg.dashboard.ai_column, 34);
         // An absent [harness] block defaults to Claude.
         assert_eq!(cfg.harness.default, HarnessSetting::Claude);
+    }
+
+    #[test]
+    fn logging_defaults_to_info_and_no_filter() {
+        let cfg = SwampConfig::default();
+        assert_eq!(cfg.logging.level, LogLevel::Info);
+        assert!(cfg.logging.filter.is_none());
+        // An absent [logging] block also yields the info default.
+        let cfg: SwampConfig = toml::from_str("[harness]\ndefault = \"claude\"\n").unwrap();
+        assert_eq!(cfg.logging.level, LogLevel::Info);
+    }
+
+    #[test]
+    fn logging_level_and_filter_parse() {
+        let cfg: SwampConfig =
+            toml::from_str("[logging]\nlevel = \"debug\"\nfilter = \"swamp::zellij=trace\"\n")
+                .unwrap();
+        assert_eq!(cfg.logging.level, LogLevel::Debug);
+        assert_eq!(cfg.logging.filter.as_deref(), Some("swamp::zellij=trace"));
+        assert_eq!(LogLevel::Debug.as_str(), "debug");
+    }
+
+    #[test]
+    fn logging_rejects_unknown_level() {
+        let err = toml::from_str::<SwampConfig>("[logging]\nlevel = \"verbose\"\n").unwrap_err();
+        assert!(err.to_string().contains("verbose") || err.to_string().contains("unknown"));
     }
 
     #[test]

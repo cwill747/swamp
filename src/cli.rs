@@ -97,6 +97,12 @@ pub enum Cmd {
     Kill(KillArgs),
 
     #[command(
+        about = "Show the repo's diagnostic log",
+        long_about = "Print swamp's per-repository diagnostic log (tab additions, git refreshes, hook updates). With no DIR, scopes output to the worktree containing the current directory; pass --all for the whole repo, or -f to follow new output."
+    )]
+    Logs(LogsArgs),
+
+    #[command(
         about = "Install user config and agent hooks",
         long_about = "Write swamp's config file if it is missing, refresh managed config files, install or update Claude Code hooks, and configure Codex notify."
     )]
@@ -177,6 +183,20 @@ pub struct KillArgs {
     /// Path inside the repo session to stop (default: current directory).
     #[arg(value_name = "DIR")]
     pub dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct LogsArgs {
+    /// Path inside the repo to inspect (default: current directory). When it
+    /// falls inside a worktree, output is scoped to that worktree.
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Follow the log, printing new output as it is appended.
+    #[arg(short, long)]
+    pub follow: bool,
+    /// Show the whole-repo log instead of scoping to the current worktree.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args)]
