@@ -14,7 +14,8 @@ pub struct ConfigPaths {
     pub harness: HarnessSetting,
 }
 
-/// Returns the `$XDG_CONFIG_HOME/swamp` directory (falls back to `~/.config/swamp`).
+/// Returns the `$XDG_CONFIG_HOME/swamp` directory (falls back to
+/// `$HOME/.config/swamp`).
 fn swamp_config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -29,18 +30,12 @@ fn config_toml_path() -> PathBuf {
 }
 
 /// Load the user's `config.toml`. A missing file yields defaults; a malformed
-/// one yields defaults plus a warning, so a typo never blocks a launch.
-pub fn load_config() -> SwampConfig {
+/// one aborts so typos do not silently change launch behavior.
+pub fn load_config() -> Result<SwampConfig> {
     let path = config_toml_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            eprintln!(
-                "swamp: warning: failed to parse {}: {e}; using defaults",
-                path.display()
-            );
-            SwampConfig::default()
-        }),
-        Err(_) => SwampConfig::default(),
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display())),
+        Err(_) => Ok(SwampConfig::default()),
     }
 }
 
@@ -85,7 +80,7 @@ pub fn ensure_configs() -> Result<ConfigPaths> {
 
     write_if_changed(&lazygit, LAZYGIT_CONFIG)?;
 
-    let cfg = load_config();
+    let cfg = load_config()?;
     Ok(ConfigPaths {
         lazygit,
         dashboard: cfg.dashboard,
@@ -108,9 +103,15 @@ pub(super) fn is_read_only(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_dir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("swamp-test-{}-{}", std::process::id(), line!()));
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("swamp-test-{}-{id}", std::process::id()));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -145,6 +146,7 @@ mod tests {
 
     #[test]
     fn ensure_configs_returns_expected_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Point XDG_CONFIG_HOME at a temp dir so we don't pollute the real one.
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
@@ -155,11 +157,26 @@ mod tests {
 
     #[test]
     fn ensure_configs_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         ensure_configs().unwrap();
         // Second call must not error and paths must still exist.
         let paths = ensure_configs().unwrap();
         assert!(paths.lazygit.exists());
+    }
+
+    #[test]
+    fn malformed_config_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let path = base.join("swamp").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[harness]\ndefault = [").unwrap();
+
+        let err = load_config().unwrap_err();
+        assert!(err.to_string().contains("parse"));
+        assert!(err.to_string().contains("config.toml"));
     }
 }
