@@ -193,7 +193,9 @@ pub fn relaunch_worktree_tab(name: &str, path: &Path) -> Result<()> {
     if !zellij::in_zellij() {
         return Ok(());
     }
-    let tabs = zellij::list_tab_names().unwrap_or_default();
+    let Ok(tabs) = zellij::list_tab_names() else {
+        return Ok(());
+    };
     if !tabs.iter().any(|t| t == name) {
         // No tab to relaunch (e.g. closed); just open it fresh.
         return open_worktree_tab(path, name);

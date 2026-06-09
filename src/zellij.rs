@@ -44,10 +44,24 @@ pub fn list_tab_names() -> Result<Vec<String>> {
         .args(["action", "query-tab-names"])
         .output()
         .context("zellij action query-tab-names")?;
-    Ok(String::from_utf8_lossy(&out.stdout)
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "zellij action query-tab-names exited {:?}: {}",
+            out.status.code(),
+            stderr.trim()
+        );
+    }
+    Ok(parse_tab_names(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_tab_names(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
-        .map(|l| l.to_string())
-        .collect())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Launch a brand-new zellij session attached to `layout`, with `cwd` and `session`.
@@ -122,5 +136,18 @@ mod exec {
             c.env_remove("ZELLIJ_SESSION_NAME");
         }
         c.exec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tab_names_trims_blank_lines() {
+        assert_eq!(
+            parse_tab_names("dashboard\n main \n\nfeature\r\n"),
+            vec!["dashboard", "main", "feature"]
+        );
     }
 }

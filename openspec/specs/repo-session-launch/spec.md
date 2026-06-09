@@ -119,6 +119,10 @@ The internal relaunch command SHALL reopen a worktree tab so harness changes can
 - **WHEN** the target tab does not exist
 - **THEN** relaunch opens a fresh worktree tab
 
+#### Scenario: Existing tabs cannot be queried
+- **WHEN** relaunch cannot query the current Zellij tab names
+- **THEN** relaunch exits without changing tabs
+
 ### Requirement: Launch Inside Zellij Baseline
 Launch SHALL preserve the currently implemented behavior of creating or attaching to a named repo session rather than adding tabs to the ambient Zellij session.
 

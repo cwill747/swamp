@@ -118,6 +118,11 @@ The dashboard TUI SHALL reconcile missing Zellij tabs for externally-created wor
 - **WHEN** the TUI is not running inside Zellij
 - **THEN** tab reconciliation does not attempt to open Zellij tabs
 
+#### Scenario: Tab query unavailable
+- **WHEN** the dashboard TUI cannot query the current Zellij tab names
+- **THEN** tab reconciliation treats tab state as unknown
+- **AND** it does not open replacement worktree tabs
+
 ### Requirement: Resource Reporting
 The daemon SHALL sample Zellij-session process descendants, aggregate CPU, RSS, elapsed time, system load, and memory, and broadcast resource snapshots.
 
