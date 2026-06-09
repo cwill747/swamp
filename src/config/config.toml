@@ -23,3 +23,17 @@ shell_column = 33
 #              (defaults to claude until you pick). The choice applies the next
 #              time swamp builds that worktree's tab.
 default = "claude"
+
+# [logging]
+# Diagnostic logging for debugging swamp itself — e.g. "why was a tab added?"
+# or "what did that git refresh do?". The daemon writes a per-repo log file
+# under $XDG_RUNTIME_DIR/swamp/<id>.log; inspect it with `swamp logs`.
+#
+#   level  — minimum severity recorded: "error", "warn", "info" (default),
+#            "debug", or "trace".
+#   filter — optional EnvFilter directive for per-target control; overrides
+#            `level` when set. Example: "swamp::zellij=debug,info".
+#
+# The RUST_LOG environment variable overrides both when set.
+# level = "info"
+# filter = "swamp::zellij=debug,info"

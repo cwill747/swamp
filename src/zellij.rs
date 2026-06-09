@@ -27,6 +27,7 @@ pub fn action(args: &[&str]) -> Result<()> {
 
 pub fn new_tab(layout: &str, cwd: &Path, name: &str) -> Result<()> {
     let cwd = cwd.to_string_lossy();
+    tracing::info!(worktree = %name, layout, cwd = %cwd, "spawning zellij worktree tab");
     action(&["new-tab", "--layout", layout, "--cwd", &cwd, "--name", name])
 }
 

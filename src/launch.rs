@@ -81,6 +81,9 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
         .unwrap_or_else(|| "swamp".into());
 
     let cfg = config::ensure_configs()?;
+    if let Ok(common) = git_common_dir(&git_dir) {
+        crate::logging::init(&common, false, false, &cfg.logging);
+    }
 
     // When launched from inside an existing zellij session, create a *nested*
     // session rather than dumping tabs into the host session. `nested` causes
@@ -175,6 +178,12 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
         .and_then(|m| m.get(name).copied());
     let harness = resolve_harness(cfg.harness, override_);
     let layout = write_worktree_layout(&cfg, harness)?;
+    tracing::debug!(
+        worktree = %name,
+        layout = %layout.display(),
+        ?harness,
+        "wrote worktree tab layout"
+    );
     let res = zellij::new_tab(&layout.to_string_lossy(), path, name);
     let _ = std::fs::remove_file(&layout);
     res
@@ -190,6 +199,13 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
 /// exist — closing the only tab would end the session — so the swap then falls
 /// back to applying on the next launch.
 pub fn relaunch_worktree_tab(name: &str, path: &Path) -> Result<()> {
+    // Runs as a detached `swamp relaunch-tab` process, so wire up logging here
+    // too (best-effort) to capture the tab close/reopen.
+    if let Ok(common) = git_common_dir(&resolve_git_dir(path)) {
+        let log_cfg = config::load_config().map(|c| c.logging).unwrap_or_default();
+        crate::logging::init(&common, false, false, &log_cfg);
+    }
+    tracing::info!(worktree = %name, "relaunching worktree tab");
     if !zellij::in_zellij() {
         return Ok(());
     }

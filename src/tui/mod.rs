@@ -31,6 +31,12 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<(
     };
     let start = resolve_git_dir(&cwd);
     let common = git_common_dir(&start).context("not inside a git repo")?;
+    // File-only logging (no stderr — it would corrupt the TUI). Best-effort:
+    // a logging-config typo is surfaced by the daemon, not by failing the TUI.
+    let log_cfg = crate::config::load_config()
+        .map(|c| c.logging)
+        .unwrap_or_default();
+    crate::logging::init(&common, false, false, &log_cfg);
     let repo_name = common
         .parent()
         .and_then(|p| p.file_name())

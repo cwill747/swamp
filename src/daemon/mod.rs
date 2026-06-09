@@ -69,12 +69,10 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // The daemon is the long-lived writer, so it truncates the per-repo log on
+    // startup to bound growth. Foreground also mirrors to stderr.
+    let log_cfg = crate::config::load_config()?.logging;
+    crate::logging::init(&common, foreground, true, &log_cfg);
 
     let state = Arc::new(RwLock::new(DaemonState::load(&common).await?));
     let (tx, _) = broadcast::channel::<ServerMsg>(64);
@@ -155,6 +153,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
+                tracing::debug!(trigger = "heartbeat", "git refresh");
                 if let Err(e) = d.refresh_all().await {
                     tracing::warn!("heartbeat refresh: {e:?}");
                 }
@@ -170,7 +169,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             tick.tick().await; // skip immediate first tick
             loop {
                 tick.tick().await;
-                tracing::debug!("running periodic git fetch");
+                tracing::info!(trigger = "periodic_fetch", "running periodic git fetch");
                 let result = tokio::process::Command::new("git")
                     .arg("-C")
                     .arg(&d.common_dir)
@@ -181,6 +180,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                     .await;
                 match result {
                     Ok(s) if s.success() => {
+                        tracing::debug!(trigger = "periodic_fetch", "fetch ok, refreshing");
                         if let Err(e) = d.refresh_all().await {
                             tracing::warn!("post-fetch refresh: {e:?}");
                         }
@@ -290,6 +290,10 @@ impl Daemon {
     /// the equivalent of the old `git wt update`, then broadcast the refreshed
     /// snapshot.
     pub async fn update_default(&self) -> Result<()> {
+        tracing::info!(
+            trigger = "update_default",
+            "fetching all remotes and fast-forwarding default branch"
+        );
         let fetch = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.common_dir)
@@ -330,6 +334,13 @@ impl Daemon {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 anyhow::bail!("fast-forward failed: {}", stderr.trim());
             }
+            let wt_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            tracing::info!(worktree = %wt_name, branch = %branch, "fast-forwarded default branch");
+        } else {
+            tracing::debug!(branch = %branch, "default branch not checked out; nothing to fast-forward");
         }
 
         self.refresh_all().await
@@ -380,6 +391,7 @@ impl Daemon {
         session_name: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<()> {
+        tracing::info!(worktree = %wt_name, status, "applied agent hook");
         let mut s = self.state.write().await;
         s.apply_hook(wt_name, status, session_name, session_id)?;
         s.persist(&self.common_dir).await?;

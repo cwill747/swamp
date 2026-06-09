@@ -360,6 +360,7 @@ mod tests {
             lazygit: PathBuf::from("/tmp/swamp/lazygit.yml"),
             dashboard: crate::config::DashboardConfig::default(),
             harness: crate::config::HarnessSetting::Claude,
+            logging: crate::config::LoggingConfig::default(),
         }
     }
 

@@ -37,9 +37,11 @@ pub async fn run(
             },
         )
         .await;
+        tracing::debug!(worktree = %wt_name, status = %status, "forwarded hook to daemon");
         return Ok(());
     }
 
+    tracing::debug!(worktree = %wt_name, status = %status, "daemon down; writing hook to status file");
     // Fallback: mutate .swamp-status.json directly.
     let path = common.join(".swamp-status.json");
     let mut map: serde_json::Map<String, serde_json::Value> = if path.exists() {

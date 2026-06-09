@@ -103,8 +103,41 @@ impl DaemonState {
         let mut new_rows = HashMap::new();
         for wt in wts {
             let info = worktree::git_info(&wt.path).unwrap_or_default();
-            let agent = self.agents.get(&wt.name()).cloned().unwrap_or_default();
-            new_rows.insert(wt.name(), build_row(&wt, &info, &agent));
+            let name = wt.name();
+            let agent = self.agents.get(&name).cloned().unwrap_or_default();
+            let row = build_row(&wt, &info, &agent);
+            tracing::trace!(
+                worktree = %name,
+                branch = %row.branch,
+                ahead = row.ahead,
+                behind = row.behind,
+                dirty = row.staged + row.unstaged + row.untracked,
+                "scanned worktree"
+            );
+            new_rows.insert(name, row);
+        }
+        // Report worktree set changes (the "why did a tab appear?" signal) at
+        // info; a no-change refresh is just debug noise.
+        let added: Vec<&str> = new_rows
+            .keys()
+            .filter(|k| !self.rows.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        let removed: Vec<&str> = self
+            .rows
+            .keys()
+            .filter(|k| !new_rows.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        if added.is_empty() && removed.is_empty() {
+            tracing::debug!(worktrees = new_rows.len(), "git state refreshed");
+        } else {
+            tracing::info!(
+                worktrees = new_rows.len(),
+                ?added,
+                ?removed,
+                "worktree set changed"
+            );
         }
         self.rows = new_rows;
         Ok(())
