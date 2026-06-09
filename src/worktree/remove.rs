@@ -45,7 +45,11 @@ pub fn remove_worktree(
         Repository::open(&wt_path)
             .ok()
             .filter(|r| !r.head_detached().unwrap_or(true))
-            .and_then(|r| r.head().ok().and_then(|h| h.shorthand().map(String::from)))
+            .and_then(|r| {
+                r.head()
+                    .ok()
+                    .and_then(|h| h.shorthand().ok().map(String::from))
+            })
     } else {
         None
     };

@@ -15,7 +15,7 @@ fn worktree_branch(path: &Path) -> String {
         && let Some(name) = repo
             .head()
             .ok()
-            .and_then(|h| h.shorthand().map(String::from))
+            .and_then(|h| h.shorthand().ok().map(String::from))
     {
         return name;
     }
@@ -41,7 +41,7 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     let repo = open_lenient(dir)?;
     let mut wts = Vec::new();
 
-    for name in repo.worktrees()?.iter().flatten() {
+    for name in repo.worktrees()?.iter().flatten().flatten() {
         let Ok(wt) = repo.find_worktree(name) else {
             continue;
         };
@@ -68,7 +68,7 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
 /// `refs/remotes/origin/HEAD`.
 pub(super) fn default_branch_name(repo: &Repository) -> Option<String> {
     let r = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
-    let target = r.symbolic_target()?;
+    let target = r.symbolic_target().ok()??;
     target
         .strip_prefix("refs/remotes/origin/")
         .map(String::from)

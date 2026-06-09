@@ -43,7 +43,10 @@ pub(super) async fn event_loop<B: ratatui::backend::Backend>(
     view: TuiView,
     cwd: PathBuf,
     pin_cwd: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
 
     // Daemon subscriber task.

@@ -15,7 +15,7 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
         "(detached)".into()
     } else {
         head.as_ref()
-            .and_then(|h| h.shorthand())
+            .and_then(|h| h.shorthand().ok())
             .unwrap_or("(detached)")
             .to_string()
     };
