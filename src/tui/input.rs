@@ -373,10 +373,10 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 /// skipped, which also makes the first post-launch snapshot a no-op.
 ///
 /// Bail unless we're inside a zellij session: `query-tab-names` has no session
-/// to query when `swamp tui` is run bare in a terminal, and
-/// [`zellij::list_tab_names`] reports that failure as an empty tab set — which
-/// would read as "every worktree is missing a tab" and spawn a doomed `new-tab`
-/// per row on every snapshot.
+/// to query when `swamp tui` is run bare in a terminal. A failed tab query must
+/// be treated as "unknown", not "empty", because an empty tab set reads as
+/// "every worktree is missing a tab" and would spawn a duplicate `new-tab` per
+/// row on every snapshot.
 pub(super) fn reconcile_tabs(app: &mut AppState) {
     if app.view != TuiView::Worktrees || app.pin_cwd || !zellij::in_zellij() {
         return;
