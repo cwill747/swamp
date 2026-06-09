@@ -161,7 +161,7 @@ fn branch_remote(repo: &Repository, branch: &str) -> Option<String> {
     let refname = format!("refs/heads/{branch}");
     repo.branch_upstream_remote(&refname)
         .ok()
-        .and_then(|buf| buf.as_str().map(String::from))
+        .and_then(|buf| buf.as_str().ok().map(String::from))
 }
 
 /// The remote that a `base` (for a brand-new branch) draws its objects from:
