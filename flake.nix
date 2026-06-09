@@ -52,6 +52,39 @@
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          swampUnwrapped = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+          });
+          completions = pkgs.runCommand "swamp-completions-${version}"
+            {
+              nativeBuildInputs = [ swampUnwrapped ];
+            }
+            ''
+              mkdir -p \
+                $out/share/swamp/completions \
+                $out/share/bash-completion/completions \
+                $out/share/fish/vendor_completions.d \
+                $out/share/zsh/site-functions
+
+              swamp completions bash > $out/share/swamp/completions/swamp.bash
+              swamp completions elvish > $out/share/swamp/completions/swamp.elv
+              swamp completions fish > $out/share/swamp/completions/swamp.fish
+              swamp completions powershell > $out/share/swamp/completions/swamp.ps1
+              swamp completions zsh > $out/share/swamp/completions/_swamp
+
+              cp $out/share/swamp/completions/swamp.bash \
+                $out/share/bash-completion/completions/swamp
+              cp $out/share/swamp/completions/swamp.fish \
+                $out/share/fish/vendor_completions.d/swamp.fish
+              cp $out/share/swamp/completions/_swamp \
+                $out/share/zsh/site-functions/_swamp
+            '';
+          withCompletions = pkg: pkg.overrideAttrs (old: {
+            postInstall = (old.postInstall or "") + ''
+              cp -r ${completions}/share $out/
+              chmod -R u+w $out/share
+            '';
+          });
 
           mkStaticLinux = crossPkgs:
             let
@@ -76,35 +109,77 @@
               };
               staticCargoArtifacts = craneLibStatic.buildDepsOnly staticArgs;
             in
-            craneLibStatic.buildPackage (staticArgs // {
+            withCompletions (craneLibStatic.buildPackage (staticArgs // {
               cargoArtifacts = staticCargoArtifacts;
-            });
+            }));
         in
         {
-          default = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-          });
+          default = withCompletions swampUnwrapped;
 
           static =
             if pkgs.stdenv.isLinux then
-              mkStaticLinux (
-                if system == "x86_64-linux"
-                then pkgs.pkgsCross.musl64
-                else pkgs.pkgsCross.aarch64-multiplatform-musl
-              )
+              mkStaticLinux
+                (
+                  if system == "x86_64-linux"
+                  then pkgs.pkgsCross.musl64
+                  else pkgs.pkgsCross.aarch64-multiplatform-musl
+                )
             else
-              craneLib.buildPackage (commonArgs // {
+              withCompletions (craneLib.buildPackage (commonArgs // {
                 inherit cargoArtifacts;
                 postFixup = ''
                   for lib in $(otool -L $out/bin/swamp | awk '/\/nix\/store.*libiconv/ {print $1}'); do
                     install_name_tool -change "$lib" /usr/lib/libiconv.2.dylib $out/bin/swamp
                   done
                 '';
-              });
+              }));
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           static-aarch64-linux =
             mkStaticLinux pkgs.pkgsCross.aarch64-multiplatform-musl;
         });
+
+      checks = forAllSystems (system: pkgs: {
+        completions = pkgs.runCommand "swamp-completions-check"
+          {
+            package = self.packages.${system}.default;
+          }
+          ''
+            set -eu
+            pkg="$package"
+
+            test -x "$pkg/bin/swamp"
+            test -s "$pkg/share/swamp/completions/swamp.bash"
+            test -s "$pkg/share/swamp/completions/swamp.elv"
+            test -s "$pkg/share/swamp/completions/swamp.fish"
+            test -s "$pkg/share/swamp/completions/swamp.ps1"
+            test -s "$pkg/share/swamp/completions/_swamp"
+
+            test -s "$pkg/share/bash-completion/completions/swamp"
+            test -s "$pkg/share/fish/vendor_completions.d/swamp.fish"
+            test -s "$pkg/share/zsh/site-functions/_swamp"
+
+            "$pkg/bin/swamp" completions bash > bash.generated
+            "$pkg/bin/swamp" completions elvish > elvish.generated
+            "$pkg/bin/swamp" completions fish > fish.generated
+            "$pkg/bin/swamp" completions powershell > powershell.generated
+            "$pkg/bin/swamp" completions zsh > zsh.generated
+
+            cmp bash.generated "$pkg/share/swamp/completions/swamp.bash"
+            cmp elvish.generated "$pkg/share/swamp/completions/swamp.elv"
+            cmp fish.generated "$pkg/share/swamp/completions/swamp.fish"
+            cmp powershell.generated "$pkg/share/swamp/completions/swamp.ps1"
+            cmp zsh.generated "$pkg/share/swamp/completions/_swamp"
+
+            cmp "$pkg/share/swamp/completions/swamp.bash" \
+              "$pkg/share/bash-completion/completions/swamp"
+            cmp "$pkg/share/swamp/completions/swamp.fish" \
+              "$pkg/share/fish/vendor_completions.d/swamp.fish"
+            cmp "$pkg/share/swamp/completions/_swamp" \
+              "$pkg/share/zsh/site-functions/_swamp"
+
+            touch $out
+          '';
+      });
 
       devShells = forAllSystems (_: pkgs: {
         default = pkgs.mkShell {
