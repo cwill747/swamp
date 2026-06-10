@@ -31,9 +31,9 @@ pub(super) enum AppEvent {
     Branches(Vec<BranchInfo>),
     /// A create/delete request failed; surface the message in the footer.
     ActionError(String),
-    /// A non-forced delete was refused because the worktree is dirty; re-open
-    /// the confirmation as a force override.
-    DeleteNeedsForce(String),
+    /// A non-forced delete was refused; re-open the confirmation as a force
+    /// override. Carries `(worktree_name, reason_description)`.
+    DeleteNeedsForce(String, String),
 }
 
 pub(super) async fn event_loop<B: ratatui::backend::Backend>(
@@ -212,12 +212,15 @@ where
                 app.input = None;
                 app.status_msg = Some(msg);
             }
-            AppEvent::DeleteNeedsForce(name) => {
-                // The snapshot looked clean but the daemon found uncommitted
-                // work; re-prompt as a force override instead of failing.
+            AppEvent::DeleteNeedsForce(name, reason) => {
+                // The daemon refused; re-prompt as a force override so the user
+                // can decide whether to proceed.
                 app.pending_delete = None;
                 app.status_msg = None;
-                app.input = Some(InputMode::ConfirmDelete { name, dirty: true });
+                app.input = Some(InputMode::ConfirmDelete {
+                    name,
+                    force_reason: Some(reason),
+                });
             }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {
@@ -306,11 +309,12 @@ where
                     KeyCode::Char('d') => {
                         if let Some(row) = app.snapshot.rows.get(app.selected) {
                             app.status_msg = None;
-                            let dirty =
-                                row.staged + row.unstaged + row.untracked > 0 || row.conflict;
+                            // For the initial prompt there is no force_reason;
+                            // if the daemon refuses, DeleteNeedsForce re-opens
+                            // it with a reason.
                             app.input = Some(InputMode::ConfirmDelete {
                                 name: row.name.clone(),
-                                dirty,
+                                force_reason: None,
                             });
                         }
                     }

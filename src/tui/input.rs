@@ -188,16 +188,19 @@ pub(super) fn handle_input_key(
         InputMode::Create(picker) => {
             app.input = Some(InputMode::Create(picker));
         }
-        InputMode::ConfirmDelete { name, dirty } => match k.code {
+        InputMode::ConfirmDelete { name, force_reason } => match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.pending_delete = Some(name.clone());
                 app.status_msg = Some(format!("Deleting {name}…"));
                 let tx = tx.clone();
                 let common = common.to_path_buf();
+                // Use force: true when the daemon already refused once and
+                // we're asking the user to confirm a force override.
+                let force = force_reason.is_some();
                 tokio::spawn(async move {
                     if let Err(e) = send_action(
                         &common,
-                        ClientMsg::RemoveWorktree { name, force: dirty },
+                        ClientMsg::RemoveWorktree { name, force },
                         tx.clone(),
                     )
                     .await

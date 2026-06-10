@@ -58,10 +58,12 @@ pub enum ServerMsg {
     Err {
         message: String,
     },
-    /// A non-forced `RemoveWorktree` was refused because the worktree has
-    /// uncommitted work. The client may retry with `force: true`.
+    /// A non-forced `RemoveWorktree` was refused. The client may retry with
+    /// `force: true`. `reason` is a short human-readable description of why
+    /// the removal was refused (e.g. "has uncommitted changes").
     ErrDirty {
         name: String,
+        reason: String,
     },
     Version {
         version: String,
@@ -157,10 +159,13 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         match daemon.remove_worktree(&name, force).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => {
-                                // Surface a dirty refusal distinctly so the TUI
+                                // Surface a refused-removal distinctly so the TUI
                                 // can offer a force override.
-                                let reply = match e.downcast_ref::<crate::worktree::DirtyWorktree>() {
-                                    Some(d) => ServerMsg::ErrDirty { name: d.name.clone() },
+                                let reply = match e.downcast_ref::<crate::worktree::RemoveRefused>() {
+                                    Some(r) => ServerMsg::ErrDirty {
+                                        name: r.name.clone(),
+                                        reason: r.reason.description().to_string(),
+                                    },
                                     None => ServerMsg::Err { message: e.to_string() },
                                 };
                                 write_msg(&mut stream, &reply).await?

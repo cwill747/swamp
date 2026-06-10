@@ -104,13 +104,13 @@ fn render_all(f: &mut Frame, app: &mut AppState) {
 fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
     // The delete confirmation takes over the footer. (The create picker is a
     // centered overlay drawn separately in `render`.)
-    if let Some(InputMode::ConfirmDelete { name, dirty }) = &app.input {
-        let line = if *dirty {
+    if let Some(InputMode::ConfirmDelete { name, force_reason }) = &app.input {
+        let line = if let Some(reason) = force_reason {
             Line::from(vec![
                 Span::styled("Worktree ", Style::default().fg(Theme::DIRTY)),
                 Span::styled(format!("'{name}'"), Style::default().fg(Theme::DIRTY)),
                 Span::styled(
-                    " has uncommitted changes — force delete?",
+                    format!(" {reason} — force delete?"),
                     Style::default().fg(Theme::DIRTY),
                 ),
                 Span::styled(" (y/n)", Theme::muted()),
