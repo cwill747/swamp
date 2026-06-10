@@ -20,7 +20,8 @@ pub use branches::{
 };
 pub use create::{create_worktree, create_worktree_from_base};
 pub use model::{
-    BranchInfo, BranchKind, DirtyWorktree, GitInfo, Worktree, worktree_name_for_branch,
+    BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, Worktree,
+    worktree_name_for_branch,
 };
 pub use remove::remove_worktree;
 pub use repo::{git_common_dir, is_bare, resolve_git_dir};

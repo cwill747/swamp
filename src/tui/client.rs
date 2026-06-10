@@ -34,8 +34,8 @@ pub(super) async fn send_action(
         Some(ServerMsg::Err { message }) => {
             let _ = tx.send(AppEvent::ActionError(message)).await;
         }
-        Some(ServerMsg::ErrDirty { name }) => {
-            let _ = tx.send(AppEvent::DeleteNeedsForce(name)).await;
+        Some(ServerMsg::ErrDirty { name, reason }) => {
+            let _ = tx.send(AppEvent::DeleteNeedsForce(name, reason)).await;
         }
         Some(other) => anyhow::bail!("unexpected action reply: {other:?}"),
         None => anyhow::bail!("daemon closed before action reply"),

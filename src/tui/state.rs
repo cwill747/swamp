@@ -12,10 +12,14 @@ use std::time::Instant;
 pub enum InputMode {
     /// The git-wt-style create picker (centered modal overlay).
     Create(CreatePicker),
-    /// Confirming deletion of the named worktree. `dirty` is true when the
-    /// worktree has uncommitted work, which turns the prompt into a force
-    /// override (deletion proceeds with `force: true`).
-    ConfirmDelete { name: String, dirty: bool },
+    /// Confirming deletion of the named worktree. When `force_reason` is
+    /// `Some`, the daemon already refused a non-forced attempt and this prompt
+    /// asks whether to retry with `force: true`; the string is the
+    /// human-readable reason (e.g. "has uncommitted changes").
+    ConfirmDelete {
+        name: String,
+        force_reason: Option<String>,
+    },
     /// Choosing the harness (Claude/Codex) for the named worktree. Applies on
     /// the next launch of that worktree's tab; only honored when the repo's
     /// harness setting is `choose`.

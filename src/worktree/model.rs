@@ -72,26 +72,58 @@ impl GitInfo {
     }
 }
 
-/// Returned by [`crate::worktree::remove_worktree`] when a non-forced removal
-/// is refused because the worktree has uncommitted work. Callers can downcast
-/// the `anyhow::Error` to this to offer a force override rather than treating
-/// it as a hard failure.
-#[derive(Debug)]
-pub struct DirtyWorktree {
-    pub name: String,
+/// The reason a non-forced [`crate::worktree::remove_worktree`] call was
+/// refused. Carried inside [`RemoveRefused`] so the TUI can show an accurate
+/// reason in the force-confirmation prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveRefusedReason {
+    /// Staged/unstaged/untracked files or an in-progress conflict.
+    Dirty,
+    /// Commits exist that have not been pushed to the upstream.
+    UnpushedCommits,
+    /// The branch has no upstream and its commits are reachable from no other
+    /// branch; deleting it would orphan them.
+    UnmergedCommits,
+    /// The worktree is locked (e.g. `git worktree lock` was called on it).
+    Locked,
+    /// Status lookup failed (corrupt index, permission error, etc.).
+    StatusUnreadable,
 }
 
-impl std::fmt::Display for DirtyWorktree {
+impl RemoveRefusedReason {
+    /// Short human-readable description used in the force-confirm prompt.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Dirty => "has uncommitted changes",
+            Self::UnpushedCommits => "has unpushed commits",
+            Self::UnmergedCommits => "has commits on no other branch",
+            Self::Locked => "is locked",
+            Self::StatusUnreadable => "has unreadable status (index error?)",
+        }
+    }
+}
+
+/// Returned by [`crate::worktree::remove_worktree`] when a non-forced removal
+/// is refused. Callers can downcast the `anyhow::Error` to this to offer a
+/// force override rather than treating it as a hard failure.
+#[derive(Debug)]
+pub struct RemoveRefused {
+    pub name: String,
+    pub reason: RemoveRefusedReason,
+}
+
+impl std::fmt::Display for RemoveRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worktree '{}' has uncommitted changes; refusing to remove",
-            self.name
+            "worktree '{}' {}; refusing to remove",
+            self.name,
+            self.reason.description(),
         )
     }
 }
 
-impl std::error::Error for DirtyWorktree {}
+impl std::error::Error for RemoveRefused {}
 
 #[cfg(test)]
 mod tests {
