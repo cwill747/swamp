@@ -1,0 +1,41 @@
+name: Update flake.lock
+
+on:
+  schedule:
+    # 04:17 UTC nightly (off the top of the hour to dodge scheduler congestion).
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Update flake.lock and open PR
+        id: update
+        uses: DeterminateSystems/update-flake-lock@main
+        with:
+          # A PAT/App token (NOT the default GITHUB_TOKEN) is required so the
+          # opened PR triggers build.yml + lint.yml. PRs created by
+          # GITHUB_TOKEN do not trigger other workflow runs, so CI would never
+          # go green and auto-merge would never fire.
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
+          pr-title: "Update flake.lock"
+          pr-labels: |
+            dependencies
+            automated
+          commit-msg: "chore: update flake.lock"
+          branch: automated/update-flake-lock
+
+      - name: Enable auto-merge
+        if: steps.update.outputs.pull-request-number
+        run: gh pr merge --squash --auto "${{ steps.update.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.FLAKE_UPDATE_TOKEN }}
