@@ -1,8 +1,7 @@
 use super::client::{request_branches, send_refresh, send_update, subscribe_loop};
 use super::ensure_daemon;
 use super::input::{
-    handle_create_key, handle_input_key, handle_mouse, open_worktree_tab_debounced,
-    request_reconcile_tabs, spawn_close_tab, spawn_go_to_tab,
+    activate_worktree_tab, handle_create_key, handle_input_key, handle_mouse, spawn_close_tab,
 };
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
@@ -11,7 +10,6 @@ use crate::daemon::resources;
 use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::kill;
 use crate::worktree::BranchInfo;
-use crate::zellij;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -26,14 +24,6 @@ pub(super) enum AppEvent {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     RefreshDone(Result<Vec<String>, String>),
-    RefreshTabsListed {
-        worktree_names: Vec<String>,
-        tabs: Result<Vec<String>, String>,
-    },
-    TabsListed {
-        full: bool,
-        tabs: Result<Vec<String>, String>,
-    },
     ZellijError(String),
     Disconnected(String),
     Connected,
@@ -128,9 +118,6 @@ where
         pending_delete: None,
         pending_create: None,
         connected: true,
-        recent_tab_opens: std::collections::HashMap::new(),
-        managed_tabs: std::collections::HashSet::from(["dashboard".to_string()]),
-        known_worktrees: None,
         input: None,
         status_msg: None,
         toast: None,
@@ -157,17 +144,19 @@ where
                 app.snapshot = s;
                 app.pin_snapshot();
                 app.reconcile_selection();
+                // When swamp itself removed a worktree, close its now-defunct
+                // tab (its panes point at a deleted directory).
                 if let Some(ref name) = app.pending_delete
                     && !app.snapshot.rows.iter().any(|r| &r.name == name)
                 {
                     spawn_close_tab(tx.clone(), name.clone());
-                    // Drop any debounce record so a same-name worktree recreated
-                    // within the cooldown still gets a fresh tab.
-                    app.recent_tab_opens.remove(name);
-                    app.managed_tabs.remove(name);
                     app.pending_delete = None;
                     app.status_msg = None;
                 }
+                // When swamp itself created a worktree, open and switch to its
+                // tab. This is the only snapshot-driven open — every other
+                // worktree tab is opened by explicit user activation, never by
+                // a snapshot (tab pinning is gone).
                 if let Some(name) = app.pending_create.clone() {
                     let created = app
                         .snapshot
@@ -176,13 +165,10 @@ where
                         .find(|r| r.name == name)
                         .map(|r| (r.path.clone(), r.name.clone()));
                     if let Some((path, name)) = created {
-                        open_worktree_tab_debounced(&mut app, &path, &name);
-                        spawn_go_to_tab(tx.clone(), name);
+                        activate_worktree_tab(tx.clone(), path, name);
                         app.pending_create = None;
                         app.status_msg = None;
                     }
-                } else {
-                    request_reconcile_tabs(tx.clone(), false);
                 }
             }
             AppEvent::Tick => {
@@ -211,45 +197,11 @@ where
                 app.pr_snapshot = pr;
             }
             AppEvent::RefreshDone(res) => {
+                // Refresh only re-reads daemon status now; it never opens or
+                // closes tabs. Open tabs are user state and are left untouched.
                 app.refreshing = false;
-                match res {
-                    Ok(wt_names) => {
-                        app.status_msg = None;
-                        let tx = tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let tabs = zellij::list_tab_names().map_err(|e| e.to_string());
-                            let _ = tx.blocking_send(AppEvent::RefreshTabsListed {
-                                worktree_names: wt_names,
-                                tabs,
-                            });
-                        });
-                    }
-                    Err(msg) => {
-                        app.status_msg = Some(msg);
-                    }
-                }
+                app.status_msg = res.err();
             }
-            AppEvent::RefreshTabsListed {
-                worktree_names,
-                tabs,
-            } => {
-                if let Ok(tabs) = tabs {
-                    for tab in &tabs {
-                        if app.managed_tabs.contains(tab)
-                            && !worktree_names.iter().any(|n| n == tab)
-                        {
-                            spawn_close_tab(tx.clone(), tab.clone());
-                            app.recent_tab_opens.remove(tab);
-                            app.managed_tabs.remove(tab);
-                        }
-                    }
-                }
-                request_reconcile_tabs(tx.clone(), true);
-            }
-            AppEvent::TabsListed { full, tabs } => match tabs {
-                Ok(tabs) => super::input::reconcile_tabs(&mut app, &tabs, full),
-                Err(e) => tracing::debug!("list zellij tabs: {e}"),
-            },
             AppEvent::ZellijError(msg) => {
                 app.status_msg = Some(msg);
             }
@@ -357,7 +309,7 @@ where
                     }
                     KeyCode::Enter => {
                         if let Some(row) = app.selected_row() {
-                            spawn_go_to_tab(tx.clone(), row.name.clone());
+                            activate_worktree_tab(tx.clone(), row.path.clone(), row.name.clone());
                         }
                     }
                     KeyCode::Char('c') => {

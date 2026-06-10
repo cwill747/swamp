@@ -2,7 +2,7 @@ use crate::config::{self, ConfigPaths, Harness, resolve_harness};
 use crate::daemon;
 use crate::daemon::socket::{ClientMsg, ServerMsg};
 use crate::util::session_name_for;
-use crate::worktree::{Worktree, git_common_dir, is_bare, list_worktrees, resolve_git_dir};
+use crate::worktree::{Worktree, git_common_dir, list_worktrees, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -72,7 +72,6 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
         None => std::env::current_dir()?,
     };
     let git_dir = resolve_git_dir(&target);
-    let bare = is_bare(&git_dir);
     let worktrees = list_worktrees(&git_dir)?;
     if worktrees.is_empty() {
         anyhow::bail!("no worktrees found under {}", target.display());
@@ -92,12 +91,11 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
     // session rather than dumping tabs into the host session. `nested` causes
     // the spawned zellij to have ZELLIJ unset so it doesn't refuse to nest.
     let nested = zellij::in_zellij();
-    spawn_new_session(&target, bare, &worktrees, &session, &cfg, nested)
+    spawn_new_session(&target, &worktrees, &session, &cfg, nested)
 }
 
 fn spawn_new_session(
     target: &Path,
-    bare: bool,
     worktrees: &[Worktree],
     session: &str,
     cfg: &ConfigPaths,
@@ -154,7 +152,7 @@ fn spawn_new_session(
         }
     }
 
-    let layout_path = write_multi_tab_layout(bare, worktrees, session, cfg, &git_dir)?;
+    let layout_path = write_multi_tab_layout(worktrees, session, cfg, &git_dir)?;
     zellij::new_session_with_layout(&layout_path, target, session, nested)
 }
 
@@ -201,18 +199,26 @@ fn acquire_launch_lock(common_dir: &Path) -> Result<std::fs::File> {
 /// `$SHELL`-aware layout rather than an externally-installed one.
 pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
     let cfg = config::ensure_configs()?;
+    let common = git_common_dir(&resolve_git_dir(path)).ok();
     // Resolve this worktree's harness: the repo setting, plus its persisted
     // override when the setting is `choose`.
-    let override_ = git_common_dir(&resolve_git_dir(path))
-        .ok()
-        .map(|c| load_harness_overrides(&c))
+    let override_ = common
+        .as_deref()
+        .map(load_harness_overrides)
         .and_then(|m| m.get(name).copied());
     let harness = resolve_harness(cfg.harness, override_);
-    let layout = write_worktree_layout(&cfg, harness)?;
+    // Resume the worktree's recorded Claude session so an on-demand tab picks
+    // the conversation back up, matching what launch used to do per worktree.
+    let resume = common
+        .as_deref()
+        .map(load_session_ids)
+        .and_then(|m| m.get(name).cloned());
+    let layout = write_worktree_layout(&cfg, harness, resume.as_deref())?;
     tracing::debug!(
         worktree = %name,
         layout = %layout.display(),
         ?harness,
+        resume = resume.is_some(),
         "wrote worktree tab layout"
     );
     zellij::new_tab(&layout.to_string_lossy(), path, name)
