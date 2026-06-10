@@ -141,16 +141,44 @@ fn apply_swamp_hooks(settings: &mut Value) -> bool {
     changed
 }
 
+/// Write `content` to `path` atomically (via a temp file in the same directory)
+/// and, if `backup_path` is Some, copy the original to that path first.
+fn atomic_write(
+    path: &std::path::Path,
+    content: &str,
+    backup_path: Option<&std::path::Path>,
+) -> Result<()> {
+    if let Some(bak) = backup_path {
+        std::fs::copy(path, bak)
+            .with_context(|| format!("backup {} -> {}", path.display(), bak.display()))?;
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(format!(".swamp-tmp-{}", std::process::id()));
+    std::fs::write(&tmp, content).with_context(|| format!("write tmp {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        // Best-effort cleanup of the temp file; ignore errors.
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}", tmp.display(), path.display())
+    })?;
+    Ok(())
+}
+
 /// Install or update swamp's Claude Code hooks in the user's `settings.json`.
 /// If the file is read-only (common under nix/home-manager), don't attempt a
 /// write: log that, and warn if the existing hooks are out of date.
 pub fn ensure_claude_hooks() -> Result<()> {
     let path = claude_settings_path();
     let original = std::fs::read_to_string(&path).ok();
-    let mut settings: Value = original
-        .as_deref()
-        .and_then(|t| serde_json::from_str(t).ok())
-        .unwrap_or_else(|| json!({}));
+
+    let mut settings: Value = match &original {
+        None => json!({}),
+        Some(text) => serde_json::from_str(text).with_context(|| {
+            format!(
+                "{} is malformed JSON; fix or remove it before running swamp",
+                path.display()
+            )
+        })?,
+    };
 
     let changed = apply_swamp_hooks(&mut settings);
     if !changed {
@@ -179,7 +207,16 @@ pub fn ensure_claude_hooks() -> Result<()> {
     }
     let mut text = serde_json::to_string_pretty(&settings)?;
     text.push('\n');
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+
+    // Back up the original when it exists and content is actually changing.
+    let backup = original.as_ref().map(|_| {
+        let mut bak = path.clone().into_os_string();
+        bak.push(".bak");
+        PathBuf::from(bak)
+    });
+
+    atomic_write(&path, &text, backup.as_deref())?;
+
     println!(
         "swamp: {} Claude hooks in {}",
         if original.is_some() {
@@ -195,6 +232,16 @@ pub fn ensure_claude_hooks() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_dir() -> PathBuf {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("swamp-claude-test-{}-{id}", std::process::id()));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
 
     #[test]
     fn apply_swamp_hooks_adds_all_events() {
@@ -312,5 +359,98 @@ mod tests {
                 .as_str()
                 .is_some_and(is_swamp_command)
         }));
+    }
+
+    // ── ensure_claude_hooks integration tests ────────────────────────────────
+
+    // Serializes tests that mutate the process-global CLAUDE_CONFIG_DIR.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_claude_dir<F: FnOnce(PathBuf)>(f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_dir();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
+        f(dir);
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn malformed_settings_returns_error_and_file_untouched() {
+        with_claude_dir(|dir| {
+            let path = dir.join("settings.json");
+            let bad = "{\"key\": \"value\",}"; // trailing comma — invalid JSON
+            fs::write(&path, bad).unwrap();
+
+            let err = ensure_claude_hooks().unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("malformed") || msg.contains("settings.json"),
+                "error should mention malformed/path, got: {msg}"
+            );
+            // File must be left completely untouched.
+            assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+        });
+    }
+
+    #[test]
+    fn fresh_file_is_created_without_backup() {
+        with_claude_dir(|dir| {
+            let path = dir.join("settings.json");
+            let bak = dir.join("settings.json.bak");
+            assert!(!path.exists());
+            ensure_claude_hooks().unwrap();
+            assert!(path.exists(), "settings.json should be created");
+            assert!(!bak.exists(), "no backup when creating fresh file");
+        });
+    }
+
+    #[test]
+    fn existing_file_gets_backup_on_modification() {
+        with_claude_dir(|dir| {
+            let path = dir.join("settings.json");
+            let bak = dir.join("settings.json.bak");
+            // Write a valid but hook-less settings file.
+            fs::write(&path, "{\"theme\": \"dark\"}\n").unwrap();
+            ensure_claude_hooks().unwrap();
+            assert!(path.exists());
+            assert!(
+                bak.exists(),
+                "backup should exist after modifying existing file"
+            );
+            // Backup should contain the original content.
+            let bak_content = fs::read_to_string(&bak).unwrap();
+            assert!(bak_content.contains("\"theme\""));
+        });
+    }
+
+    #[test]
+    fn no_backup_when_already_correct() {
+        with_claude_dir(|dir| {
+            let bak = dir.join("settings.json.bak");
+            // Run once to populate.
+            ensure_claude_hooks().unwrap();
+            // Remove any backup that was created (there was none since no prior file).
+            let _ = fs::remove_file(&bak);
+            // Run again — should be idempotent: no write, no backup.
+            ensure_claude_hooks().unwrap();
+            assert!(!bak.exists(), "no backup on a no-op second run");
+        });
+    }
+
+    #[test]
+    fn key_order_preserved_on_rewrite() {
+        with_claude_dir(|dir| {
+            let path = dir.join("settings.json");
+            // Write a settings file with keys in a deliberate non-alphabetical order.
+            fs::write(&path, "{\n  \"zzz\": 1,\n  \"aaa\": 2\n}\n").unwrap();
+            ensure_claude_hooks().unwrap();
+            let content = fs::read_to_string(&path).unwrap();
+            let zzz_pos = content.find("zzz").unwrap();
+            let aaa_pos = content.find("aaa").unwrap();
+            assert!(
+                zzz_pos < aaa_pos,
+                "preserve_order: zzz should appear before aaa in the rewritten file"
+            );
+        });
     }
 }
