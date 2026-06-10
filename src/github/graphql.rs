@@ -3,10 +3,13 @@ use super::context::get_repo_context;
 use super::types::{PrSummary, ReviewDecision};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+const BRANCHES_PER_QUERY: usize = 20;
 
 #[derive(Debug, Deserialize)]
 struct GraphqlResponse {
@@ -48,6 +51,8 @@ struct GraphqlPrNode {
 
 #[derive(Debug, Deserialize)]
 struct GraphqlReviews {
+    #[serde(rename = "totalCount")]
+    total_count: u32,
     nodes: Vec<GraphqlReviewNode>,
 }
 
@@ -79,6 +84,8 @@ struct GraphqlCheckRollup {
 
 #[derive(Debug, Deserialize)]
 struct GraphqlCheckContexts {
+    #[serde(rename = "totalCount")]
+    total_count: u32,
     nodes: Vec<GraphqlCheckNode>,
 }
 
@@ -133,27 +140,56 @@ pub(super) fn list_prs_for_branches(
     branches: &[String],
 ) -> Result<HashMap<String, PrSummary>> {
     let (owner, repo_name, hostname) = get_repo_context(repo_root)?;
+    let mut map = HashMap::new();
 
+    for chunk in branches.chunks(BRANCHES_PER_QUERY) {
+        let response = fetch_pr_chunk(repo_root, &owner, &repo_name, &hostname, chunk)?;
+        map.extend(response);
+    }
+
+    Ok(map)
+}
+
+fn fetch_pr_chunk(
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    hostname: &str,
+    branches: &[String],
+) -> Result<HashMap<String, PrSummary>> {
     let fragments: Vec<String> = branches
         .iter()
         .enumerate()
         .map(|(i, branch)| {
             let alias = branch_to_alias(i, branch);
-            build_branch_fragment(&alias, branch)
+            build_branch_fragment(&alias, &branch_var_name(i))
         })
         .collect();
 
+    let branch_vars = (0..branches.len())
+        .map(|i| format!("${}: String!", branch_var_name(i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query_vars = if branch_vars.is_empty() {
+        "$owner: String!, $name: String!".to_string()
+    } else {
+        format!("$owner: String!, $name: String!, {branch_vars}")
+    };
     let query = format!(
-        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{\n{}\n  }} }}",
+        "query({query_vars}) {{ repository(owner: $owner, name: $name) {{\n{}\n  }} }}",
         fragments.join("\n")
     );
 
+    let mut variables = Map::new();
+    variables.insert("owner".to_string(), Value::String(owner.to_string()));
+    variables.insert("name".to_string(), Value::String(repo_name.to_string()));
+    for (i, branch) in branches.iter().enumerate() {
+        variables.insert(branch_var_name(i), Value::String(branch.clone()));
+    }
+
     let body = serde_json::to_vec(&serde_json::json!({
         "query": query,
-        "variables": {
-            "owner": owner,
-            "name": repo_name,
-        }
+        "variables": variables,
     }))
     .context("JSON serialize")?;
 
@@ -214,8 +250,20 @@ pub(super) fn list_prs_for_branches(
                         .collect()
                 })
                 .unwrap_or_default();
+            let checks_partial = node
+                .commits
+                .nodes
+                .first()
+                .and_then(|c| c.commit.status_check_rollup.as_ref())
+                .is_some_and(|rollup| {
+                    rollup.contexts.total_count as usize > rollup.contexts.nodes.len()
+                });
 
-            let (checks, check_meta) = aggregate_checks(&check_items);
+            let (checks, check_meta) = aggregate_checks(&check_items, checks_partial);
+            let reviews_partial = node
+                .latest_reviews
+                .as_ref()
+                .is_some_and(|reviews| reviews.total_count as usize > reviews.nodes.len());
             let review = compute_review(
                 node.review_decision.as_deref(),
                 node.latest_reviews.as_ref(),
@@ -231,6 +279,7 @@ pub(super) fn list_prs_for_branches(
                     check_meta,
                     url: Some(node.url),
                     review,
+                    reviews_partial,
                 },
             );
         }
@@ -247,15 +296,18 @@ fn branch_to_alias(index: usize, branch: &str) -> String {
     format!("br{}_{}", index, sanitized)
 }
 
-fn build_branch_fragment(alias: &str, branch: &str) -> String {
-    let escaped = branch.replace('\\', "\\\\").replace('"', "\\\"");
+fn branch_var_name(index: usize) -> String {
+    format!("branch{index}")
+}
+
+fn build_branch_fragment(alias: &str, branch_var: &str) -> String {
     format!(
-        r#"    {alias}: pullRequests(headRefName: "{escaped}", first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
+        r#"    {alias}: pullRequests(headRefName: ${branch_var}, first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
         number title state isDraft headRefName url reviewDecision
-        latestReviews(first: 10) {{ nodes {{ state }} }}
+        latestReviews(first: 10) {{ totalCount nodes {{ state }} }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{
-          nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt }} ... on StatusContext {{ context state createdAt }} }}
+          totalCount nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt }} ... on StatusContext {{ context state createdAt }} }}
         }} }} }} }} }}
       }}
     }}"#
@@ -321,5 +373,14 @@ mod tests {
         let a1 = branch_to_alias(0, "a-b");
         let a2 = branch_to_alias(1, "a_b");
         assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn branch_fragment_uses_variable_and_total_counts() {
+        let fragment = build_branch_fragment("br0_feature", "branch0");
+        assert!(fragment.contains("headRefName: $branch0"));
+        assert!(fragment.contains("latestReviews(first: 10) { totalCount"));
+        assert!(fragment.contains("contexts(first: 100) {\n          totalCount"));
+        assert!(!fragment.contains("headRefName: \""));
     }
 }

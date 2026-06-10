@@ -6,6 +6,7 @@ use crate::worktree::BranchInfo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -84,7 +85,7 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
     // them just races their close and trips a spurious BrokenPipe on the next
     // 1Hz resource tick. Gate the broadcast arm on having subscribed; we still
     // drain `rx` so this receiver doesn't pin the channel's ring buffer.
-    let mut subscribed = false;
+    let mut subscription: Option<PrSubscription> = None;
     loop {
         tokio::select! {
             res = read_msg(&mut stream) => {
@@ -92,7 +93,9 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                 match msg {
                     ClientMsg::Ping => write_msg(&mut stream, &ServerMsg::Pong).await?,
                     ClientMsg::Subscribe => {
-                        subscribed = true;
+                        if subscription.is_none() {
+                            subscription = Some(PrSubscription::new(daemon.clone()));
+                        }
                         let snap = daemon.state.read().await.snapshot();
                         write_msg(&mut stream, &ServerMsg::Snapshot(snap)).await?;
                         let res = daemon.resources.read().await.clone();
@@ -178,12 +181,29 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                 // Err means lagged or closed; keep going. Only forward to
                 // clients that asked for the stream — see `subscribed` above.
                 if let Ok(m) = ev
-                    && subscribed
+                    && subscription.is_some()
                 {
                     write_msg(&mut stream, &m).await?;
                 }
             }
         }
+    }
+}
+
+struct PrSubscription {
+    daemon: Arc<Daemon>,
+}
+
+impl PrSubscription {
+    fn new(daemon: Arc<Daemon>) -> Self {
+        daemon.pr_subscribers.fetch_add(1, Ordering::Relaxed);
+        Self { daemon }
+    }
+}
+
+impl Drop for PrSubscription {
+    fn drop(&mut self) {
+        self.daemon.pr_subscribers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

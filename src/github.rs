@@ -33,9 +33,24 @@ pub fn list_prs_for_branches(
 
     match graphql::list_prs_for_branches(repo_root, branches) {
         Ok(map) => Ok(map),
+        Err(e) if is_preflight_error(&e) => Err(e),
         Err(e) => {
             debug!("github:graphql batch failed, falling back to per-branch GraphQL: {e}");
             rest::list_prs_for_branches(repo_root, branches)
         }
     }
+}
+
+fn is_preflight_error(error: &anyhow::Error) -> bool {
+    let msg = error.to_string().to_lowercase();
+    msg.contains("failed to spawn gh")
+        || msg.contains("failed to run gh")
+        || msg.contains("gh repo view failed")
+        || msg.contains("gh api graphql failed")
+            && (msg.contains("authentication")
+                || msg.contains("authenticate")
+                || msg.contains("not logged")
+                || msg.contains("login")
+                || msg.contains("unauthorized")
+                || msg.contains("forbidden"))
 }

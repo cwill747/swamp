@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Debug, Deserialize)]
 struct RepositoryOwner {
@@ -15,7 +16,13 @@ struct RepoContext {
     url: String,
 }
 
+static REPO_CONTEXT: OnceLock<(String, String, String)> = OnceLock::new();
+
 pub(super) fn get_repo_context(repo_root: &Path) -> Result<(String, String, String)> {
+    if let Some(ctx) = REPO_CONTEXT.get() {
+        return Ok(ctx.clone());
+    }
+
     let output = Command::new("gh")
         .current_dir(repo_root)
         .args(["repo", "view", "--json", "owner,name,url"])
@@ -38,5 +45,7 @@ pub(super) fn get_repo_context(repo_root: &Path) -> Result<(String, String, Stri
         .unwrap_or("github.com")
         .to_string();
 
-    Ok((ctx.owner.login, ctx.name, hostname))
+    let repo_context = (ctx.owner.login, ctx.name, hostname);
+    let _ = REPO_CONTEXT.set(repo_context.clone());
+    Ok(repo_context)
 }

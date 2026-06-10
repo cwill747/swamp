@@ -540,6 +540,7 @@ mod tests {
             check_meta: None,
             url: None,
             review: None,
+            reviews_partial: false,
         }
     }
 
