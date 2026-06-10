@@ -174,9 +174,10 @@ fn spawn_new_session(
 /// The originating tab's host session and stable id are captured *before*
 /// switching — afterwards the host's "current tab" is ambiguous. Closing is
 /// skipped when the host has a single tab (closing it would tear the host session
-/// down); the user then drops back to the shell they launched from. The close is
-/// best-effort: a failure never fails the launch, since the switch already
-/// succeeded.
+/// down), or when the host *is* the target session (launched from within it, so
+/// the originating tab is a live tab the user wants to keep); the user then drops
+/// back to the shell they launched from. The close is best-effort: a failure
+/// never fails the launch, since the switch already succeeded.
 fn nested_handover(session: &str, layout: Option<&Path>) -> Result<()> {
     let host = std::env::var("ZELLIJ_SESSION_NAME").ok();
     let origin_tab = match zellij::current_tab_id() {
@@ -192,7 +193,14 @@ fn nested_handover(session: &str, layout: Option<&Path>) -> Result<()> {
 
     zellij::switch_session(session, layout)?;
 
-    if host_has_multiple_tabs && let (Some(host), Some(id)) = (host, origin_tab) {
+    // Skip cleanup when launched from inside the target session itself: `host`
+    // equals `session`, the switch is a no-op, and closing the originating tab
+    // would tear down the user's current dashboard/worktree tab rather than a
+    // stale tab in a different host session.
+    if host_has_multiple_tabs
+        && let (Some(host), Some(id)) = (host, origin_tab)
+        && host != session
+    {
         zellij::close_tab_by_id_in_session(&host, id);
     }
     Ok(())
