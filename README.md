@@ -36,6 +36,12 @@ nix build path:.
 ./result/bin/swamp --help
 ```
 
+For a faster unoptimized local build:
+
+```bash
+nix build path:.#dev
+```
+
 For an optimized build matching release profile settings:
 
 ```bash

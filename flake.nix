@@ -56,15 +56,14 @@
             inherit cargoArtifacts;
           });
 
-          # Unoptimized local/default build. The shipped binary uses the heavy
+          # Unoptimized local/PR build. The shipped binary uses the heavy
           # [profile.release] (opt-level=z + lto + codegen-units=1), which is
           # slow to compile because it applies to every dependency. This output
           # uses cargo's `dev` profile (opt-level 0, no LTO, parallel codegen)
-          # for fast iteration: `nix build path:.`. Deps get their own
+          # for fast iteration: `nix build path:.#dev`. Deps get their own
           # dev-profile artifacts so they aren't rebuilt against the release set.
           devArgs = commonArgs // {
             CARGO_PROFILE = "dev";
-            doCheck = false;
           };
           swampDev = craneLib.buildPackage (devArgs // {
             cargoArtifacts = craneLib.buildDepsOnly devArgs;
@@ -128,10 +127,10 @@
             }));
         in
         {
-          # Fast, unoptimized build for local iteration and PR validation.
-          default = swampDev;
+          # Installable default with optimized binary and shell completions.
+          default = withCompletions swampUnwrapped;
 
-          # Backward-compatible alias for the fast local build.
+          # Fast, unoptimized build for local iteration and PR validation.
           dev = swampDev;
 
           # Optimized build used by main-branch CI, cache population, and releases.
