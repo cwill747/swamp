@@ -13,15 +13,17 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
     // Watch the common dir itself for direct files like HEAD, packed-refs, and
     // .swamp-status.json, but avoid recursively subscribing to objects/ and logs/.
     watcher.watch(&daemon.common_dir, RecursiveMode::NonRecursive)?;
-    watch_if_exists(
+    let mut refs_watched = ensure_watch_if_exists(
         &mut watcher,
         &daemon.common_dir.join("refs"),
         RecursiveMode::Recursive,
+        false,
     )?;
-    watch_if_exists(
+    let mut worktrees_watched = ensure_watch_if_exists(
         &mut watcher,
         &daemon.common_dir.join("worktrees"),
         RecursiveMode::Recursive,
+        false,
     )?;
 
     // Debounce: collect bursts, then refresh once.
@@ -40,19 +42,35 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
             }
         }
         tracing::debug!(trigger = "watcher", "filesystem change; git refresh");
+        refs_watched = ensure_watch_if_exists(
+            &mut watcher,
+            &daemon.common_dir.join("refs"),
+            RecursiveMode::Recursive,
+            refs_watched,
+        )?;
+        worktrees_watched = ensure_watch_if_exists(
+            &mut watcher,
+            &daemon.common_dir.join("worktrees"),
+            RecursiveMode::Recursive,
+            worktrees_watched,
+        )?;
         if let Err(e) = daemon.refresh_all().await {
             tracing::warn!("watcher refresh: {e:?}");
         }
     }
 }
 
-fn watch_if_exists(
+fn ensure_watch_if_exists(
     watcher: &mut notify::RecommendedWatcher,
     path: &Path,
     mode: RecursiveMode,
-) -> notify::Result<()> {
-    if path.exists() {
+    watched: bool,
+) -> notify::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !watched {
         watcher.watch(path, mode)?;
     }
-    Ok(())
+    Ok(true)
 }
