@@ -16,6 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Per-repository log file path, alongside the daemon's socket/PID files.
 /// Returns `None` when no safe runtime directory can be determined (no HOME/XDG
 /// vars set); callers treat a missing log path as best-effort.
@@ -61,6 +63,9 @@ fn env_filter(cfg: &LoggingConfig) -> tracing_subscriber::EnvFilter {
 /// (daemon startup, to bound growth); otherwise the file is opened for append.
 fn open_log_file(common_dir: &Path, fresh: bool) -> Option<std::fs::File> {
     let path = log_path(common_dir)?;
+    if !fresh {
+        rotate_if_oversize(&path, MAX_LOG_BYTES);
+    }
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -68,6 +73,18 @@ fn open_log_file(common_dir: &Path, fresh: bool) -> Option<std::fs::File> {
         .append(!fresh)
         .open(&path)
         .ok()
+}
+
+fn rotate_if_oversize(path: &Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let rotated = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&rotated);
+    let _ = std::fs::rename(path, rotated);
 }
 
 /// Install the tracing subscriber for the current process: always a file layer

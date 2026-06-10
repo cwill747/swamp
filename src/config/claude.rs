@@ -27,15 +27,10 @@ fn claude_settings_path() -> PathBuf {
     base.join("settings.json")
 }
 
-/// The recommended swamp hook command: parses Claude's JSON stdin for the
-/// session name/id and forwards them to `swamp hook <status>`.
+/// The recommended swamp hook command forwards Claude events to `swamp hook`
+/// without requiring external JSON tools to be installed.
 fn swamp_hook_command(status: &str) -> String {
-    format!(
-        "input=$(cat); swamp hook {status} \
-         --session-name \"$(echo \"$input\" | jq -r '.session_name // empty')\" \
-         --session-id \"$(echo \"$input\" | jq -r '.session_id // empty')\" \
-         >/dev/null 2>&1 || true"
-    )
+    format!("swamp hook {status} >/dev/null 2>&1 || true")
 }
 
 /// A command string belongs to swamp if it invokes `swamp hook`.

@@ -111,6 +111,14 @@ pub fn list_sessions() -> Result<Vec<String>> {
         .arg("--no-formatting")
         .output()
         .context("zellij list-sessions")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "zellij list-sessions exited {:?}: {}",
+            out.status.code(),
+            stderr.trim()
+        );
+    }
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
