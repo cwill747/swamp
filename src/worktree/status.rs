@@ -5,6 +5,21 @@ use std::path::Path;
 
 /// Collect git status for a single worktree at `dir`.
 pub fn git_info(dir: &Path) -> Result<GitInfo> {
+    git_info_with_status_mode(dir, StatusMode::Tolerant)
+}
+
+/// Collect git status for a single worktree, returning an error if working-tree
+/// status cannot be read.
+pub(super) fn git_info_strict(dir: &Path) -> Result<GitInfo> {
+    git_info_with_status_mode(dir, StatusMode::Strict)
+}
+
+enum StatusMode {
+    Tolerant,
+    Strict,
+}
+
+fn git_info_with_status_mode(dir: &Path, status_mode: StatusMode) -> Result<GitInfo> {
     let repo = Repository::open(dir)?;
     let mut info = GitInfo::default();
 
@@ -48,7 +63,15 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
     opts.include_untracked(true)
         .recurse_untracked_dirs(false)
         .include_ignored(false);
-    if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
+    let statuses = match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => Some(statuses),
+        Err(err) if matches!(status_mode, StatusMode::Tolerant) => {
+            let _ = err;
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if let Some(statuses) = statuses {
         for entry in statuses.iter() {
             let s = entry.status();
             if s.intersects(

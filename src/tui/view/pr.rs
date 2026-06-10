@@ -149,7 +149,7 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
 /// Render a single-line dim error/staleness notice.
 fn render_error_line(f: &mut Frame, area: Rect, err: &str, fetched_at: Option<u64>) {
     // Truncate the error message so it fits on one line.
-    let short_err = if err.len() > 40 { &err[..40] } else { err };
+    let short_err = truncate(err, 40);
 
     let text = if let Some(ts) = fetched_at {
         let age_secs = std::time::SystemTime::now()
