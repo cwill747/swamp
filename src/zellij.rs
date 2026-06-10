@@ -66,23 +66,13 @@ fn parse_tab_names(stdout: &str) -> Vec<String> {
 }
 
 /// Launch a brand-new zellij session attached to `layout`, with `cwd` and `session`.
-/// When `nested` is true (we're already inside a zellij session), `ZELLIJ` is
-/// stripped from the child's environment so zellij allows the nested session.
-pub fn new_session_with_layout(
-    layout: &Path,
-    _cwd: &Path,
-    session: &str,
-    nested: bool,
-) -> Result<()> {
+/// Only used when *not* already inside a zellij session; the nested case switches
+/// the live client over instead (see [`switch_session`]).
+pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str) -> Result<()> {
     let layout = layout.to_string_lossy();
-    tracing::info!(session, %layout, nested, "launching zellij session from multi-tab layout");
-    let mut cmd = Command::new("zellij");
-    cmd.args(["--new-session-with-layout", &layout, "--session", session]);
-    if nested {
-        cmd.env_remove("ZELLIJ");
-        cmd.env_remove("ZELLIJ_SESSION_NAME");
-    }
-    let status = cmd
+    tracing::info!(session, %layout, "launching zellij session from multi-tab layout");
+    let status = Command::new("zellij")
+        .args(["--new-session-with-layout", &layout, "--session", session])
         .status()
         .context("spawn zellij --new-session-with-layout")?;
     if !status.success() {
@@ -125,11 +115,76 @@ pub fn list_sessions() -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn attach(session: &str, nested: bool) -> Result<()> {
+/// Switch the *calling* client to `session`. When `layout` is `Some`, the session
+/// is created from that layout if it doesn't already exist; the same call then
+/// moves the client into it. This is the nested-launch counterpart to `attach` /
+/// `new_session_with_layout`: instead of spawning a session the host client never
+/// joins, it hands the live client over to the repo session.
+pub fn switch_session(session: &str, layout: Option<&Path>) -> Result<()> {
+    let mut args = vec!["switch-session".to_string(), session.to_string()];
+    if let Some(layout) = layout {
+        args.push("--layout".to_string());
+        args.push(layout.to_string_lossy().into_owned());
+    }
+    tracing::info!(session, layout = ?layout, "switching zellij client to session");
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    action(&refs)
+}
+
+/// Stable id of the currently active tab, parsed from `zellij action
+/// current-tab-info`. The default output is `name: <n>`/`id: <n>`/`position: <n>`
+/// lines; we want the `id:` value, which is the stable tab id accepted by
+/// `close-tab-by-id`.
+pub fn current_tab_id() -> Result<u32> {
+    let out = Command::new("zellij")
+        .args(["action", "current-tab-info"])
+        .output()
+        .context("zellij action current-tab-info")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "zellij action current-tab-info exited {:?}: {}",
+            out.status.code(),
+            stderr.trim()
+        );
+    }
+    parse_tab_id(&String::from_utf8_lossy(&out.stdout))
+        .context("parse tab id from current-tab-info")
+}
+
+fn parse_tab_id(stdout: &str) -> Result<u32> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("id:"))
+        .map(str::trim)
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("no parseable `id:` line in current-tab-info output"))
+}
+
+/// Best-effort close of tab `id` in a *named* session, targeting it explicitly so
+/// it works even when the calling process's client has already switched away.
+/// Failures are logged, never fatal — the originating-tab cleanup is cosmetic.
+pub fn close_tab_by_id_in_session(host: &str, id: u32) {
+    let id = id.to_string();
+    let status = Command::new("zellij")
+        .args(["--session", host, "action", "close-tab-by-id", &id])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::warn!(host, id, "zellij close-tab-by-id exited {:?}", s.code()),
+        Err(e) => tracing::warn!(host, id, "spawn zellij close-tab-by-id failed: {e}"),
+    }
+}
+
+/// Attach to an existing session, replacing this process via `exec`. Only used
+/// when *not* already inside a zellij session; the nested case switches the live
+/// client over instead (see [`switch_session`]).
+pub fn attach(session: &str) -> Result<()> {
     let err = exec::execvp(
         "zellij",
         &["zellij", "attach", "--force-run-commands", session],
-        nested,
     );
     Err(anyhow::anyhow!("exec zellij attach failed: {:?}", err))
 }
@@ -138,13 +193,9 @@ pub fn attach(session: &str, nested: bool) -> Result<()> {
 mod exec {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    pub fn execvp(cmd: &str, args: &[&str], nested: bool) -> std::io::Error {
+    pub fn execvp(cmd: &str, args: &[&str]) -> std::io::Error {
         let mut c = Command::new(cmd);
         c.args(&args[1..]);
-        if nested {
-            c.env_remove("ZELLIJ");
-            c.env_remove("ZELLIJ_SESSION_NAME");
-        }
         c.exec()
     }
 }
@@ -159,5 +210,18 @@ mod tests {
             parse_tab_names("dashboard\n main \n\nfeature\r\n"),
             vec!["dashboard", "main", "feature"]
         );
+    }
+
+    #[test]
+    fn parse_tab_id_reads_stable_id_line() {
+        // Default `current-tab-info` output: name/id/position lines. `id:` is the
+        // stable id, distinct from `position:`.
+        let out = "name: nested\nid: 3\nposition: 1\n";
+        assert_eq!(parse_tab_id(out).unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_tab_id_missing_id_is_error() {
+        assert!(parse_tab_id("name: nested\nposition: 1\n").is_err());
     }
 }
