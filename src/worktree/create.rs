@@ -2,7 +2,6 @@ use crate::worktree::branches::default_branch_name;
 use crate::worktree::model::{Worktree, worktree_name_for_branch};
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository, WorktreeAddOptions};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Resolve the directory that holds all worktrees for `repo`.
@@ -125,9 +124,9 @@ pub fn create_worktree_from_base(
 }
 
 /// Materialize the worktree directory for `branch` pointed at `reference`. The
-/// worktree dir is a sibling of `.bare` named after the branch (git-wt layout);
-/// since git can't name a worktree with slashes, the registry name uses the
-/// branch basename.
+/// worktree dir is a flat sibling of `.bare` named after the sanitized branch
+/// (slashes replaced with dashes), so directory basename == registry name ==
+/// hook key (`cwd.file_name()`).
 fn add_worktree(
     repo: &Repository,
     branch: &str,
@@ -136,15 +135,22 @@ fn add_worktree(
 ) -> Result<Worktree> {
     let root = workon_root(repo)?;
     let wt_name = worktree_name_for_branch(branch);
-    let wt_path = root.join(branch);
-    if let Some(parent) = wt_path.parent() {
-        fs::create_dir_all(parent)?;
+    // Check for an existing worktree with this name before libgit2 returns an
+    // opaque error.
+    if repo.find_worktree(&wt_name).is_ok() {
+        anyhow::bail!(
+            "worktree name '{}' already exists (branch {})",
+            wt_name,
+            branch
+        );
     }
+    // Flat path: directory basename == registry name.
+    let wt_path = root.join(&wt_name);
 
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(reference));
     let wt = repo
-        .worktree(wt_name, &wt_path, Some(&opts))
+        .worktree(&wt_name, &wt_path, Some(&opts))
         .with_context(|| format!("create worktree {wt_name} at {}", wt_path.display()))?;
 
     let path = wt.path().to_path_buf();
@@ -262,6 +268,100 @@ mod tests {
         // And the local branch exists in the repo.
         let branches = list_branches(&bare).unwrap();
         assert!(branches.iter().any(|b| b.name == "feature/new"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two branches with the same basename but different prefixes must both
+    /// create worktrees successfully side by side (flat-path scheme prevents
+    /// the old collision).
+    #[test]
+    fn create_two_branches_same_basename_succeeds() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        let wt_a = create_worktree_from_base(&bare, "alice/fix", "main").unwrap();
+        let wt_b = create_worktree_from_base(&bare, "bob/fix", "main").unwrap();
+
+        assert_eq!(wt_a.branch, "alice/fix");
+        assert_eq!(wt_b.branch, "bob/fix");
+
+        // Directory basenames are unique sanitized names, not both "fix".
+        let name_a = wt_a
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let name_b = wt_b
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name_a, "alice-fix");
+        assert_eq!(name_b, "bob-fix");
+        assert_ne!(name_a, name_b, "worktree dirs must differ");
+
+        assert!(wt_a.path.is_dir());
+        assert!(wt_b.path.is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Attempting to create a worktree whose sanitized name already exists must
+    /// return a clear error, not an opaque libgit2 one.
+    #[test]
+    fn create_duplicate_sanitized_name_gives_clear_error() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        // Create alice/fix → worktree name "alice-fix".
+        create_worktree_from_base(&bare, "alice/fix", "main").unwrap();
+
+        // A second branch whose sanitized name would be "alice-fix" must fail
+        // with our clear error, not a libgit2 one.
+        // We fake a collision by trying to create the exact same branch name again.
+        // (In practice the collision comes from two different branch names that
+        // share a sanitized form; here we exercise the detection path directly.)
+        let err = create_worktree(&bare, "alice/fix").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists"),
+            "expected clear 'already exists' error, got: {msg}"
+        );
+        assert!(
+            msg.contains("alice-fix"),
+            "error should name the conflicting worktree: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Slashed branch names produce a flat worktree directory (basename ==
+    /// sanitized name), so `cwd.file_name()` in hook.rs returns the right key.
+    #[test]
+    fn slashed_branch_flat_path_basename_matches_registry_name() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        let wt = create_worktree_from_base(&bare, "feature/login", "main").unwrap();
+        let dir_basename = wt.path.file_name().unwrap().to_string_lossy().into_owned();
+        let registry_name = crate::worktree::worktree_name_for_branch("feature/login");
+
+        assert_eq!(
+            dir_basename, registry_name,
+            "directory basename must equal registry/hook key"
+        );
+        assert_eq!(dir_basename, "feature-login");
+        // Path must be flat (one level under root, not nested).
+        assert_eq!(wt.path.parent().unwrap(), root.as_path());
 
         let _ = std::fs::remove_dir_all(&root);
     }

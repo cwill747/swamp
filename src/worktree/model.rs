@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Worktree {
@@ -41,13 +41,16 @@ pub struct BranchInfo {
     pub is_default: bool,
 }
 
-/// Registry/tab name used for a branch's worktree. Git worktree names cannot
-/// contain slashes, so git-wt-style branch paths use the branch basename.
-pub fn worktree_name_for_branch(branch: &str) -> &str {
-    Path::new(branch)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(branch)
+/// Registry/tab name used for a branch's worktree.
+///
+/// Git worktree names and directory names cannot contain `/`. Rather than
+/// collapsing to just the basename (which would make `alice/fix` and
+/// `bob/fix` both become `fix`), we sanitize the full branch name by
+/// replacing every `/` with `-`. This keeps the name unique and still
+/// readable, and means the worktree directory basename == registry name ==
+/// hook key (since hooks key on `cwd.file_name()`).
+pub fn worktree_name_for_branch(branch: &str) -> String {
+    branch.replace('/', "-")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,8 +133,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worktree_name_uses_branch_basename() {
+    fn worktree_name_sanitizes_full_branch() {
         assert_eq!(worktree_name_for_branch("feature"), "feature");
-        assert_eq!(worktree_name_for_branch("users/alice/feature"), "feature");
+        // Slashes become dashes — full path is preserved, no collision.
+        assert_eq!(
+            worktree_name_for_branch("users/alice/feature"),
+            "users-alice-feature"
+        );
+        assert_eq!(worktree_name_for_branch("alice/fix"), "alice-fix");
+        assert_eq!(worktree_name_for_branch("bob/fix"), "bob-fix");
+        // No slashes → unchanged.
+        assert_eq!(worktree_name_for_branch("main"), "main");
     }
 }

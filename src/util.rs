@@ -1,6 +1,4 @@
 use anyhow::{Context, Result, bail};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -111,10 +109,39 @@ pub fn format_compact_age(d: Duration) -> String {
 }
 
 /// Stable short id for a repo path (used in socket filenames).
+///
+/// Uses FNV-1a 64-bit over the canonicalized path bytes. Canonicalization
+/// means two symlinked paths to the same repo yield the same id; FNV-1a is
+/// algorithm-stable across Rust versions (unlike `DefaultHasher`/SipHash).
+/// Falls back to the raw path when canonicalization fails (e.g. path doesn't
+/// exist yet in tests).
 pub fn repo_id(path: &Path) -> String {
-    let mut h = DefaultHasher::new();
-    path.hash(&mut h);
-    format!("{:016x}", h.finish())
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let bytes = canonical.as_os_str().as_encoded_bytes();
+    // FNV-1a 64-bit: https://www.isthe.com/chongo/tech/comp/fnv/
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let hash = bytes
+        .iter()
+        .fold(FNV_OFFSET, |h, &b| (h ^ b as u64).wrapping_mul(FNV_PRIME));
+    format!("{:016x}", hash)
+}
+
+/// Disambiguated Zellij session name for a repo.
+///
+/// Returns `{container_basename}-{first 4 hex chars of repo_id}` where
+/// `container` is the directory holding the bare repo / `.git` dir.
+/// The suffix prevents two repos with the same basename (e.g. `~/a/myproj`
+/// and `~/work/myproj`) from mapping to the same session.
+pub fn session_name_for(common_dir: &Path) -> String {
+    // container = the directory that holds the bare repo or .git dir
+    let container = common_dir.parent().unwrap_or(common_dir);
+    let basename = container
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "swamp".into());
+    let id = repo_id(common_dir);
+    format!("{}-{}", basename, &id[..4])
 }
 
 pub fn ascii_mode() -> bool {
@@ -331,6 +358,81 @@ mod tests {
         assert_eq!(
             base64_encode(b"https://github.com/cwill747/swamp/pull/52"),
             "aHR0cHM6Ly9naXRodWIuY29tL2N3aWxsNzQ3L3N3YW1wL3B1bGwvNTI="
+        );
+    }
+
+    /// repo_id must be stable: the same input always yields the same output.
+    /// This is a known-answer test that pins the FNV-1a value so a future
+    /// change to the algorithm is caught immediately rather than silently
+    /// orphaning running daemons.
+    ///
+    /// The expected value was computed over the literal bytes of
+    /// `/home/user/code/myrepo/.bare` using FNV-1a 64-bit.
+    #[test]
+    fn repo_id_stable_known_answer() {
+        // Path that does NOT exist on disk, so canonicalize falls back to the
+        // raw path — making this test portable and deterministic.
+        let path = std::path::Path::new("/home/user/code/myrepo/.bare");
+        let id = repo_id(path);
+        // 16 hex characters (64-bit hash).
+        assert_eq!(id.len(), 16, "repo_id must be 16 hex chars");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "repo_id must be hex: {id}"
+        );
+        // Known-answer: must not change across Rust versions.
+        assert_eq!(
+            id, "e21f11f192ce1f63",
+            "repo_id changed — this would orphan running daemons"
+        );
+    }
+
+    /// Two calls with the same path must return the same id.
+    #[test]
+    fn repo_id_deterministic() {
+        let path = std::path::Path::new("/tmp/some/repo/.bare");
+        assert_eq!(repo_id(path), repo_id(path));
+    }
+
+    /// Two different paths must (in practice) return different ids.
+    #[test]
+    fn repo_id_differs_for_different_paths() {
+        let a = std::path::Path::new("/home/alice/myrepo/.bare");
+        let b = std::path::Path::new("/home/bob/myrepo/.bare");
+        assert_ne!(repo_id(a), repo_id(b));
+    }
+
+    /// session_name_for must return `{basename}-{4-hex-chars}`.
+    #[test]
+    fn session_name_format() {
+        let path = std::path::Path::new("/home/user/code/myrepo/.bare");
+        let name = session_name_for(path);
+        // Format: `<container_basename>-<4 hex chars>`
+        // container is parent of common_dir = /home/user/code/myrepo
+        // basename = myrepo
+        let (prefix, suffix) = name.split_once('-').expect("session name must contain '-'");
+        assert_eq!(prefix, "myrepo");
+        assert_eq!(suffix.len(), 4, "suffix must be 4 hex chars: {suffix}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix must be hex: {suffix}"
+        );
+    }
+
+    /// Two repos with the same basename but different paths yield different
+    /// session names.
+    #[test]
+    fn session_name_disambiguates_same_basename() {
+        let a = std::path::Path::new("/home/alice/myrepo/.bare");
+        let b = std::path::Path::new("/home/bob/myrepo/.bare");
+        let na = session_name_for(a);
+        let nb = session_name_for(b);
+        // Both start with "myrepo-" but the suffix differs.
+        assert!(na.starts_with("myrepo-"), "a: {na}");
+        assert!(nb.starts_with("myrepo-"), "b: {nb}");
+        assert_ne!(
+            na, nb,
+            "same-basename repos must have different session names"
         );
     }
 }
