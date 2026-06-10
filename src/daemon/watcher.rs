@@ -1,6 +1,7 @@
 use super::Daemon;
 use anyhow::Result;
 use notify::{RecursiveMode, Watcher};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,15 +10,21 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;
-    // Watch the common dir (covers HEAD, worktrees/, index changes for the bare repo).
-    watcher.watch(&daemon.common_dir, RecursiveMode::Recursive)?;
-    // Also watch each worktree's index/HEAD.
-    {
-        let s = daemon.state.read().await;
-        for row in s.rows.values() {
-            let _ = watcher.watch(&row.path.join(".git"), RecursiveMode::NonRecursive);
-        }
-    }
+    // Watch the common dir itself for direct files like HEAD, packed-refs, and
+    // .swamp-status.json, but avoid recursively subscribing to objects/ and logs/.
+    watcher.watch(&daemon.common_dir, RecursiveMode::NonRecursive)?;
+    let mut refs_watched = ensure_watch_if_exists(
+        &mut watcher,
+        &daemon.common_dir.join("refs"),
+        RecursiveMode::Recursive,
+        false,
+    )?;
+    let mut worktrees_watched = ensure_watch_if_exists(
+        &mut watcher,
+        &daemon.common_dir.join("worktrees"),
+        RecursiveMode::Recursive,
+        false,
+    )?;
 
     // Debounce: collect bursts, then refresh once.
     loop {
@@ -35,8 +42,35 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
             }
         }
         tracing::debug!(trigger = "watcher", "filesystem change; git refresh");
+        refs_watched = ensure_watch_if_exists(
+            &mut watcher,
+            &daemon.common_dir.join("refs"),
+            RecursiveMode::Recursive,
+            refs_watched,
+        )?;
+        worktrees_watched = ensure_watch_if_exists(
+            &mut watcher,
+            &daemon.common_dir.join("worktrees"),
+            RecursiveMode::Recursive,
+            worktrees_watched,
+        )?;
         if let Err(e) = daemon.refresh_all().await {
             tracing::warn!("watcher refresh: {e:?}");
         }
     }
+}
+
+fn ensure_watch_if_exists(
+    watcher: &mut notify::RecommendedWatcher,
+    path: &Path,
+    mode: RecursiveMode,
+    watched: bool,
+) -> notify::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !watched {
+        watcher.watch(path, mode)?;
+    }
+    Ok(true)
 }
