@@ -384,6 +384,14 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
     let Ok(tabs) = zellij::list_tab_names() else {
         return;
     };
+    // A tab we previously issued has now surfaced in zellij's list — clear its
+    // open-claim. This is what ends the suppression window: instead of guessing
+    // how long zellij takes to register a tab (a flat timer that this monorepo's
+    // ~5s git-refresh cadence raced straight past), we hold the claim until we
+    // actually observe the tab, then release it. A later same-name worktree can
+    // then reopen cleanly.
+    app.recent_tab_opens
+        .retain(|name, _| !tabs.iter().any(|t| t == name));
     // Collect first: opening a tab mutates `recent_tab_opens`, which can't
     // alias the `snapshot.rows` borrow held by the loop.
     let missing: Vec<(PathBuf, String)> = app
@@ -405,29 +413,26 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
     }
 }
 
-/// Window after swamp issues a `new-tab` during which we refuse to reopen the
-/// same worktree. Covers the gap between `zellij action new-tab` returning and
-/// the tab becoming visible to `query-tab-names`, plus the burst of snapshots
-/// a single worktree creation produces.
-const TAB_OPEN_COOLDOWN: Duration = Duration::from_secs(5);
+/// Failsafe lifetime of an open-claim. A claim is normally cleared the moment
+/// [`reconcile_tabs`] sees the tab appear in `query-tab-names`; this bound only
+/// matters when an open *failed* (the tab never appears) — after it elapses we
+/// allow a retry rather than suppressing forever. It must comfortably exceed the
+/// worst-case `new-tab` → tab-registered latency, so it is intentionally far
+/// longer than any single snapshot interval.
+const TAB_OPEN_FAILSAFE: Duration = Duration::from_secs(30);
 
-/// Open a worktree tab unless we issued one for the same name within
-/// [`TAB_OPEN_COOLDOWN`]. Both the targeted `pending_create` path and
-/// [`reconcile_tabs`] route through here so the freshly-opened tab isn't
-/// reopened by the snapshots that arrive before zellij registers it.
+/// Open a worktree tab unless we already have an outstanding open-claim for the
+/// same name. Both the targeted `pending_create` path and [`reconcile_tabs`]
+/// route through here. A claim is held until [`reconcile_tabs`] observes the tab
+/// in zellij's list (the normal release) or [`TAB_OPEN_FAILSAFE`] elapses (the
+/// failed-open retry), so the freshly-opened tab is never reopened by the
+/// snapshots that arrive before zellij registers it.
 pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name: &str) {
     let now = Instant::now();
     app.recent_tab_opens
-        .retain(|_, t| now.duration_since(*t) < TAB_OPEN_COOLDOWN);
+        .retain(|_, t| now.duration_since(*t) < TAB_OPEN_FAILSAFE);
     if app.recent_tab_opens.contains_key(name) {
-        // Refresh the timestamp so the cooldown is measured from the *latest*
-        // attempt, not the first. The burst of snapshots a worktree creation
-        // produces (filesystem churn fires the watcher every few seconds) keeps
-        // pushing the window forward, so a tab that zellij hasn't yet surfaced in
-        // `query-tab-names` is never reopened mid-registration — which is how a
-        // single new worktree ended up with two tabs.
-        app.recent_tab_opens.insert(name.to_string(), now);
-        tracing::debug!(worktree = %name, "tab open suppressed (within cooldown)");
+        tracing::debug!(worktree = %name, "tab open suppressed (claim outstanding)");
         return;
     }
     app.recent_tab_opens.insert(name.to_string(), now);
