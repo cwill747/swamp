@@ -55,6 +55,20 @@
           swampUnwrapped = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          # Unoptimized local-dev build. The shipped binary uses the heavy
+          # [profile.release] (opt-level=z + lto + codegen-units=1), which is
+          # slow to compile because it applies to every dependency. This output
+          # uses cargo's `dev` profile (opt-level 0, no LTO, parallel codegen)
+          # for fast iteration: `nix build path:.#dev`. Deps get their own
+          # dev-profile artifacts so they aren't rebuilt against the release set.
+          devArgs = commonArgs // {
+            CARGO_PROFILE = "dev";
+            doCheck = false;
+          };
+          swampDev = craneLib.buildPackage (devArgs // {
+            cargoArtifacts = craneLib.buildDepsOnly devArgs;
+          });
           completions = pkgs.runCommand "swamp-completions-${version}"
             {
               nativeBuildInputs = [ swampUnwrapped ];
@@ -115,6 +129,9 @@
         in
         {
           default = withCompletions swampUnwrapped;
+
+          # Fast, unoptimized build for local iteration (no completions wrapper).
+          dev = swampDev;
 
           static =
             if pkgs.stdenv.isLinux then

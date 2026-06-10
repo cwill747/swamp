@@ -8,6 +8,17 @@ In a bare-repo worktree setup, Nix can't resolve the flake via the worktree's
 relative `.git` file. Always build with `nix build path:.` to point Nix at the
 current directory explicitly.
 
+For fast local iteration, use the `dev` output. It builds with cargo's `dev`
+profile (opt-level 0, no LTO, parallel codegen) instead of the heavy
+`[profile.release]` the shipped binary uses, so it compiles much faster:
+
+```
+nix build path:.#dev
+```
+
+To verify a release build (matches what CI/the cache ship), build the default
+output:
+
 ```
 nix build path:.
 ```
