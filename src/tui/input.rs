@@ -393,8 +393,14 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
         .filter(|row| !tabs.iter().any(|t| t == &row.name))
         .map(|row| (row.path.clone(), row.name.clone()))
         .collect();
+    if !missing.is_empty() {
+        // Log both sides so a spurious "missing" (a tab that exists but isn't
+        // yet visible to `query-tab-names`) is distinguishable from a genuinely
+        // absent tab when diagnosing duplicate-tab reports.
+        let missing_names: Vec<&str> = missing.iter().map(|(_, n)| n.as_str()).collect();
+        tracing::debug!(?tabs, missing = ?missing_names, "reconcile: worktrees without a zellij tab");
+    }
     for (path, name) in missing {
-        tracing::info!(worktree = %name, "reconcile: worktree has no zellij tab");
         open_worktree_tab_debounced(app, &path, &name);
     }
 }
@@ -414,6 +420,13 @@ pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name:
     app.recent_tab_opens
         .retain(|_, t| now.duration_since(*t) < TAB_OPEN_COOLDOWN);
     if app.recent_tab_opens.contains_key(name) {
+        // Refresh the timestamp so the cooldown is measured from the *latest*
+        // attempt, not the first. The burst of snapshots a worktree creation
+        // produces (filesystem churn fires the watcher every few seconds) keeps
+        // pushing the window forward, so a tab that zellij hasn't yet surfaced in
+        // `query-tab-names` is never reopened mid-registration — which is how a
+        // single new worktree ended up with two tabs.
+        app.recent_tab_opens.insert(name.to_string(), now);
         tracing::debug!(worktree = %name, "tab open suppressed (within cooldown)");
         return;
     }
