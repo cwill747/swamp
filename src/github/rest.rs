@@ -1,90 +1,59 @@
-use super::checks::{CheckRollupItem, aggregate_checks};
-use super::types::{PrSummary, ReviewDecision};
-use anyhow::Result;
-use serde::Deserialize;
+/// Per-branch GraphQL fallback.
+///
+/// When the batch GraphQL query fails (e.g. network glitch, field-level
+/// GraphQL error for one alias), this module re-issues the same GraphQL
+/// query but for a single branch at a time, so one bad branch does not
+/// silence the others.  It reuses `graphql::list_prs_for_branches` directly
+/// — one call per branch — and therefore goes through the *same* query
+/// fragment builder and response parser.  The bespoke `gh pr list --json`
+/// path (with its own struct definitions and schema drift) is gone.
+///
+/// Error policy:
+/// - If every branch call fails, we return `Err` so the caller can keep the
+///   previous snapshot rather than wiping it.
+/// - Individual branch failures are logged at `warn` and skipped so the
+///   returned map is as complete as possible.
+use super::graphql;
+use super::types::PrSummary;
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
-
-#[derive(Debug, Deserialize)]
-struct PrBatchItem {
-    number: u32,
-    title: String,
-    state: String,
-    #[serde(rename = "isDraft")]
-    is_draft: bool,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    url: String,
-    #[serde(rename = "reviewDecision", default)]
-    review_decision: Option<String>,
-    #[serde(rename = "statusCheckRollup", default)]
-    status_check_rollup: Vec<CheckRollupItem>,
-}
+use tracing::warn;
 
 pub(super) fn list_prs_for_branches(
     repo_root: &Path,
     branches: &[String],
 ) -> Result<HashMap<String, PrSummary>> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, PrSummary> = HashMap::new();
+    let mut error_count = 0usize;
 
     for branch in branches {
-        let output = match Command::new("gh")
-            .current_dir(repo_root)
-            .args([
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--state",
-                "all",
-                "--json",
-                "number,title,state,isDraft,headRefName,url,statusCheckRollup,reviewDecision",
-                "--limit",
-                "1",
-            ])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-
-        if !output.status.success() {
-            continue;
+        match graphql::list_prs_for_branches(repo_root, std::slice::from_ref(branch)) {
+            Ok(partial) => map.extend(partial),
+            Err(e) => {
+                warn!("github:rest per-branch fallback failed for {branch:?}: {e}");
+                error_count += 1;
+            }
         }
+    }
 
-        let prs: Vec<PrBatchItem> = match serde_json::from_slice(&output.stdout) {
-            Ok(prs) => prs,
-            Err(_) => continue,
-        };
-
-        if let Some(pr) = prs.into_iter().next() {
-            let (checks, check_meta) = aggregate_checks(&pr.status_check_rollup);
-            let review = parse_review_decision(pr.review_decision.as_deref());
-            map.insert(
-                pr.head_ref_name,
-                PrSummary {
-                    number: pr.number,
-                    title: pr.title,
-                    state: pr.state,
-                    is_draft: pr.is_draft,
-                    checks,
-                    check_meta,
-                    url: Some(pr.url),
-                    review,
-                },
-            );
-        }
+    if error_count == branches.len() && !branches.is_empty() {
+        return Err(anyhow!(
+            "all {} per-branch fallback queries failed",
+            branches.len()
+        ));
     }
 
     Ok(map)
 }
 
-fn parse_review_decision(s: Option<&str>) -> Option<ReviewDecision> {
-    match s? {
-        "APPROVED" => Some(ReviewDecision::Approved),
-        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
-        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    /// Smoke-test that the module compiles and the public surface is intact.
+    /// End-to-end integration tests require a live `gh` binary and are left to
+    /// manual / CI runs that have GitHub auth.
+    #[test]
+    fn module_exists() {
+        // If this compiles, the rewrite did not break the module boundary.
     }
 }

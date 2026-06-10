@@ -6,9 +6,11 @@ pub(super) struct CheckRollupItem {
     #[serde(alias = "state")]
     pub(super) status: Option<String>,
     pub(super) conclusion: Option<String>,
-    #[serde(default)]
+    // `context` is the key used by StatusContext items in the REST JSON schema.
+    #[serde(default, alias = "context")]
     pub(super) name: Option<String>,
-    #[serde(default)]
+    // `startedAt` is the camelCase key emitted by `gh` REST responses.
+    #[serde(default, alias = "startedAt")]
     pub(super) started_at: Option<String>,
 }
 
@@ -296,5 +298,23 @@ mod tests {
         assert_eq!(parse_github_timestamp(""), None);
         assert_eq!(parse_github_timestamp("not a date"), None);
         assert_eq!(parse_github_timestamp("2026-13-01T00:00:00Z"), None);
+    }
+
+    /// `startedAt` (camelCase) must deserialize into the `started_at` field so
+    /// that REST JSON responses produce correct timestamps.
+    #[test]
+    fn check_rollup_item_deserializes_started_at_camel_case() {
+        let json = r#"{"status":"IN_PROGRESS","startedAt":"2026-03-24T14:02:00Z"}"#;
+        let item: CheckRollupItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.started_at.as_deref(), Some("2026-03-24T14:02:00Z"));
+    }
+
+    /// `context` (REST StatusContext key) must deserialize into the `name` field.
+    #[test]
+    fn check_rollup_item_deserializes_context_as_name() {
+        let json = r#"{"state":"SUCCESS","context":"ci/my-check"}"#;
+        let item: CheckRollupItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.name.as_deref(), Some("ci/my-check"));
+        assert_eq!(item.status.as_deref(), Some("SUCCESS"));
     }
 }

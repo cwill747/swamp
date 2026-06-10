@@ -209,7 +209,16 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                         drop(s);
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
                     }
-                    Ok(Err(e)) => tracing::debug!("pr status poll: {e:?}"),
+                    Ok(Err(e)) => {
+                        tracing::debug!("pr status poll: {e:?}");
+                        // Keep the previous PR map; tell subscribers the data
+                        // is stale rather than blanking their badges.
+                        let mut s = d.state.write().await;
+                        s.record_pr_error(format!("{e:#}"));
+                        let pr_snap = s.pr_snapshot();
+                        drop(s);
+                        let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
+                    }
                     Err(e) => tracing::warn!("pr status poll join: {e:?}"),
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
