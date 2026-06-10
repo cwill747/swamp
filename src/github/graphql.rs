@@ -195,7 +195,7 @@ fn fetch_pr_chunk(
 
     let mut child = Command::new("gh")
         .current_dir(repo_root)
-        .args(["api", "graphql", "--hostname", &hostname, "--input", "-"])
+        .args(["api", "graphql", "--hostname", hostname, "--input", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

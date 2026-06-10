@@ -317,7 +317,7 @@ mod tests {
     fn aggregate_checks_marks_partial() {
         let checks = vec![check_item(Some("COMPLETED"), Some("SUCCESS"))];
         let (_state, meta) = aggregate_checks(&checks, true);
-        assert_eq!(meta.expect("partial meta").partial, true);
+        assert!(meta.expect("partial meta").partial);
     }
 
     #[test]
