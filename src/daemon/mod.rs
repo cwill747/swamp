@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
@@ -25,6 +26,7 @@ pub struct Daemon {
     pub refresh_op: Arc<Mutex<Option<SharedOpRx>>>,
     pub fetch_op: Arc<Mutex<Option<SharedOpRx>>>,
     pub tx: broadcast::Sender<ServerMsg>,
+    pub pr_subscribers: Arc<AtomicUsize>,
 }
 
 type SharedOpResult = std::result::Result<(), String>;
@@ -154,6 +156,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         refresh_op: Arc::new(Mutex::new(None)),
         fetch_op: Arc::new(Mutex::new(None)),
         tx: tx.clone(),
+        pr_subscribers: Arc::new(AtomicUsize::new(0)),
     });
 
     // Bind the control socket *before* the first state scan. The TUI waits
@@ -239,7 +242,13 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         let d = daemon.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut delay = Duration::from_secs(60);
             loop {
+                if d.pr_subscribers.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+
                 let common_dir = d.common_dir.clone();
                 let branches: Vec<String> = {
                     let s = d.state.read().await;
@@ -256,6 +265,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                         let pr_snap = s.pr_snapshot();
                         drop(s);
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
+                        delay = Duration::from_secs(60);
                     }
                     Ok(Err(e)) => {
                         tracing::debug!("pr status poll: {e:?}");
@@ -266,10 +276,11 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                         let pr_snap = s.pr_snapshot();
                         drop(s);
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
+                        delay = (delay * 2).min(Duration::from_secs(600));
                     }
                     Err(e) => tracing::warn!("pr status poll join: {e:?}"),
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(delay).await;
             }
         });
     }
@@ -682,6 +693,7 @@ mod tests {
             refresh_op: Arc::new(Mutex::new(None)),
             fetch_op: Arc::new(Mutex::new(None)),
             tx: broadcast::channel(64).0,
+            pr_subscribers: Arc::new(AtomicUsize::new(0)),
         })
     }
 

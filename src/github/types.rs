@@ -23,6 +23,8 @@ pub struct CheckMeta {
     pub duration_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,4 +42,10 @@ pub struct PrSummary {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewDecision>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reviews_partial: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

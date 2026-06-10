@@ -16,9 +16,20 @@ pub(super) struct CheckRollupItem {
 
 pub(super) fn aggregate_checks(
     checks: &[CheckRollupItem],
+    partial: bool,
 ) -> (Option<CheckState>, Option<CheckMeta>) {
     if checks.is_empty() {
-        return (None, None);
+        return if partial {
+            (
+                None,
+                Some(CheckMeta {
+                    partial: true,
+                    ..Default::default()
+                }),
+            )
+        } else {
+            (None, None)
+        };
     }
 
     let mut passed = 0u32;
@@ -84,6 +95,12 @@ pub(super) fn aggregate_checks(
                 started_at: started,
                 duration_secs: None,
                 failing_name,
+                partial,
+            })
+        } else if partial {
+            Some(CheckMeta {
+                partial,
+                ..Default::default()
             })
         } else {
             None
@@ -93,15 +110,21 @@ pub(super) fn aggregate_checks(
             (Some(start), Some(now)) => Some(now.saturating_sub(start)),
             _ => None,
         };
-        if failing_name.is_some() || duration_secs.is_some() {
+        if failing_name.is_some() || duration_secs.is_some() || partial {
             Some(CheckMeta {
                 started_at: earliest_any_start,
                 duration_secs,
                 failing_name,
+                partial,
             })
         } else {
             None
         }
+    } else if partial {
+        Some(CheckMeta {
+            partial,
+            ..Default::default()
+        })
     } else {
         None
     };
@@ -171,7 +194,7 @@ mod tests {
 
     #[test]
     fn aggregate_checks_empty() {
-        assert_eq!(aggregate_checks(&[]).0, None);
+        assert_eq!(aggregate_checks(&[], false).0, None);
     }
 
     #[test]
@@ -180,7 +203,10 @@ mod tests {
             check_item(Some("COMPLETED"), Some("SUCCESS")),
             check_item(Some("COMPLETED"), Some("SUCCESS")),
         ];
-        assert_eq!(aggregate_checks(&checks).0, Some(CheckState::Success));
+        assert_eq!(
+            aggregate_checks(&checks, false).0,
+            Some(CheckState::Success)
+        );
     }
 
     #[test]
@@ -190,7 +216,7 @@ mod tests {
             check_item(Some("COMPLETED"), Some("FAILURE")),
         ];
         assert_eq!(
-            aggregate_checks(&checks).0,
+            aggregate_checks(&checks, false).0,
             Some(CheckState::Failure {
                 passed: 1,
                 total: 2
@@ -205,7 +231,7 @@ mod tests {
             check_item(Some("IN_PROGRESS"), None),
         ];
         assert_eq!(
-            aggregate_checks(&checks).0,
+            aggregate_checks(&checks, false).0,
             Some(CheckState::Pending {
                 passed: 1,
                 total: 2
@@ -221,7 +247,7 @@ mod tests {
             check_item(Some("IN_PROGRESS"), None),
         ];
         assert_eq!(
-            aggregate_checks(&checks).0,
+            aggregate_checks(&checks, false).0,
             Some(CheckState::Failure {
                 passed: 1,
                 total: 3
@@ -235,7 +261,10 @@ mod tests {
             check_item(Some("COMPLETED"), Some("SKIPPED")),
             check_item(Some("COMPLETED"), Some("NEUTRAL")),
         ];
-        assert_eq!(aggregate_checks(&checks).0, Some(CheckState::Success));
+        assert_eq!(
+            aggregate_checks(&checks, false).0,
+            Some(CheckState::Success)
+        );
     }
 
     #[test]
@@ -246,7 +275,7 @@ mod tests {
             check_item(Some("IN_PROGRESS"), None),
         ];
         assert_eq!(
-            aggregate_checks(&checks).0,
+            aggregate_checks(&checks, false).0,
             Some(CheckState::Pending {
                 passed: 1,
                 total: 2
@@ -270,7 +299,7 @@ mod tests {
                 started_at: None,
             },
         ];
-        let (state, meta) = aggregate_checks(&checks);
+        let (state, meta) = aggregate_checks(&checks, false);
         assert_eq!(
             state,
             Some(CheckState::Failure {
@@ -282,6 +311,13 @@ mod tests {
             meta.as_ref().and_then(|m| m.failing_name.as_deref()),
             Some("lint-check")
         );
+    }
+
+    #[test]
+    fn aggregate_checks_marks_partial() {
+        let checks = vec![check_item(Some("COMPLETED"), Some("SUCCESS"))];
+        let (_state, meta) = aggregate_checks(&checks, true);
+        assert!(meta.expect("partial meta").partial);
     }
 
     #[test]
