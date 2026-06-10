@@ -11,13 +11,11 @@ pub(super) async fn request_branches(common: &std::path::Path) -> Result<Vec<Bra
     let sock = daemon::socket_path(common);
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::ListBranches).await?;
-    loop {
-        match read_server_msg(&mut stream).await? {
-            Some(ServerMsg::Branches { branches }) => return Ok(branches),
-            Some(ServerMsg::Err { message }) => anyhow::bail!(message),
-            Some(other) => anyhow::bail!("unexpected branch-list reply: {other:?}"),
-            None => anyhow::bail!("daemon closed before branch-list reply"),
-        }
+    match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Branches { branches }) => Ok(branches),
+        Some(ServerMsg::Err { message }) => anyhow::bail!(message),
+        Some(other) => anyhow::bail!("unexpected branch-list reply: {other:?}"),
+        None => anyhow::bail!("daemon closed before branch-list reply"),
     }
 }
 
@@ -54,11 +52,25 @@ pub(super) async fn send_refresh(
     write_client_msg(&mut stream, &ClientMsg::Refresh).await?;
     match read_server_msg(&mut stream).await? {
         Some(ServerMsg::RefreshDone { worktree_names }) => {
-            let _ = tx.send(AppEvent::RefreshDone(worktree_names)).await;
+            let _ = tx.send(AppEvent::RefreshDone(Ok(worktree_names))).await;
         }
-        Some(ServerMsg::Err { message }) => anyhow::bail!(message),
-        Some(other) => anyhow::bail!("unexpected refresh reply: {other:?}"),
-        None => anyhow::bail!("daemon closed before refresh reply"),
+        Some(ServerMsg::Err { message }) => {
+            let _ = tx.send(AppEvent::RefreshDone(Err(message))).await;
+        }
+        Some(other) => {
+            let _ = tx
+                .send(AppEvent::RefreshDone(Err(format!(
+                    "unexpected refresh reply: {other:?}"
+                ))))
+                .await;
+        }
+        None => {
+            let _ = tx
+                .send(AppEvent::RefreshDone(Err(
+                    "daemon closed before refresh reply".into(),
+                )))
+                .await;
+        }
     }
     Ok(())
 }
@@ -72,13 +84,11 @@ pub(super) async fn send_update(
     let sock = daemon::socket_path(common);
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::UpdateDefault).await?;
-    let done = loop {
-        match read_server_msg(&mut stream).await? {
-            Some(ServerMsg::Ok) => break Ok(()),
-            Some(ServerMsg::Err { message }) => break Err(message),
-            Some(other) => break Err(format!("unexpected update reply: {other:?}")),
-            None => break Err("daemon closed before update reply".into()),
-        }
+    let done = match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Ok) => Ok(()),
+        Some(ServerMsg::Err { message }) => Err(message),
+        Some(other) => Err(format!("unexpected update reply: {other:?}")),
+        None => Err("daemon closed before update reply".into()),
     };
     let _ = tx.send(AppEvent::UpdateDone(done)).await;
     Ok(())
