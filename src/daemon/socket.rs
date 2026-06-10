@@ -109,10 +109,14 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     }
                     ClientMsg::Refresh => {
                         tracing::info!(trigger = "tui_refresh", "client requested refresh");
-                        daemon.fetch_and_refresh().await;
-                        let snap = daemon.state.read().await.snapshot();
-                        let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
-                        write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
+                        match daemon.fetch_and_refresh().await {
+                            Ok(()) => {
+                                let snap = daemon.state.read().await.snapshot();
+                                let names: Vec<String> = snap.rows.iter().map(|r| r.name.clone()).collect();
+                                write_msg(&mut stream, &ServerMsg::RefreshDone { worktree_names: names }).await?;
+                            }
+                            Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
+                        }
                     }
                     ClientMsg::UpdateDefault => {
                         tracing::info!(trigger = "update_default", "client requested default-branch update");
@@ -122,17 +126,9 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         }
                     }
                     ClientMsg::ListBranches => {
-                        let common = daemon.common_dir.clone();
-                        let res = tokio::task::spawn_blocking(move || {
-                            crate::worktree::list_branches(&common)
-                        })
-                        .await;
-                        match res {
-                            Ok(Ok(branches)) => {
+                        match daemon.list_branches().await {
+                            Ok(branches) => {
                                 write_msg(&mut stream, &ServerMsg::Branches { branches }).await?
-                            }
-                            Ok(Err(e)) => {
-                                write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?
                             }
                             Err(e) => {
                                 write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?

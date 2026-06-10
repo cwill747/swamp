@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use self::socket::{ClientMsg, ServerMsg};
 use self::state::DaemonState;
@@ -20,8 +20,14 @@ pub struct Daemon {
     pub session_name: String,
     pub state: Arc<RwLock<DaemonState>>,
     pub resources: Arc<RwLock<resources::Snapshot>>,
+    pub repo_ops: Arc<Mutex<()>>,
+    pub refresh_op: Arc<Mutex<Option<SharedOpRx>>>,
+    pub fetch_op: Arc<Mutex<Option<SharedOpRx>>>,
     pub tx: broadcast::Sender<ServerMsg>,
 }
+
+type SharedOpResult = std::result::Result<(), String>;
+type SharedOpRx = watch::Receiver<Option<SharedOpResult>>;
 
 pub fn socket_path(common_dir: &Path) -> PathBuf {
     let id = repo_id(common_dir);
@@ -96,6 +102,9 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         session_name,
         state: state.clone(),
         resources: Arc::new(RwLock::new(resources::Snapshot::default())),
+        repo_ops: Arc::new(Mutex::new(())),
+        refresh_op: Arc::new(Mutex::new(None)),
+        fetch_op: Arc::new(Mutex::new(None)),
         tx: tx.clone(),
     });
 
@@ -170,23 +179,8 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             loop {
                 tick.tick().await;
                 tracing::info!(trigger = "periodic_fetch", "running periodic git fetch");
-                let result = tokio::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&d.common_dir)
-                    .args(["fetch", "--all", "--prune"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                match result {
-                    Ok(s) if s.success() => {
-                        tracing::debug!(trigger = "periodic_fetch", "fetch ok, refreshing");
-                        if let Err(e) = d.refresh_all().await {
-                            tracing::warn!("post-fetch refresh: {e:?}");
-                        }
-                    }
-                    Ok(s) => tracing::warn!("git fetch exited {s}"),
-                    Err(e) => tracing::warn!("git fetch failed: {e}"),
+                if let Err(e) = d.fetch_and_refresh().await {
+                    tracing::warn!("periodic fetch/refresh: {e:?}");
                 }
             }
         });
@@ -280,8 +274,52 @@ fn bind_and_kickoff(daemon: &Arc<Daemon>, common: &Path, sock: &Path) -> Result<
     Ok(listener)
 }
 
+async fn await_shared_op(mut rx: SharedOpRx) -> Result<()> {
+    loop {
+        if let Some(res) = rx.borrow().clone() {
+            return res.map_err(anyhow::Error::msg);
+        }
+        if rx.changed().await.is_err() {
+            anyhow::bail!("shared operation ended without a result");
+        }
+    }
+}
+
 impl Daemon {
     pub async fn refresh_all(&self) -> Result<()> {
+        if let Some(rx) = self.fetch_op.lock().await.as_ref().cloned() {
+            if let Err(e) = await_shared_op(rx).await {
+                self.refresh_all_exclusive().await?;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        let tx = {
+            let mut refresh = self.refresh_op.lock().await;
+            if let Some(rx) = refresh.as_ref().cloned() {
+                drop(refresh);
+                return await_shared_op(rx).await;
+            }
+            let (tx, rx) = watch::channel(None);
+            *refresh = Some(rx);
+            tx
+        };
+
+        let res = self
+            .refresh_all_exclusive()
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(Some(res.clone()));
+        *self.refresh_op.lock().await = None;
+        res.map_err(anyhow::Error::msg)
+    }
+
+    async fn refresh_all_exclusive(&self) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
+        self.refresh_all_unlocked().await
+    }
+
+    async fn refresh_all_unlocked(&self) -> Result<()> {
         let mut s = self.state.write().await;
         s.refresh_git(&self.common_dir)?;
         let snap = s.snapshot();
@@ -290,30 +328,49 @@ impl Daemon {
         Ok(())
     }
 
-    pub async fn fetch_and_refresh(&self) {
-        let result = tokio::process::Command::new("git")
+    pub async fn fetch_and_refresh(&self) -> Result<()> {
+        let tx = {
+            let mut fetch = self.fetch_op.lock().await;
+            if let Some(rx) = fetch.as_ref().cloned() {
+                drop(fetch);
+                return await_shared_op(rx).await;
+            }
+            let (tx, rx) = watch::channel(None);
+            *fetch = Some(rx);
+            tx
+        };
+
+        let res = self
+            .fetch_and_refresh_exclusive()
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(Some(res.clone()));
+        *self.fetch_op.lock().await = None;
+        res.map_err(anyhow::Error::msg)
+    }
+
+    async fn fetch_and_refresh_exclusive(&self) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
+        let status = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.common_dir)
             .args(["fetch", "--all", "--prune"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .await;
-        match result {
-            Ok(s) if s.success() => {
-                if let Err(e) = self.refresh_all().await {
-                    tracing::warn!("post-fetch refresh: {e:?}");
-                }
-            }
-            Ok(s) => tracing::warn!("git fetch exited {s}"),
-            Err(e) => tracing::warn!("git fetch failed: {e}"),
+            .await
+            .context("git fetch")?;
+        if !status.success() {
+            anyhow::bail!("git fetch exited {status}");
         }
+        self.refresh_all_unlocked().await
     }
 
     /// Fetch all remotes and fast-forward the default branch in its worktree,
     /// the equivalent of the old `git wt update`, then broadcast the refreshed
     /// snapshot.
     pub async fn update_default(&self) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
         tracing::info!(
             trigger = "update_default",
             "fetching all remotes and fast-forwarding default branch"
@@ -367,23 +424,25 @@ impl Daemon {
             tracing::debug!(branch = %branch, "default branch not checked out; nothing to fast-forward");
         }
 
-        self.refresh_all().await
+        self.refresh_all_unlocked().await
     }
 
     /// Create a worktree for `branch` (git2, off the async thread) and
     /// broadcast the refreshed snapshot.
     pub async fn create_worktree(&self, branch: &str) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let branch = branch.to_string();
         tokio::task::spawn_blocking(move || crate::worktree::create_worktree(&common, &branch))
             .await
             .context("create worktree task")??;
-        self.refresh_all().await
+        self.refresh_all_unlocked().await
     }
 
     /// Create a worktree for a new `branch` cut from `base` (git2, off the
     /// async thread) and broadcast the refreshed snapshot.
     pub async fn create_worktree_from_base(&self, branch: &str, base: &str) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let branch = branch.to_string();
         let base = base.to_string();
@@ -392,12 +451,13 @@ impl Daemon {
         })
         .await
         .context("create worktree task")??;
-        self.refresh_all().await
+        self.refresh_all_unlocked().await
     }
 
     /// Remove worktree `name` and its local branch (git2, off the async thread),
     /// then broadcast the refreshed snapshot.
     pub async fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
@@ -405,7 +465,15 @@ impl Daemon {
         })
         .await
         .context("remove worktree task")??;
-        self.refresh_all().await
+        self.refresh_all_unlocked().await
+    }
+
+    pub async fn list_branches(&self) -> Result<Vec<crate::worktree::BranchInfo>> {
+        let _repo = self.repo_ops.lock().await;
+        let common = self.common_dir.clone();
+        tokio::task::spawn_blocking(move || crate::worktree::list_branches(&common))
+            .await
+            .context("list branches task")?
     }
 
     pub async fn apply_hook(
@@ -491,6 +559,9 @@ mod tests {
             session_name: "test".into(),
             state: Arc::new(RwLock::new(DaemonState::load(common).await.unwrap())),
             resources: Arc::new(RwLock::new(resources::Snapshot::default())),
+            repo_ops: Arc::new(Mutex::new(())),
+            refresh_op: Arc::new(Mutex::new(None)),
+            fetch_op: Arc::new(Mutex::new(None)),
             tx: broadcast::channel(64).0,
         })
     }

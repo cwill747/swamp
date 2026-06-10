@@ -1,4 +1,4 @@
-use crate::daemon::socket::{ClientMsg, write_client_msg};
+use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
 use crate::daemon::{self};
 use crate::util::now_unix;
 use crate::worktree::git_common_dir;
@@ -23,22 +23,26 @@ pub async fn run(
 
     let sock = daemon::socket_path(&common);
     // Try daemon first.
-    if sock.exists()
-        && let Ok(Ok(mut s)) =
-            tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(&sock)).await
-    {
-        let _ = write_client_msg(
-            &mut s,
-            &ClientMsg::Hook {
+    if sock.exists() {
+        match forward_to_daemon(
+            &sock,
+            ClientMsg::Hook {
                 worktree: wt_name.clone(),
                 status: status.clone(),
                 session_name: session_name.clone(),
                 session_id: session_id.clone(),
             },
         )
-        .await;
-        tracing::debug!(worktree = %wt_name, status = %status, "forwarded hook to daemon");
-        return Ok(());
+        .await
+        {
+            Ok(()) => {
+                tracing::debug!(worktree = %wt_name, status = %status, "forwarded hook to daemon");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(worktree = %wt_name, status = %status, "daemon hook failed; falling back to status file: {e:?}");
+            }
+        }
     }
 
     tracing::debug!(worktree = %wt_name, status = %status, "daemon down; writing hook to status file");
@@ -89,4 +93,25 @@ pub async fn run(
     tokio::fs::write(&tmp, serde_json::to_vec_pretty(&map)?).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(())
+}
+
+async fn forward_to_daemon(sock: &std::path::Path, msg: ClientMsg) -> Result<()> {
+    let mut s = tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(sock))
+        .await
+        .context("connect to daemon timed out")?
+        .context("connect to daemon")?;
+    tokio::time::timeout(Duration::from_millis(500), write_client_msg(&mut s, &msg))
+        .await
+        .context("write hook to daemon timed out")?
+        .context("write hook to daemon")?;
+    match tokio::time::timeout(Duration::from_millis(500), read_server_msg(&mut s))
+        .await
+        .context("read hook ack timed out")?
+        .context("read hook ack")?
+    {
+        Some(ServerMsg::Ok) => Ok(()),
+        Some(ServerMsg::Err { message }) => anyhow::bail!(message),
+        Some(other) => anyhow::bail!("unexpected hook reply: {other:?}"),
+        None => anyhow::bail!("daemon closed before hook ack"),
+    }
 }

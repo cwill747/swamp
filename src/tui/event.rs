@@ -23,7 +23,7 @@ pub(super) enum AppEvent {
     Tick,
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
-    RefreshDone(Vec<String>),
+    RefreshDone(Result<Vec<String>, String>),
     /// The default-branch update finished; `Ok(())` clears the status line,
     /// `Err` carries a message to surface.
     UpdateDone(Result<(), String>),
@@ -172,17 +172,25 @@ where
             AppEvent::PrStatus(pr) => {
                 app.pr_snapshot = pr;
             }
-            AppEvent::RefreshDone(wt_names) => {
+            AppEvent::RefreshDone(res) => {
                 app.refreshing = false;
-                if let Ok(tabs) = zellij::list_tab_names() {
-                    for tab in &tabs {
-                        if tab == "dashboard" {
-                            continue;
+                match res {
+                    Ok(wt_names) => {
+                        app.status_msg = None;
+                        if let Ok(tabs) = zellij::list_tab_names() {
+                            for tab in &tabs {
+                                if tab == "dashboard" {
+                                    continue;
+                                }
+                                if !wt_names.iter().any(|n| n == tab) {
+                                    let _ = zellij::close_tab_by_name(tab);
+                                    app.recent_tab_opens.remove(tab);
+                                }
+                            }
                         }
-                        if !wt_names.iter().any(|n| n == tab) {
-                            let _ = zellij::close_tab_by_name(tab);
-                            app.recent_tab_opens.remove(tab);
-                        }
+                    }
+                    Err(msg) => {
+                        app.status_msg = Some(msg);
                     }
                 }
             }
@@ -319,7 +327,8 @@ where
                         let tx = tx.clone();
                         let common = common.to_path_buf();
                         tokio::spawn(async move {
-                            if let Err(e) = send_refresh(&common, tx).await {
+                            if let Err(e) = send_refresh(&common, tx.clone()).await {
+                                let _ = tx.send(AppEvent::RefreshDone(Err(e.to_string()))).await;
                                 tracing::warn!("refresh: {e:?}");
                             }
                         });
