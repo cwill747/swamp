@@ -1,7 +1,83 @@
+use anyhow::{Context, Result, bail};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Return a private per-user directory suitable for sockets, pid files, and
+/// logs. The directory is created with mode 0700, and a pre-existing entry is
+/// verified to be a real directory owned by the current user.
+///
+/// Resolution order (first match wins):
+/// 1. `$XDG_RUNTIME_DIR/swamp`
+/// 2. `$XDG_CACHE_HOME/swamp/run`
+/// 3. `$HOME/.cache/swamp/run`
+///
+/// The shared `/tmp` fallback is intentionally omitted: it is world-writable
+/// and therefore unsafe for sockets that accept destructive operations.
+pub fn runtime_base_dir() -> Result<PathBuf> {
+    let candidate = if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(v).join("swamp")
+    } else if let Some(v) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(v).join("swamp").join("run")
+    } else if let Some(v) = std::env::var_os("HOME") {
+        PathBuf::from(v).join(".cache").join("swamp").join("run")
+    } else {
+        bail!(
+            "cannot determine a safe runtime directory: \
+             neither XDG_RUNTIME_DIR, XDG_CACHE_HOME, nor HOME is set. \
+             Set at least one of these environment variables."
+        );
+    };
+
+    // Create with mode 0700 if absent.
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&candidate)
+        .with_context(|| format!("create runtime dir {}", candidate.display()))?;
+
+    // Verify the final path: must be a real directory owned by us.
+    let our_uid = unsafe { libc::getuid() };
+    let meta = std::fs::symlink_metadata(&candidate)
+        .with_context(|| format!("stat runtime dir {}", candidate.display()))?;
+    if meta.is_symlink() {
+        bail!(
+            "runtime directory {} is a symlink; refusing to use it",
+            candidate.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "runtime directory {} exists but is not a directory",
+            candidate.display()
+        );
+    }
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != our_uid {
+        bail!(
+            "runtime directory {} is owned by uid {} but we are uid {}; \
+             refusing to use it",
+            candidate.display(),
+            meta.uid(),
+            our_uid
+        );
+    }
+
+    // Tighten permissions to 0700 if the directory was pre-existing and
+    // somehow ended up more permissive.
+    let current_mode = meta.mode() & 0o777;
+    if current_mode != 0o700 {
+        std::fs::set_permissions(
+            &candidate,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .with_context(|| format!("tighten permissions on runtime dir {}", candidate.display()))?;
+    }
+
+    Ok(candidate)
+}
 
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -104,6 +180,144 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::base64_encode;
+    use super::*;
+
+    // Serializes tests that mutate process-global environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn runtime_base_dir_uses_xdg_runtime_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-rbd-test-xdg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+
+        let result = runtime_base_dir().unwrap();
+        assert_eq!(result, tmp.join("swamp"));
+        assert!(result.is_dir());
+
+        // Verify mode 0700.
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&result).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700, "directory must be mode 0700");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
+    fn runtime_base_dir_falls_back_to_xdg_cache_home() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-rbd-test-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("XDG_CACHE_HOME", &tmp);
+        }
+
+        let result = runtime_base_dir().unwrap();
+        assert_eq!(result, tmp.join("swamp").join("run"));
+        assert!(result.is_dir());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+    }
+
+    #[test]
+    fn runtime_base_dir_falls_back_to_home() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-rbd-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let result = runtime_base_dir().unwrap();
+        assert_eq!(result, tmp.join(".cache").join("swamp").join("run"));
+        assert!(result.is_dir());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Restore HOME to something reasonable — process can't function without it.
+        unsafe {
+            std::env::set_var("HOME", std::env::temp_dir());
+        }
+    }
+
+    #[test]
+    fn runtime_base_dir_rejects_symlink() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-rbd-test-sym-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create the real target dir and a symlink pointing to it where we
+        // expect the runtime dir.
+        let real_target = tmp.join("real");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let symlink_path = tmp.join("xdg_runtime");
+        std::os::unix::fs::symlink(&real_target, &symlink_path).unwrap();
+
+        // Point XDG_RUNTIME_DIR at a path whose child "swamp" we'll pre-create as a symlink.
+        let xdg_base = tmp.join("xdg_base");
+        std::fs::create_dir_all(&xdg_base).unwrap();
+        let swamp_sym = xdg_base.join("swamp");
+        std::os::unix::fs::symlink(&real_target, &swamp_sym).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &xdg_base);
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+
+        let err = runtime_base_dir().unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

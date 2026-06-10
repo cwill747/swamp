@@ -1638,6 +1638,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "git2",
+ "libc",
  "notify",
  "ratatui",
  "serde",

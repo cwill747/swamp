@@ -29,16 +29,14 @@ pub struct Daemon {
 type SharedOpResult = std::result::Result<(), String>;
 type SharedOpRx = watch::Receiver<Option<SharedOpResult>>;
 
-pub fn socket_path(common_dir: &Path) -> PathBuf {
+pub fn socket_path(common_dir: &Path) -> Result<PathBuf> {
     let id = repo_id(common_dir);
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("swamp").join(format!("{}.sock", id))
+    let base = crate::util::runtime_base_dir()?;
+    Ok(base.join(format!("{}.sock", id)))
 }
 
-pub fn pid_path(common_dir: &Path) -> PathBuf {
-    socket_path(common_dir).with_extension("pid")
+pub fn pid_path(common_dir: &Path) -> Result<PathBuf> {
+    Ok(socket_path(common_dir)?.with_extension("pid"))
 }
 
 pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
@@ -48,10 +46,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     };
     let start = resolve_git_dir(&start);
     let common = git_common_dir(&start).context("not inside a git repo")?;
-    let sock = socket_path(&common);
-    if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let sock = socket_path(&common)?;
     // Remove a stale socket if the previous daemon died.
     if sock.exists() {
         if probe(&sock).await.is_ok() {
@@ -267,10 +262,7 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
 /// `serve` for why that ordering matters.
 fn bind_and_kickoff(daemon: &Arc<Daemon>, common: &Path, sock: &Path) -> Result<UnixListener> {
     let listener = UnixListener::bind(sock).context("bind socket")?;
-    let pid = pid_path(common);
-    if let Some(parent) = pid.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let pid = pid_path(common)?;
     std::fs::write(pid, std::process::id().to_string())?;
     tracing::info!("swamp daemon listening on {}", sock.display());
 
@@ -616,7 +608,9 @@ mod tests {
 
         drop(listener);
         let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(pid_path(&common));
+        if let Ok(p) = pid_path(&common) {
+            let _ = std::fs::remove_file(p);
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

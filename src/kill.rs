@@ -31,8 +31,20 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
 }
 
 fn kill_daemon(common_dir: &std::path::Path) {
-    let pid_file = daemon::pid_path(common_dir);
-    let sock_file = daemon::socket_path(common_dir);
+    let pid_file = match daemon::pid_path(common_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("could not resolve pid path: {e}");
+            return;
+        }
+    };
+    let sock_file = match daemon::socket_path(common_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("could not resolve socket path: {e}");
+            return;
+        }
+    };
 
     match std::fs::read_to_string(&pid_file) {
         Ok(contents) => {

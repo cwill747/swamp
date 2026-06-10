@@ -83,7 +83,7 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<(
 
 async fn ensure_daemon(start: &std::path::Path) -> Result<()> {
     let common = git_common_dir(start)?;
-    let sock = daemon::socket_path(&common);
+    let sock = daemon::socket_path(&common)?;
     // Probe rather than trust the file: a daemon that died can leave its socket
     // behind, and a bare existence check would declare that stale file healthy
     // and spawn nothing, leaving the TUI's subscribe loop stuck on a connection

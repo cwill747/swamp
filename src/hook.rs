@@ -21,7 +21,7 @@ pub async fn run(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
 
-    let sock = daemon::socket_path(&common);
+    let sock = daemon::socket_path(&common)?;
     // Try daemon first.
     if sock.exists() {
         match forward_to_daemon(
