@@ -108,7 +108,7 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
 /// configured-default-remote `<base>` remote-tracking branch, then a generic
 /// revparse (so a tag or raw sha works too). The new branch carries no upstream
 /// - it's local-only until pushed. `common_dir` must point at the bare/common
-/// git dir.
+///   git dir.
 pub fn create_worktree_from_base(
     common_dir: &Path,
     new_branch: &str,
