@@ -111,26 +111,12 @@ impl DaemonState {
         Ok(())
     }
 
-    pub fn refresh_git(&mut self, common_dir: &Path) -> Result<()> {
-        let wts = worktree::list_worktrees(common_dir)?;
-        let mut new_rows = HashMap::new();
-        for wt in wts {
-            let info = worktree::git_info(&wt.path).unwrap_or_default();
-            let name = wt.name();
-            let agent = self.agents.get(&name).cloned().unwrap_or_default();
-            let row = build_row(&wt, &info, &agent);
-            tracing::trace!(
-                worktree = %name,
-                branch = %row.branch,
-                ahead = row.ahead,
-                behind = row.behind,
-                dirty = row.staged + row.unstaged + row.untracked,
-                "scanned worktree"
-            );
-            new_rows.insert(name, row);
-        }
-        // Report worktree set changes (the "why did a tab appear?" signal) at
-        // info; a no-change refresh is just debug noise.
+    /// Swap freshly computed rows (produced by [`scan_worktrees`]) into the
+    /// state, logging worktree-set changes at info level.  Callers that want
+    /// to run the git scan off the async runtime (see `refresh_all_unlocked`)
+    /// call `scan_worktrees` in a `spawn_blocking` block and then call this
+    /// under the write lock to do just the in-memory swap.
+    pub fn apply_scanned_rows(&mut self, new_rows: HashMap<String, WorktreeRow>) {
         let added: Vec<&str> = new_rows
             .keys()
             .filter(|k| !self.rows.contains_key(*k))
@@ -153,7 +139,6 @@ impl DaemonState {
             );
         }
         self.rows = new_rows;
-        Ok(())
     }
 
     pub fn apply_hook(
@@ -256,6 +241,38 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
         return HashMap::new();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Run the full git scan (list_worktrees + per-worktree git_info) and return
+/// the computed row map.  This function is CPU/IO-bound and is meant to be
+/// called from `tokio::task::spawn_blocking`; it must NOT be called while
+/// holding any async lock.
+///
+/// `agents` is a snapshot cloned out from `DaemonState::agents` under a read
+/// lock *before* this call; the caller swaps the result in under the write lock
+/// with [`DaemonState::apply_scanned_rows`].
+pub fn scan_worktrees(
+    common_dir: &Path,
+    agents: &HashMap<String, AgentRecord>,
+) -> Result<HashMap<String, WorktreeRow>> {
+    let wts = worktree::list_worktrees(common_dir)?;
+    let mut new_rows = HashMap::new();
+    for wt in wts {
+        let info = worktree::git_info(&wt.path).unwrap_or_default();
+        let name = wt.name();
+        let agent = agents.get(&name).cloned().unwrap_or_default();
+        let row = build_row(&wt, &info, &agent);
+        tracing::trace!(
+            worktree = %name,
+            branch = %row.branch,
+            ahead = row.ahead,
+            behind = row.behind,
+            dirty = row.staged + row.unstaged + row.untracked,
+            "scanned worktree"
+        );
+        new_rows.insert(name, row);
+    }
+    Ok(new_rows)
 }
 
 fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {

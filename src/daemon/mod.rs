@@ -6,6 +6,7 @@ pub mod watcher;
 use crate::util::repo_id;
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use anyhow::{Context, Result};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,51 @@ pub fn pid_path(common_dir: &Path) -> Result<PathBuf> {
     Ok(socket_path(common_dir)?.with_extension("pid"))
 }
 
+fn lock_path(common_dir: &Path) -> Result<PathBuf> {
+    Ok(socket_path(common_dir)?.with_extension("lock"))
+}
+
+/// Acquire an exclusive advisory lock on `<runtime>/<id>.lock`.
+///
+/// Opens (or creates) the lock file and calls `flock(2)` with `LOCK_EX`.
+/// Returns the open `File` whose lifetime keeps the lock held — drop it to
+/// release.  The lock is NOT inherited by child processes spawned after this
+/// call (close-on-exec is set automatically on Linux for files opened with
+/// `O_CLOEXEC` / the standard `File::create` path).
+fn acquire_startup_lock(common_dir: &Path) -> Result<std::fs::File> {
+    flock_exclusive(&lock_path(common_dir)?)
+}
+
+/// Open (or create) `path` and take an exclusive `flock(2)` on it, retrying
+/// briefly on contention. The returned `File` holds the lock until dropped.
+fn flock_exclusive(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open startup lock {}", path.display()))?;
+    // LOCK_EX | LOCK_NB: fail immediately if another process holds it, then
+    // retry in a short loop so we tolerate brief contention without spinning.
+    // We cap retries so a truly stuck holder doesn't park us forever.
+    let fd = file.as_raw_fd();
+    let mut waited_ms = 0u64;
+    loop {
+        // SAFETY: fd is valid for the lifetime of `file`.
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock || waited_ms >= 5_000 {
+            return Err(err).context("flock startup lock");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        waited_ms += 50;
+    }
+}
+
 pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     let start = match dir {
         Some(p) => p,
@@ -46,17 +92,12 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     };
     let start = resolve_git_dir(&start);
     let common = git_common_dir(&start).context("not inside a git repo")?;
-    let sock = socket_path(&common)?;
-    // Remove a stale socket if the previous daemon died.
-    if sock.exists() {
-        if probe(&sock).await.is_ok() {
-            anyhow::bail!("swamp serve already running for {}", common.display());
-        }
-        let _ = std::fs::remove_file(&sock);
-    }
 
     if !foreground {
-        // crude double-fork via spawning ourselves.
+        // The non-foreground parent only spawns a --foreground child and exits.
+        // It does NOT hold the startup lock — doing so would deadlock the child
+        // (on Linux, flock locks are per open-file-description, not per-fd, but
+        // the child is a separate process and would still block on LOCK_EX).
         let me = std::env::current_exe()?;
         std::process::Command::new(me)
             .arg("serve")
@@ -68,6 +109,24 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             .spawn()
             .context("spawn detached daemon")?;
         return Ok(());
+    }
+
+    // ── Foreground path: serialise the check→remove→bind→pid critical section ──
+    //
+    // Multiple --foreground processes (e.g. a previous parent + this one) may
+    // race here.  An exclusive flock on the lock file ensures only one of them
+    // completes the bind; the other sees a live socket via `probe` and exits.
+    // The lock file remains open (and therefore locked) for the daemon's
+    // lifetime, giving `swamp kill` a reliable liveness signal.
+    let _startup_lock = acquire_startup_lock(&common)?;
+
+    let sock = socket_path(&common)?;
+    // Remove a stale socket if the previous daemon died.
+    if sock.exists() {
+        if probe(&sock).await.is_ok() {
+            anyhow::bail!("swamp serve already running for {}", common.display());
+        }
+        let _ = std::fs::remove_file(&sock);
     }
 
     // The daemon is the long-lived writer, so it truncates the per-repo log on
@@ -321,10 +380,27 @@ impl Daemon {
     }
 
     async fn refresh_all_unlocked(&self) -> Result<()> {
-        let mut s = self.state.write().await;
-        s.refresh_git(&self.common_dir)?;
-        let snap = s.snapshot();
-        drop(s);
+        // Clone out the agents map under a *read* lock so the git scan (which
+        // can take seconds on large repos) runs completely off the runtime via
+        // spawn_blocking, without blocking any async task or holding any lock.
+        let agents = {
+            let s = self.state.read().await;
+            s.agents.clone()
+        };
+
+        let common = self.common_dir.clone();
+        let new_rows = tokio::task::spawn_blocking(move || {
+            crate::daemon::state::scan_worktrees(&common, &agents)
+        })
+        .await
+        .context("git scan task")??;
+
+        // Swap the freshly computed rows in under the write lock.
+        let snap = {
+            let mut s = self.state.write().await;
+            s.apply_scanned_rows(new_rows);
+            s.snapshot()
+        };
         let _ = self.tx.send(ServerMsg::Snapshot(snap));
         Ok(())
     }
@@ -352,15 +428,19 @@ impl Daemon {
 
     async fn fetch_and_refresh_exclusive(&self) -> Result<()> {
         let _repo = self.repo_ops.lock().await;
-        let status = tokio::process::Command::new("git")
+        let mut child = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.common_dir)
             .args(["fetch", "--all", "--prune"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await
+            .kill_on_drop(true)
+            .spawn()
             .context("git fetch")?;
+        let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+            .await
+            .map_err(|_| anyhow::anyhow!("git fetch timed out after 60s"))?
+            .context("git fetch wait")?;
         if !status.success() {
             anyhow::bail!("git fetch exited {status}");
         }
@@ -376,17 +456,21 @@ impl Daemon {
             trigger = "update_default",
             "fetching all remotes and fast-forwarding default branch"
         );
-        let fetch = tokio::process::Command::new("git")
+        let mut fetch_child = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.common_dir)
             .args(["fetch", "--all", "--prune"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await
+            .kill_on_drop(true)
+            .spawn()
             .context("git fetch")?;
-        if !fetch.success() {
-            anyhow::bail!("git fetch exited {fetch}");
+        let fetch_status = tokio::time::timeout(Duration::from_secs(60), fetch_child.wait())
+            .await
+            .map_err(|_| anyhow::anyhow!("git fetch timed out after 60s"))?
+            .context("git fetch wait")?;
+        if !fetch_status.success() {
+            anyhow::bail!("git fetch exited {fetch_status}");
         }
 
         // Fast-forward the default branch in its worktree (if it's checked out).
@@ -405,13 +489,19 @@ impl Daemon {
         .context("locate default worktree")?;
         if let Some(path) = wt {
             let remote_ref = format!("origin/{branch}");
-            let out = tokio::process::Command::new("git")
+            let merge_child = tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&path)
                 .args(["merge", "--ff-only", &remote_ref])
-                .output()
-                .await
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
                 .context("git merge --ff-only")?;
+            let out = tokio::time::timeout(Duration::from_secs(30), merge_child.wait_with_output())
+                .await
+                .map_err(|_| anyhow::anyhow!("git merge --ff-only timed out after 30s"))?
+                .context("git merge --ff-only wait")?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 anyhow::bail!("fast-forward failed: {}", stderr.trim());
@@ -523,6 +613,31 @@ mod tests {
     use super::*;
     use crate::daemon::state::DaemonState;
     use std::process::Command as StdCommand;
+
+    /// Acquire → drop → re-acquire the lock on the same path to verify that
+    /// releasing the flock (by dropping the File) allows a second caller to
+    /// succeed. Exercises the flock primitive directly so the test needs no
+    /// git repo, env vars, or runtime dir (it must pass in the Nix sandbox).
+    #[test]
+    fn startup_lock_acquire_release_reacquire() {
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-lock-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.lock");
+
+        // First acquisition must succeed.
+        let lock1 = flock_exclusive(&path).expect("first acquire");
+        // Dropping releases the flock.
+        drop(lock1);
+        // Second acquisition must also succeed (not permanently locked).
+        let lock2 = flock_exclusive(&path).expect("re-acquire after release");
+        drop(lock2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn git_available() -> bool {
         StdCommand::new("git").arg("--version").output().is_ok()
