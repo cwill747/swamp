@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Per-repository log file path, alongside the daemon's socket/PID files.
-pub fn log_path(common_dir: &Path) -> PathBuf {
+/// Returns `None` when no safe runtime directory can be determined (no HOME/XDG
+/// vars set); callers treat a missing log path as best-effort.
+pub fn log_path(common_dir: &Path) -> Option<PathBuf> {
     let id = repo_id(common_dir);
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("swamp").join(format!("{id}.log"))
+    let base = crate::util::runtime_base_dir().ok()?;
+    Some(base.join(format!("{id}.log")))
 }
 
 /// A cloneable writer over a shared append handle. `&File` implements `Write`,
@@ -60,10 +60,7 @@ fn env_filter(cfg: &LoggingConfig) -> tracing_subscriber::EnvFilter {
 /// Open the per-repo log file, creating its directory. `fresh` truncates
 /// (daemon startup, to bound growth); otherwise the file is opened for append.
 fn open_log_file(common_dir: &Path, fresh: bool) -> Option<std::fs::File> {
-    let path = log_path(common_dir);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let path = log_path(common_dir)?;
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -129,7 +126,7 @@ pub async fn show(dir: Option<PathBuf>, follow: bool, all: bool) -> Result<()> {
     };
     let git_dir = resolve_git_dir(&target);
     let common = git_common_dir(&git_dir).context("not inside a git repo")?;
-    let path = log_path(&common);
+    let path = log_path(&common).context("cannot determine log path (no HOME or XDG vars set)")?;
 
     let scope = if all {
         None
@@ -223,10 +220,34 @@ mod tests {
 
     #[test]
     fn log_path_is_under_runtime_dir() {
-        // SAFETY: single-threaded test; no other thread reads the environment.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
-        let p = log_path(Path::new("/repo/.bare"));
-        assert!(p.starts_with("/run/user/1000/swamp"));
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Point XDG_RUNTIME_DIR at a real temp dir so runtime_base_dir() can
+        // verify ownership and create the directory.
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-log-path-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+
+        let p = log_path(Path::new("/repo/.bare")).expect("log_path should succeed");
+        assert!(p.starts_with(tmp.join("swamp")));
         assert!(p.extension().is_some_and(|e| e == "log"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 }

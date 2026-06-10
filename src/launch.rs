@@ -21,7 +21,7 @@ pub fn version_is_stale(running: &str, mine: &str) -> bool {
 /// absent, the daemon is unreachable, or the daemon is too old to understand
 /// `GetVersion`.
 fn query_daemon_version(common_dir: &Path) -> Option<String> {
-    let sock = daemon::socket_path(common_dir);
+    let sock = daemon::socket_path(common_dir).ok()?;
     if !sock.exists() {
         return None;
     }

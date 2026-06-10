@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 /// Ask the daemon for the branch list (for the create picker).
 pub(super) async fn request_branches(common: &std::path::Path) -> Result<Vec<BranchInfo>> {
-    let sock = daemon::socket_path(common);
+    let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::ListBranches).await?;
     match read_server_msg(&mut stream).await? {
@@ -26,7 +26,7 @@ pub(super) async fn send_action(
     msg: ClientMsg,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
-    let sock = daemon::socket_path(common);
+    let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &msg).await?;
     match read_server_msg(&mut stream).await? {
@@ -47,7 +47,7 @@ pub(super) async fn send_refresh(
     common: &std::path::Path,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
-    let sock = daemon::socket_path(common);
+    let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Refresh).await?;
     match read_server_msg(&mut stream).await? {
@@ -81,7 +81,7 @@ pub(super) async fn send_update(
     common: &std::path::Path,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
-    let sock = daemon::socket_path(common);
+    let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::UpdateDefault).await?;
     let done = match read_server_msg(&mut stream).await? {
@@ -98,7 +98,7 @@ pub(super) async fn subscribe_loop(
     common: &std::path::Path,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
-    let sock = daemon::socket_path(common);
+    let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Subscribe).await?;
     while let Some(msg) = read_server_msg(&mut stream).await? {

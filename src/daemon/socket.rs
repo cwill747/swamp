@@ -187,6 +187,11 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
     }
 }
 
+/// Maximum frame size for both client and server messages (16 MiB).
+/// A length prefix exceeding this cap causes the connection to be dropped rather
+/// than allocating an unbounded amount of memory.
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
     let mut len_buf = [0u8; 4];
     if let Err(e) = stream.read_exact(&mut len_buf).await {
@@ -196,6 +201,11 @@ pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
         return Err(e.into());
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        anyhow::bail!(
+            "incoming frame length {len} exceeds maximum {MAX_FRAME_LEN}; dropping connection"
+        );
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(serde_json::from_slice(&buf)?))
@@ -220,6 +230,11 @@ pub async fn read_server_msg(stream: &mut UnixStream) -> Result<Option<ServerMsg
         return Err(e.into());
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        anyhow::bail!(
+            "incoming frame length {len} exceeds maximum {MAX_FRAME_LEN}; dropping connection"
+        );
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(Some(serde_json::from_slice(&buf)?))
@@ -394,5 +409,85 @@ mod tests {
 
         handle.await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A 4-byte length header of 0xFFFFFFFF (4 GiB) must be rejected by
+    /// read_msg before any allocation attempt, instead of OOM-killing the
+    /// daemon.
+    #[tokio::test]
+    async fn read_msg_rejects_oversized_frame() {
+        let tmp =
+            std::env::temp_dir().join(format!("swamp-test-oversized-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&tmp).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Write a header claiming 4 GiB of payload.
+            use tokio::io::AsyncWriteExt;
+            s.write_all(&0xFFFF_FFFFu32.to_be_bytes()).await.unwrap();
+        });
+
+        let mut server_side = tokio::net::UnixStream::connect(&tmp).await.unwrap();
+        let err = read_msg(&mut server_side).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "expected cap error, got: {err}"
+        );
+
+        handle.await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Same guard for read_server_msg: a huge length prefix is rejected.
+    #[tokio::test]
+    async fn read_server_msg_rejects_oversized_frame() {
+        let tmp = std::env::temp_dir().join(format!(
+            "swamp-test-oversized-srv-{}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&tmp).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            s.write_all(&0xFFFF_FFFFu32.to_be_bytes()).await.unwrap();
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&tmp).await.unwrap();
+        let err = read_server_msg(&mut client).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "expected cap error, got: {err}"
+        );
+
+        handle.await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A frame exactly at the cap (16 MiB) should be accepted; one byte over
+    /// must be rejected.
+    #[tokio::test]
+    async fn read_msg_accepts_frame_at_cap_rejects_one_over() {
+        // Just above cap — no socket needed, just check the arithmetic.
+        let tmp_over =
+            std::env::temp_dir().join(format!("swamp-test-over-cap-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&tmp_over).unwrap();
+
+        let over_len = (MAX_FRAME_LEN + 1) as u32;
+        let handle = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            s.write_all(&over_len.to_be_bytes()).await.unwrap();
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&tmp_over).await.unwrap();
+        let err = read_msg(&mut client).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "expected cap error for over-cap frame, got: {err}"
+        );
+
+        handle.await.unwrap();
+        let _ = std::fs::remove_file(&tmp_over);
     }
 }
