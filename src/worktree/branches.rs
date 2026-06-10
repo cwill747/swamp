@@ -1,7 +1,7 @@
 use crate::worktree::model::{BranchInfo, BranchKind, Worktree};
 use crate::worktree::repo::open_lenient;
 use anyhow::Result;
-use git2::{BranchType, Repository};
+use git2::{BranchType, Repository, WorktreePruneOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,8 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
         };
         let path = wt.path().to_path_buf();
         if !path.exists() {
+            let mut opts = WorktreePruneOptions::new();
+            let _ = wt.prune(Some(&mut opts));
             continue;
         }
         let branch = worktree_branch(&path);
@@ -64,28 +66,66 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     Ok(wts)
 }
 
-/// Resolve the default branch *name* (e.g. "main") from
-/// `refs/remotes/origin/HEAD`.
-pub(super) fn default_branch_name(repo: &Repository) -> Option<String> {
-    let r = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
+fn remote_exists(repo: &Repository, remote: &str) -> bool {
+    repo.find_remote(remote).is_ok()
+}
+
+/// Resolve the configured default remote. Prefer Git's `checkout.defaultRemote`
+/// when set; otherwise use `origin` if present, or the sole configured remote.
+pub(super) fn default_remote(repo: &Repository) -> Option<String> {
+    if let Ok(remote) = repo
+        .config()
+        .and_then(|c| c.get_string("checkout.defaultRemote"))
+        && remote_exists(repo, &remote)
+    {
+        return Some(remote);
+    }
+    if remote_exists(repo, "origin") {
+        return Some("origin".into());
+    }
+    let remotes = repo.remotes().ok()?;
+    let mut names = remotes.iter().flatten().flatten();
+    let only = names.next()?.to_string();
+    names.next().is_none().then_some(only)
+}
+
+fn default_branch_name_for_remote(repo: &Repository, remote: &str) -> Option<String> {
+    let r = repo
+        .find_reference(&format!("refs/remotes/{remote}/HEAD"))
+        .ok()?;
     let target = r.symbolic_target().ok()??;
     target
-        .strip_prefix("refs/remotes/origin/")
+        .strip_prefix(&format!("refs/remotes/{remote}/"))
         .map(String::from)
 }
 
-/// Detect the default branch name, falling back to "main".
+/// Resolve the default branch *name* (e.g. "main") from the configured
+/// default remote's `HEAD` symbolic ref.
+pub(super) fn default_branch_name(repo: &Repository) -> Option<String> {
+    let remote = default_remote(repo)?;
+    default_branch_name_for_remote(repo, &remote)
+}
+
+/// Detect the default branch name. Returns an empty string when the default
+/// branch cannot be determined; callers that need a base must handle that
+/// explicitly instead of silently assuming `main`.
 pub fn default_branch(dir: &Path) -> String {
     open_lenient(dir)
         .ok()
         .and_then(|r| default_branch_name(&r))
-        .unwrap_or_else(|| "main".into())
+        .unwrap_or_default()
 }
 
 /// Find the worktree tracking the default branch (the one `git wt update`
 /// syncs). Falls back to the first worktree if no match.
 pub fn find_default_worktree<'a>(worktrees: &'a [Worktree], dir: &Path) -> Option<&'a Worktree> {
     let default = default_branch(dir);
+    if default.is_empty() {
+        return worktrees
+            .iter()
+            .find(|w| w.branch == "main")
+            .or_else(|| worktrees.first());
+    }
     worktrees
         .iter()
         .find(|w| w.branch == default)
@@ -98,6 +138,9 @@ pub fn find_default_worktree<'a>(worktrees: &'a [Worktree], dir: &Path) -> Optio
 /// (e.g. the "update" action) don't fast-forward the wrong tree.
 pub fn default_worktree_path(common_dir: &Path) -> Option<PathBuf> {
     let default = default_branch(common_dir);
+    if default.is_empty() {
+        return None;
+    }
     list_worktrees(common_dir)
         .ok()?
         .into_iter()
@@ -115,6 +158,7 @@ pub fn default_worktree_path(common_dir: &Path) -> Option<PathBuf> {
 pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
     let repo = open_lenient(common_dir)?;
     let default = default_branch_name(&repo);
+    let preferred_remote = default_remote(&repo);
 
     // Branch names currently checked out in some worktree.
     let checked_out: HashSet<String> = list_worktrees(common_dir)
@@ -140,6 +184,8 @@ pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
     }
 
     let mut remotes: Vec<BranchInfo> = Vec::new();
+    let mut remote_names: HashSet<String> = HashSet::new();
+    let mut duplicate_remote_names: HashSet<String> = HashSet::new();
     for entry in repo.branches(Some(BranchType::Remote))?.flatten() {
         let (branch, _) = entry;
         if let Ok(Some(full)) = branch.name() {
@@ -147,6 +193,13 @@ pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
                 continue;
             };
             if short == "HEAD" || local_names.contains(short) {
+                continue;
+            }
+            if preferred_remote.as_deref().is_some_and(|r| r != remote) {
+                continue;
+            }
+            if !remote_names.insert(short.to_string()) {
+                duplicate_remote_names.insert(short.to_string());
                 continue;
             }
             remotes.push(BranchInfo {
@@ -157,6 +210,9 @@ pub fn list_branches(common_dir: &Path) -> Result<Vec<BranchInfo>> {
                 is_default: false,
             });
         }
+    }
+    if preferred_remote.is_none() {
+        remotes.retain(|b| !duplicate_remote_names.contains(&b.name));
     }
 
     let sort_key = |b: &BranchInfo| (!b.is_default, b.name.clone());
@@ -196,6 +252,25 @@ mod tests {
     }
 
     #[test]
+    fn list_worktrees_prunes_missing_registry_entry() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        let wt = create_worktree(&bare, "feature").unwrap();
+        std::fs::remove_dir_all(&wt.path).unwrap();
+
+        assert!(list_worktrees(&bare).unwrap().is_empty());
+        assert!(
+            create_worktree(&bare, "feature").is_ok(),
+            "stale registry entry should not block recreating the worktree"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn list_branches_reports_local_and_checked_out() {
         if !git_available() {
             return;
@@ -227,6 +302,62 @@ mod tests {
         assert!(feature.checked_out, "feature is now in a worktree");
         let main = branches.iter().find(|b| b.name == "main").unwrap();
         assert!(!main.checked_out, "main is still free");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_branch_prefers_configured_default_remote() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+
+        run(&bare, &["branch", "develop", "main"]);
+        run(&bare, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(&bare, &["update-ref", "refs/remotes/origin/topic", "main"]);
+        run(&bare, &["update-ref", "refs/remotes/origin/HEAD", "main"]);
+        run(
+            &bare,
+            &["update-ref", "refs/remotes/upstream/develop", "develop"],
+        );
+        run(
+            &bare,
+            &["update-ref", "refs/remotes/upstream/topic", "develop"],
+        );
+        run(
+            &bare,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/develop",
+            ],
+        );
+        run(
+            &bare,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/origin.git",
+            ],
+        );
+        run(
+            &bare,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://example.invalid/upstream.git",
+            ],
+        );
+        run(&bare, &["config", "checkout.defaultRemote", "upstream"]);
+
+        let repo = Repository::open(&bare).unwrap();
+        assert_eq!(default_branch_name(&repo).as_deref(), Some("develop"));
+        let branches = list_branches(&bare).unwrap();
+        let topic = branches.iter().find(|b| b.name == "topic").unwrap();
+        assert_eq!(topic.remote.as_deref(), Some("upstream"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

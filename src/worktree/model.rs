@@ -57,6 +57,7 @@ pub fn worktree_name_for_branch(branch: &str) -> String {
 pub struct GitInfo {
     pub branch: String,
     pub upstream: Option<String>,
+    pub upstream_gone: bool,
     pub ahead: u32,
     pub behind: u32,
     pub staged: u32,
@@ -89,6 +90,8 @@ pub enum RemoveRefusedReason {
     UnmergedCommits,
     /// The worktree is locked (e.g. `git worktree lock` was called on it).
     Locked,
+    /// The process is currently running from inside this worktree.
+    CurrentDirectory,
     /// Status lookup failed (corrupt index, permission error, etc.).
     StatusUnreadable,
 }
@@ -101,6 +104,7 @@ impl RemoveRefusedReason {
             Self::UnpushedCommits => "has unpushed commits",
             Self::UnmergedCommits => "has commits on no other branch",
             Self::Locked => "is locked",
+            Self::CurrentDirectory => "contains the current directory",
             Self::StatusUnreadable => "has unreadable status (index error?)",
         }
     }
