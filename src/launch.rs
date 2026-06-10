@@ -155,8 +155,7 @@ fn spawn_new_session(
     }
 
     let layout_path = write_multi_tab_layout(bare, worktrees, session, cfg, &git_dir)?;
-    let res = zellij::new_session_with_layout(&layout_path, target, session, nested);
-    res
+    zellij::new_session_with_layout(&layout_path, target, session, nested)
 }
 
 fn prompt_restart(prompt: &str) -> bool {
@@ -216,8 +215,7 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
         ?harness,
         "wrote worktree tab layout"
     );
-    let res = zellij::new_tab(&layout.to_string_lossy(), path, name);
-    res
+    zellij::new_tab(&layout.to_string_lossy(), path, name)
 }
 
 /// Close the worktree's tab and reopen it, so a harness swap takes effect live.
