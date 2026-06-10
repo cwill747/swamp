@@ -1,6 +1,9 @@
 use crate::config::{ConfigPaths, Harness, resolve_harness};
 use crate::worktree::{Worktree, find_default_worktree, git_common_dir};
 use anyhow::{Context, Result};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -77,12 +80,11 @@ pub(super) fn write_multi_tab_layout(
     _session: &str,
     cfg: &ConfigPaths,
     git_dir: &Path,
-) -> Result<PathBuf> {
+) -> Result<TempLayout> {
     let swamp_bin = std::env::current_exe()
         .context("resolve current executable")?
         .display()
         .to_string();
-    let tmp = std::env::temp_dir().join(format!("swamp-layout-{}.kdl", std::process::id()));
     let nix = nix_available();
     let mut s = String::new();
     s.push_str("layout {\n");
@@ -134,7 +136,7 @@ pub(super) fn write_multi_tab_layout(
         s.push_str("  }\n");
     }
     s.push_str("}\n");
-    std::fs::write(&tmp, s)?;
+    let tmp = TempLayout::create("layout", &s)?;
     let tab_names: Vec<String> = worktrees.iter().map(|w| w.name()).collect();
     tracing::info!(
         bare,
@@ -153,12 +155,11 @@ fn session_cwd(worktrees: &[Worktree], git_dir: &Path) -> String {
 /// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
 /// the externally-installed `swamp` layout we used to depend on, but built from
 /// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
-pub(super) fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Result<PathBuf> {
+pub(super) fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Result<TempLayout> {
     let swamp_bin = std::env::current_exe()
         .context("resolve current executable")?
         .display()
         .to_string();
-    let tmp = std::env::temp_dir().join(format!("swamp-worktree-{}.kdl", std::process::id()));
     let mut s = String::new();
     s.push_str("layout {\n");
     // Mirror the per-tab frame from `write_multi_tab_layout`: a
@@ -180,8 +181,67 @@ pub(super) fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Resu
     push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None, harness);
     s.push_str("  }\n");
     s.push_str("}\n");
-    std::fs::write(&tmp, s)?;
-    Ok(tmp)
+    TempLayout::create("worktree", &s)
+}
+
+pub(super) struct TempLayout {
+    path: PathBuf,
+}
+
+impl TempLayout {
+    fn create(kind: &str, content: &str) -> Result<Self> {
+        let base = layout_base_dir()?;
+        for n in 0..1000 {
+            let path = base.join(format!("swamp-{kind}-{}-{n}.kdl", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(content.as_bytes())
+                        .with_context(|| format!("write {}", path.display()))?;
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            }
+        }
+        anyhow::bail!("could not allocate unique swamp {kind} layout file")
+    }
+}
+
+#[cfg(not(test))]
+fn layout_base_dir() -> Result<PathBuf> {
+    crate::util::runtime_base_dir()
+}
+
+#[cfg(test)]
+fn layout_base_dir() -> Result<PathBuf> {
+    let base = std::env::temp_dir().join(format!("swamp-layout-test-{}", std::process::id()));
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&base)
+        .with_context(|| format!("create test layout dir {}", base.display()))?;
+    Ok(base)
+}
+
+impl Deref for TempLayout {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempLayout {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempLayout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// The user's login shell, the basis for every interactive layout pane.

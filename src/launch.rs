@@ -6,7 +6,9 @@ use crate::worktree::{Worktree, git_common_dir, is_bare, list_worktrees, resolve
 use crate::zellij;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod layout;
 use layout::{write_multi_tab_layout, write_worktree_layout};
@@ -101,30 +103,28 @@ fn spawn_new_session(
     cfg: &ConfigPaths,
     nested: bool,
 ) -> Result<()> {
+    let git_dir = resolve_git_dir(target);
+    let common = git_common_dir(&git_dir);
+    let _launch_lock = match &common {
+        Ok(c) => Some(acquire_launch_lock(c)?),
+        Err(_) => None,
+    };
+
     // Reuse an existing session if one already matches this repo's name —
     // but first check whether the running daemon is stale.
-    if let Ok(sessions) = zellij::list_sessions()
-        && sessions.iter().any(|s| s == session)
-    {
+    let sessions = zellij::list_sessions()?;
+    if sessions.iter().any(|s| s == session) {
         let my_version = env!("CARGO_PKG_VERSION");
-        let git_dir = resolve_git_dir(target);
-        let common = git_common_dir(&git_dir);
 
         let mut do_restart = false;
         if let Ok(common) = &common {
             if let Some(running_version) = query_daemon_version(common) {
                 if version_is_stale(&running_version, my_version) {
                     if std::io::stdin().is_terminal() {
-                        print!(
-                            "swamp: running daemon is version {} but this binary is {} — restart session? [Y/n] ",
+                        do_restart = prompt_restart(&format!(
+                            "swamp: running daemon is version {} but this binary is {} - restart session? [y/N] ",
                             running_version, my_version
-                        );
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                        let mut answer = String::new();
-                        let _ = std::io::stdin().read_line(&mut answer);
-                        let answer = answer.trim().to_lowercase();
-                        do_restart = answer.is_empty() || answer == "y" || answer == "yes";
+                        ));
                     } else {
                         eprintln!(
                             "swamp: warning: running daemon is version {} but this binary is {} (non-interactive, attaching anyway)",
@@ -135,15 +135,9 @@ fn spawn_new_session(
             } else {
                 // No version response — treat as stale (old daemon).
                 if std::io::stdin().is_terminal() {
-                    print!(
-                        "swamp: running daemon did not report a version (likely an older build) — restart session? [Y/n] "
+                    do_restart = prompt_restart(
+                        "swamp: running daemon did not report a version (likely an older build) - restart session? [y/N] ",
                     );
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                    let mut answer = String::new();
-                    let _ = std::io::stdin().read_line(&mut answer);
-                    let answer = answer.trim().to_lowercase();
-                    do_restart = answer.is_empty() || answer == "y" || answer == "yes";
                 } else {
                     eprintln!(
                         "swamp: warning: running daemon did not report a version (likely an older build), attaching anyway"
@@ -160,11 +154,47 @@ fn spawn_new_session(
         }
     }
 
-    let git_dir = resolve_git_dir(target);
     let layout_path = write_multi_tab_layout(bare, worktrees, session, cfg, &git_dir)?;
-    let res = zellij::new_session_with_layout(&layout_path, target, session, nested);
-    let _ = std::fs::remove_file(&layout_path);
-    res
+    zellij::new_session_with_layout(&layout_path, target, session, nested)
+}
+
+fn prompt_restart(prompt: &str) -> bool {
+    print!("{prompt}");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn launch_lock_path(common_dir: &Path) -> Result<PathBuf> {
+    let id = crate::util::repo_id(common_dir);
+    Ok(crate::util::runtime_base_dir()?.join(format!("{id}.launch.lock")))
+}
+
+fn acquire_launch_lock(common_dir: &Path) -> Result<std::fs::File> {
+    let path = launch_lock_path(common_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open launch lock {}", path.display()))?;
+    let fd = file.as_raw_fd();
+    let mut waited_ms = 0u64;
+    loop {
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock || waited_ms >= 5_000 {
+            return Err(err).context("flock launch lock");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        waited_ms += 50;
+    }
 }
 
 /// Open a new zellij tab for a worktree, using a freshly generated,
@@ -185,9 +215,7 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
         ?harness,
         "wrote worktree tab layout"
     );
-    let res = zellij::new_tab(&layout.to_string_lossy(), path, name);
-    let _ = std::fs::remove_file(&layout);
-    res
+    zellij::new_tab(&layout.to_string_lossy(), path, name)
 }
 
 /// Close the worktree's tab and reopen it, so a harness swap takes effect live.
@@ -235,13 +263,7 @@ pub fn relaunch_worktree_tab(name: &str, path: &Path) -> Result<()> {
 /// shell command line, so anything outside the expected UUID charset is refused
 /// rather than escaped.
 pub(super) fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<String, String> {
-    let path = common_dir.join(".swamp-status.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Default::default();
-    };
-    let Ok(map) =
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
-    else {
+    let Some(map) = load_status_values(common_dir) else {
         return Default::default();
     };
     map.into_iter()
@@ -260,13 +282,7 @@ pub(super) fn load_session_ids(common_dir: &Path) -> std::collections::HashMap<S
 pub(super) fn load_harness_overrides(
     common_dir: &Path,
 ) -> std::collections::HashMap<String, Harness> {
-    let path = common_dir.join(".swamp-status.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Default::default();
-    };
-    let Ok(map) =
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
-    else {
+    let Some(map) = load_status_values(common_dir) else {
         return Default::default();
     };
     map.into_iter()
@@ -279,6 +295,37 @@ pub(super) fn load_harness_overrides(
             Some((name, h))
         })
         .collect()
+}
+
+fn load_status_values(
+    common_dir: &Path,
+) -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    let path = common_dir.join(".swamp-status.json");
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => Some(map),
+        Err(e) => {
+            let corrupt = corrupt_status_path(&path);
+            match std::fs::rename(&path, &corrupt) {
+                Ok(()) => tracing::warn!(
+                    path = %path.display(),
+                    corrupt = %corrupt.display(),
+                    "renamed corrupt swamp status file: {e}"
+                ),
+                Err(rename_err) => tracing::warn!(
+                    path = %path.display(),
+                    "could not rename corrupt swamp status file ({e}): {rename_err}"
+                ),
+            }
+            None
+        }
+    }
+}
+
+fn corrupt_status_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.corrupt", crate::util::now_unix()));
+    PathBuf::from(name)
 }
 
 /// A session id is safe to splice into a shell command only if it's a plain
