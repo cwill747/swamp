@@ -3,7 +3,7 @@ pub mod socket;
 pub mod state;
 pub mod watcher;
 
-use crate::util::repo_id;
+use crate::util::{repo_id, session_name_for};
 use crate::worktree::{git_common_dir, resolve_git_dir};
 use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
@@ -137,19 +137,13 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     let state = Arc::new(RwLock::new(DaemonState::load(&common).await?));
     let (tx, _) = broadcast::channel::<ServerMsg>(64);
 
-    // Session name matches launch::run's derivation: the file_name of the dir
-    // that contains the bare repo / .git. Prefer the ZELLIJ_SESSION_NAME env if
-    // present (set inside any zellij pane), so the daemon agrees with zellij
-    // even when started from an unusual cwd.
+    // Session name matches launch::run's derivation via session_name_for.
+    // Prefer the ZELLIJ_SESSION_NAME env if present (set inside any zellij
+    // pane), so the daemon agrees with zellij even when started from an
+    // unusual cwd.
     let session_name = std::env::var("ZELLIJ_SESSION_NAME")
         .ok()
-        .unwrap_or_else(|| {
-            common
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "swamp".into())
-        });
+        .unwrap_or_else(|| session_name_for(&common));
 
     let daemon = Arc::new(Daemon {
         common_dir: common.clone(),

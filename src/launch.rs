@@ -1,6 +1,7 @@
 use crate::config::{self, ConfigPaths, Harness, resolve_harness};
 use crate::daemon;
 use crate::daemon::socket::{ClientMsg, ServerMsg};
+use crate::util::session_name_for;
 use crate::worktree::{Worktree, git_common_dir, is_bare, list_worktrees, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
@@ -75,15 +76,15 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
         anyhow::bail!("no worktrees found under {}", target.display());
     }
 
-    let session = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "swamp".into());
-
     let cfg = config::ensure_configs()?;
-    if let Ok(common) = git_common_dir(&git_dir) {
-        crate::logging::init(&common, false, false, &cfg.logging);
+    let common = git_common_dir(&git_dir);
+    if let Ok(ref c) = common {
+        crate::logging::init(c, false, false, &cfg.logging);
     }
+    let session = common
+        .as_deref()
+        .map(session_name_for)
+        .unwrap_or_else(|_| "swamp".into());
 
     // When launched from inside an existing zellij session, create a *nested*
     // session rather than dumping tabs into the host session. `nested` causes

@@ -82,7 +82,9 @@ swamp
 ```
 
 swamp lists the repo's worktrees, generates a Zellij layout, and attaches to a
-session named after the repo. In a bare clone, the first tab is a dashboard and
+session named after the repo. The session name is `{repo-basename}-{4-hex}`
+(e.g. `myrepo-3b8b`) so two repos with the same directory name but different
+paths get distinct sessions. In a bare clone, the first tab is a dashboard and
 the remaining tabs are worktrees. In a normal repo, the worktree layout opens
 directly.
 
