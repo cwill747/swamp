@@ -12,20 +12,21 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use std::time::{Duration, SystemTime};
 
 pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rect) {
     let now = now_unix();
     let current_tab = app.current_tab.as_deref();
     let pin_current = app.view == TuiView::Worktrees;
+    let selected = app.selected_index();
 
     let rows: Vec<Row> = app
         .snapshot
         .rows
         .iter()
         .enumerate()
-        .map(|(i, r)| build_row(i, r, app, now, current_tab, pin_current))
+        .map(|(i, r)| build_row(i, r, app, selected, now, current_tab, pin_current))
         .collect();
 
     let table = Table::new(
@@ -49,17 +50,41 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
     )
     .column_spacing(1);
 
-    f.render_widget(table, area);
-
     let inner = bordered_inner(area);
-    let visible = (app.snapshot.rows.len()).min(inner.height as usize);
-    app.regions.worktrees = Some((inner, visible));
+    let visible_capacity = inner.height as usize;
+    if let Some(idx) = selected {
+        if idx < app.worktree_scroll {
+            app.worktree_scroll = idx;
+        } else if visible_capacity > 0 && idx >= app.worktree_scroll + visible_capacity {
+            app.worktree_scroll = idx + 1 - visible_capacity;
+        }
+    }
+    if app.snapshot.rows.len() <= visible_capacity {
+        app.worktree_scroll = 0;
+    } else {
+        app.worktree_scroll = app
+            .worktree_scroll
+            .min(app.snapshot.rows.len().saturating_sub(visible_capacity));
+    }
+    let mut state = TableState::new()
+        .with_selected(selected)
+        .with_offset(app.worktree_scroll);
+    f.render_stateful_widget(table, area, &mut state);
+
+    let visible = app
+        .snapshot
+        .rows
+        .len()
+        .saturating_sub(app.worktree_scroll)
+        .min(visible_capacity);
+    app.regions.worktrees = Some((inner, visible, app.worktree_scroll));
 }
 
 fn build_row<'a>(
     i: usize,
     r: &'a WorktreeRow,
     app: &AppState,
+    selected: Option<usize>,
     now: u64,
     current_tab: Option<&str>,
     pin_current: bool,
@@ -167,7 +192,7 @@ fn build_row<'a>(
         age_cell,
         harness_cell,
     ]);
-    if i == app.selected {
+    if selected == Some(i) {
         row.style(Theme::selected())
     } else if is_current {
         row.style(Theme::current())

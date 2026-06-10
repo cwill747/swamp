@@ -1,6 +1,8 @@
 use super::client::{request_branches, send_refresh, send_update, subscribe_loop};
+use super::ensure_daemon;
 use super::input::{
-    handle_create_key, handle_input_key, handle_mouse, open_worktree_tab_debounced, reconcile_tabs,
+    handle_create_key, handle_input_key, handle_mouse, open_worktree_tab_debounced,
+    request_reconcile_tabs, spawn_close_tab, spawn_go_to_tab,
 };
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
@@ -24,6 +26,17 @@ pub(super) enum AppEvent {
     Resources(resources::Snapshot),
     PrStatus(PrSnapshot),
     RefreshDone(Result<Vec<String>, String>),
+    RefreshTabsListed {
+        worktree_names: Vec<String>,
+        tabs: Result<Vec<String>, String>,
+    },
+    TabsListed {
+        full: bool,
+        tabs: Result<Vec<String>, String>,
+    },
+    ZellijError(String),
+    Disconnected(String),
+    Connected,
     /// The default-branch update finished; `Ok(())` clears the status line,
     /// `Err` carries a message to surface.
     UpdateDone(Result<(), String>),
@@ -31,6 +44,7 @@ pub(super) enum AppEvent {
     Branches(Vec<BranchInfo>),
     /// A create/delete request failed; surface the message in the footer.
     ActionError(String),
+    InputError(String),
     /// A non-forced delete was refused; re-open the confirmation as a force
     /// override. Carries `(worktree_name, reason_description)`.
     DeleteNeedsForce(String, String),
@@ -53,10 +67,15 @@ where
     {
         let tx = tx.clone();
         let common = common.to_path_buf();
+        let cwd = cwd.clone();
         tokio::spawn(async move {
             loop {
                 if let Err(e) = subscribe_loop(&common, tx.clone()).await {
                     tracing::debug!("subscriber: {e:?}");
+                    let _ = tx.send(AppEvent::Disconnected(e.to_string())).await;
+                }
+                if let Err(e) = ensure_daemon(&cwd).await {
+                    tracing::debug!("ensure daemon after disconnect: {e:?}");
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -68,11 +87,17 @@ where
         let tx = tx.clone();
         std::thread::spawn(move || {
             loop {
-                if event::poll(Duration::from_millis(100)).unwrap_or(false)
-                    && let Ok(evt) = event::read()
-                    && tx.blocking_send(AppEvent::Input(evt)).is_err()
-                {
-                    return;
+                match event::poll(Duration::from_millis(100)) {
+                    Ok(true) => match event::read() {
+                        Ok(evt) => {
+                            if tx.blocking_send(AppEvent::Input(evt)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(250)),
+                    },
+                    Ok(false) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(250)),
                 }
             }
         });
@@ -94,14 +119,17 @@ where
 
     let mut app = AppState {
         snapshot: Snapshot { rows: vec![] },
-        selected: 0,
+        selected: None,
+        worktree_scroll: 0,
         spinner_frame: 0,
         repo_name,
         view,
         refreshing: false,
         pending_delete: None,
         pending_create: None,
+        connected: true,
         recent_tab_opens: std::collections::HashMap::new(),
+        managed_tabs: std::collections::HashSet::from(["dashboard".to_string()]),
         known_worktrees: None,
         input: None,
         status_msg: None,
@@ -128,16 +156,15 @@ where
             AppEvent::Snapshot(s) => {
                 app.snapshot = s;
                 app.pin_snapshot();
-                if app.selected >= app.snapshot.rows.len() {
-                    app.selected = app.snapshot.rows.len().saturating_sub(1);
-                }
+                app.reconcile_selection();
                 if let Some(ref name) = app.pending_delete
                     && !app.snapshot.rows.iter().any(|r| &r.name == name)
                 {
-                    let _ = zellij::close_tab_by_name(name);
+                    spawn_close_tab(tx.clone(), name.clone());
                     // Drop any debounce record so a same-name worktree recreated
                     // within the cooldown still gets a fresh tab.
                     app.recent_tab_opens.remove(name);
+                    app.managed_tabs.remove(name);
                     app.pending_delete = None;
                     app.status_msg = None;
                 }
@@ -150,15 +177,25 @@ where
                         .map(|r| (r.path.clone(), r.name.clone()));
                     if let Some((path, name)) = created {
                         open_worktree_tab_debounced(&mut app, &path, &name);
-                        let _ = zellij::go_to_tab_name(&name);
+                        spawn_go_to_tab(tx.clone(), name);
                         app.pending_create = None;
                         app.status_msg = None;
                     }
                 } else {
-                    reconcile_tabs(&mut app, false);
+                    request_reconcile_tabs(tx.clone(), false);
                 }
             }
             AppEvent::Tick => {
+                let needs_tick = app.refreshing
+                    || app.toast.is_some()
+                    || app
+                        .snapshot
+                        .rows
+                        .iter()
+                        .any(|r| matches!(r.agent, crate::daemon::state::AgentStatus::Working));
+                if !needs_tick {
+                    continue;
+                }
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 if let Some((_, ticks)) = &mut app.toast {
                     *ticks = ticks.saturating_sub(1);
@@ -178,25 +215,56 @@ where
                 match res {
                     Ok(wt_names) => {
                         app.status_msg = None;
-                        if let Ok(tabs) = zellij::list_tab_names() {
-                            for tab in &tabs {
-                                if tab == "dashboard" {
-                                    continue;
-                                }
-                                if !wt_names.iter().any(|n| n == tab) {
-                                    let _ = zellij::close_tab_by_name(tab);
-                                    app.recent_tab_opens.remove(tab);
-                                }
-                            }
-                        }
-                        // Manual refresh is the deliberate "put my session back
-                        // together" gesture: reopen tabs for ALL worktrees, not
-                        // just newly appeared ones.
-                        reconcile_tabs(&mut app, true);
+                        let tx = tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let tabs = zellij::list_tab_names().map_err(|e| e.to_string());
+                            let _ = tx.blocking_send(AppEvent::RefreshTabsListed {
+                                worktree_names: wt_names,
+                                tabs,
+                            });
+                        });
                     }
                     Err(msg) => {
                         app.status_msg = Some(msg);
                     }
+                }
+            }
+            AppEvent::RefreshTabsListed {
+                worktree_names,
+                tabs,
+            } => {
+                if let Ok(tabs) = tabs {
+                    for tab in &tabs {
+                        if app.managed_tabs.contains(tab)
+                            && !worktree_names.iter().any(|n| n == tab)
+                        {
+                            spawn_close_tab(tx.clone(), tab.clone());
+                            app.recent_tab_opens.remove(tab);
+                            app.managed_tabs.remove(tab);
+                        }
+                    }
+                }
+                request_reconcile_tabs(tx.clone(), true);
+            }
+            AppEvent::TabsListed { full, tabs } => match tabs {
+                Ok(tabs) => super::input::reconcile_tabs(&mut app, &tabs, full),
+                Err(e) => tracing::debug!("list zellij tabs: {e}"),
+            },
+            AppEvent::ZellijError(msg) => {
+                app.status_msg = Some(msg);
+            }
+            AppEvent::Disconnected(msg) => {
+                app.connected = false;
+                app.status_msg = Some(format!("Disconnected from daemon: {msg}"));
+            }
+            AppEvent::Connected => {
+                app.connected = true;
+                if app
+                    .status_msg
+                    .as_ref()
+                    .is_some_and(|msg| msg.starts_with("Disconnected from daemon:"))
+                {
+                    app.status_msg = None;
                 }
             }
             AppEvent::UpdateDone(res) => {
@@ -212,6 +280,11 @@ where
                 }
             }
             AppEvent::ActionError(msg) => {
+                app.pending_create = None;
+                app.pending_delete = None;
+                app.status_msg = Some(msg);
+            }
+            AppEvent::InputError(msg) => {
                 app.pending_create = None;
                 app.pending_delete = None;
                 app.input = None;
@@ -254,21 +327,21 @@ where
                             );
                             app.resource_scroll = (app.resource_scroll + 1).min(max);
                         } else if !app.snapshot.rows.is_empty() {
-                            app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
+                            app.move_selection(1);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         if app.view == TuiView::Resources {
                             app.resource_scroll = app.resource_scroll.saturating_sub(1);
                         } else {
-                            app.selected = app.selected.saturating_sub(1);
+                            app.move_selection(-1);
                         }
                     }
                     KeyCode::Char('g') => {
                         if app.view == TuiView::Resources {
                             app.resource_scroll = 0;
                         } else {
-                            app.selected = 0;
+                            app.select_first();
                         }
                     }
                     KeyCode::Char('G') => {
@@ -279,12 +352,12 @@ where
                             );
                             app.resource_scroll = max;
                         } else if !app.snapshot.rows.is_empty() {
-                            app.selected = app.snapshot.rows.len() - 1;
+                            app.select_last();
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(row) = app.snapshot.rows.get(app.selected) {
-                            let _ = zellij::go_to_tab_name(&row.name);
+                        if let Some(row) = app.selected_row() {
+                            spawn_go_to_tab(tx.clone(), row.name.clone());
                         }
                     }
                     KeyCode::Char('c') => {
@@ -306,29 +379,27 @@ where
                                     let _ = tx.send(AppEvent::Branches(branches)).await;
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                                    let _ = tx.send(AppEvent::InputError(e.to_string())).await;
                                 }
                             }
                         });
                     }
                     KeyCode::Char('d') => {
-                        if let Some(row) = app.snapshot.rows.get(app.selected) {
+                        if let Some(name) = app.selected_row().map(|row| row.name.clone()) {
                             app.status_msg = None;
                             // For the initial prompt there is no force_reason;
                             // if the daemon refuses, DeleteNeedsForce re-opens
                             // it with a reason.
                             app.input = Some(InputMode::ConfirmDelete {
-                                name: row.name.clone(),
+                                name,
                                 force_reason: None,
                             });
                         }
                     }
                     KeyCode::Char('h') => {
-                        if let Some(row) = app.snapshot.rows.get(app.selected) {
+                        if let Some(name) = app.selected_row().map(|row| row.name.clone()) {
                             app.status_msg = None;
-                            app.input = Some(InputMode::PickHarness {
-                                name: row.name.clone(),
-                            });
+                            app.input = Some(InputMode::PickHarness { name });
                         }
                     }
                     KeyCode::Char('r') if !app.refreshing => {
