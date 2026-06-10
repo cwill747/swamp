@@ -1,6 +1,7 @@
 use super::Daemon;
 use anyhow::Result;
 use notify::{RecursiveMode, Watcher};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,15 +10,19 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
     })?;
-    // Watch the common dir (covers HEAD, worktrees/, index changes for the bare repo).
-    watcher.watch(&daemon.common_dir, RecursiveMode::Recursive)?;
-    // Also watch each worktree's index/HEAD.
-    {
-        let s = daemon.state.read().await;
-        for row in s.rows.values() {
-            let _ = watcher.watch(&row.path.join(".git"), RecursiveMode::NonRecursive);
-        }
-    }
+    // Watch the common dir itself for direct files like HEAD, packed-refs, and
+    // .swamp-status.json, but avoid recursively subscribing to objects/ and logs/.
+    watcher.watch(&daemon.common_dir, RecursiveMode::NonRecursive)?;
+    watch_if_exists(
+        &mut watcher,
+        &daemon.common_dir.join("refs"),
+        RecursiveMode::Recursive,
+    )?;
+    watch_if_exists(
+        &mut watcher,
+        &daemon.common_dir.join("worktrees"),
+        RecursiveMode::Recursive,
+    )?;
 
     // Debounce: collect bursts, then refresh once.
     loop {
@@ -39,4 +44,15 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
             tracing::warn!("watcher refresh: {e:?}");
         }
     }
+}
+
+fn watch_if_exists(
+    watcher: &mut notify::RecommendedWatcher,
+    path: &Path,
+    mode: RecursiveMode,
+) -> notify::Result<()> {
+    if path.exists() {
+        watcher.watch(path, mode)?;
+    }
+    Ok(())
 }
