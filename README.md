@@ -36,6 +36,12 @@ nix build path:.
 ./result/bin/swamp --help
 ```
 
+For an optimized build matching release profile settings:
+
+```bash
+nix build path:.#release
+```
+
 ### Static binaries
 
 Static binaries are published on the

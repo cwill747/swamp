@@ -36,6 +36,10 @@ jobs:
           name: cwill747-swamp
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      - name: Build release package
+        if: matrix.package == 'static'
+        run: nix build --print-build-logs .#release --out-link result-release
+
       - name: Build static binary
         run: nix build --print-build-logs .#${{ matrix.package }}
 
