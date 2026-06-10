@@ -568,9 +568,18 @@ impl Daemon {
         session_name: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<()> {
-        tracing::info!(worktree = %wt_name, status, "applied agent hook");
         let mut s = self.state.write().await;
-        s.apply_hook(wt_name, status, session_name, session_id)?;
+        let changed = s.apply_hook(wt_name, status, session_name, session_id)?;
+        if !changed {
+            // Timestamp-only ping (active agents send one per tool call). The
+            // in-memory record is fresh; skip the persist — whose status-file
+            // write would otherwise echo through the fs watcher as a pointless
+            // git rescan — and the snapshot broadcast, which drove the TUI's
+            // tab reconciler on every ping.
+            tracing::debug!(worktree = %wt_name, status, "agent hook unchanged; not broadcasting");
+            return Ok(());
+        }
+        tracing::info!(worktree = %wt_name, status, "applied agent hook");
         s.persist(&self.common_dir).await?;
         let snap = s.snapshot();
         drop(s);

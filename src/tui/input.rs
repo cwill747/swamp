@@ -9,6 +9,7 @@ use crate::worktree::worktree_name_for_branch;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -361,13 +362,22 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
     }
 }
 
-/// Create zellij tabs for any worktrees in the snapshot that don't have one.
+/// Create zellij tabs for worktrees that newly appeared in the snapshot.
 ///
 /// Swamp opens the requested target tab itself when *it* creates a worktree
 /// (the `pending_create` path), but a worktree born outside swamp — `git
 /// worktree add` in another terminal, an agent spinning one up — only shows up
 /// in the daemon snapshot. It lists in the dashboard, yet double-clicking it
 /// can't focus anything because no tab exists. Reconcile fills that gap.
+///
+/// Eligibility is *appearance*, not absence: a tab is opened for a worktree
+/// only when its name wasn't in the previously reconciled snapshot (or on the
+/// first reconcile after startup, when everything is new to us). A long-known
+/// worktree with no tab means the user closed it — treating "no tab" itself as
+/// the trigger meant every snapshot broadcast (one per agent hook ping)
+/// resurrected tabs the user had just closed. `full` restores the
+/// open-anything-missing behavior for the manual refresh key, the deliberate
+/// "put my session back together" gesture.
 ///
 /// Only the dashboard's worktrees pane runs this: it's the single instance with
 /// `view == Worktrees && !pin_cwd`, so the several swamp panes (one per worktree
@@ -379,8 +389,9 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 /// to query when `swamp tui` is run bare in a terminal. A failed tab query must
 /// be treated as "unknown", not "empty", because an empty tab set reads as
 /// "every worktree is missing a tab" and would spawn a duplicate `new-tab` per
-/// row on every snapshot.
-pub(super) fn reconcile_tabs(app: &mut AppState) {
+/// row. The known-set is only advanced on a successful query, so an appearance
+/// missed during a failed query is retried on the next snapshot.
+pub(super) fn reconcile_tabs(app: &mut AppState, full: bool) {
     if app.view != TuiView::Worktrees || app.pin_cwd || !zellij::in_zellij() {
         return;
     }
@@ -395,13 +406,21 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
     // then reopen cleanly.
     app.recent_tab_opens
         .retain(|name, _| !tabs.iter().any(|t| t == name));
+    let names: HashSet<String> = app
+        .snapshot
+        .rows
+        .iter()
+        .map(|row| row.name.clone())
+        .collect();
+    let eligible = eligible_for_open(app.known_worktrees.as_ref(), &names, full);
+    app.known_worktrees = Some(names);
     // Collect first: opening a tab mutates `recent_tab_opens`, which can't
     // alias the `snapshot.rows` borrow held by the loop.
     let missing: Vec<(PathBuf, String)> = app
         .snapshot
         .rows
         .iter()
-        .filter(|row| !tabs.iter().any(|t| t == &row.name))
+        .filter(|row| eligible.contains(&row.name) && !tabs.iter().any(|t| t == &row.name))
         .map(|row| (row.path.clone(), row.name.clone()))
         .collect();
     if !missing.is_empty() {
@@ -409,10 +428,26 @@ pub(super) fn reconcile_tabs(app: &mut AppState) {
         // yet visible to `query-tab-names`) is distinguishable from a genuinely
         // absent tab when diagnosing duplicate-tab reports.
         let missing_names: Vec<&str> = missing.iter().map(|(_, n)| n.as_str()).collect();
-        tracing::debug!(?tabs, missing = ?missing_names, "reconcile: worktrees without a zellij tab");
+        tracing::debug!(?tabs, missing = ?missing_names, full, "reconcile: opening tabs for new worktrees");
     }
     for (path, name) in missing {
         open_worktree_tab_debounced(app, &path, &name);
+    }
+}
+
+/// Which worktree names may get a tab this round: everything on the first
+/// reconcile (`prev` is `None`) or when a full reconcile was requested,
+/// otherwise only names absent from the previous round. A name that vanishes
+/// and returns (worktree deleted then recreated) counts as new again because
+/// the caller replaces the known-set with `current` every round.
+fn eligible_for_open(
+    prev: Option<&HashSet<String>>,
+    current: &HashSet<String>,
+    full: bool,
+) -> HashSet<String> {
+    match prev {
+        Some(prev) if !full => current.difference(prev).cloned().collect(),
+        _ => current.clone(),
     }
 }
 
@@ -517,6 +552,58 @@ mod tests {
         assert!(!point_in(r, 6, 4)); // one past width
         assert!(!point_in(r, 5, 5)); // one past height
         assert!(!point_in(r, 1, 3)); // left of region
+    }
+
+    fn names(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Tab opens are driven by worktree *appearance*: everything qualifies on
+    /// the first round, only additions afterwards, and `full` (manual refresh)
+    /// re-qualifies everything. A worktree that disappears and returns is an
+    /// appearance again.
+    #[test]
+    fn eligible_for_open_tracks_appearances() {
+        // First reconcile: no previous set, everything is new.
+        assert_eq!(
+            eligible_for_open(None, &names(&["main", "feat"]), false),
+            names(&["main", "feat"])
+        );
+        // Steady state: nothing new, nothing eligible — a closed tab for a
+        // known worktree must NOT be resurrected by the next snapshot.
+        assert_eq!(
+            eligible_for_open(
+                Some(&names(&["main", "feat"])),
+                &names(&["main", "feat"]),
+                false
+            ),
+            names(&[])
+        );
+        // Only the addition qualifies.
+        assert_eq!(
+            eligible_for_open(Some(&names(&["main"])), &names(&["main", "feat"]), false),
+            names(&["feat"])
+        );
+        // Removals alone qualify nothing.
+        assert_eq!(
+            eligible_for_open(Some(&names(&["main", "feat"])), &names(&["main"]), false),
+            names(&[])
+        );
+        // Full reconcile (manual refresh) re-qualifies everything known.
+        assert_eq!(
+            eligible_for_open(
+                Some(&names(&["main", "feat"])),
+                &names(&["main", "feat"]),
+                true
+            ),
+            names(&["main", "feat"])
+        );
+        // Deleted-then-recreated: the caller replaced the known-set with the
+        // post-deletion set, so the name's return is an appearance.
+        assert_eq!(
+            eligible_for_open(Some(&names(&["main"])), &names(&["main", "feat"]), false),
+            names(&["feat"])
+        );
     }
 
     #[test]

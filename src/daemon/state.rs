@@ -141,13 +141,19 @@ impl DaemonState {
         self.rows = new_rows;
     }
 
+    /// Record an agent status ping. Returns `true` when the record changed in
+    /// a way subscribers can observe (status, session name/id) — repeated pings
+    /// of the same status only refresh the in-memory timestamp and return
+    /// `false`, so the daemon can skip the persist + snapshot broadcast. Active
+    /// agents ping on every tool call; broadcasting each one made every hook a
+    /// tab-reconcile trigger in the TUI.
     pub fn apply_hook(
         &mut self,
         wt_name: &str,
         status: &str,
         session_name: Option<&str>,
         session_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let agent_status = match status.to_lowercase().as_str() {
             "working" => AgentStatus::Working,
             "waiting" => AgentStatus::Waiting,
@@ -167,6 +173,16 @@ impl DaemonState {
             .or_else(|| existing.and_then(|r| r.session_id.clone()));
         // Preserve any per-worktree harness override across status pings.
         let harness = existing.and_then(|r| r.harness);
+        // The timestamp always moves; "changed" means anything else did. The
+        // harness is carried over verbatim, so it can never be a diff source.
+        let changed = match existing {
+            None => true,
+            Some(prev) => {
+                prev.status != agent_status
+                    || prev.session_name != session
+                    || prev.session_id != sid
+            }
+        };
         let rec = AgentRecord {
             status: agent_status,
             ts: now_unix(),
@@ -180,7 +196,7 @@ impl DaemonState {
             row.agent_ts = rec.ts;
             row.session_name = rec.session_name;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Record the per-worktree harness override (worktrees pane `h`). Preserves
@@ -391,6 +407,31 @@ mod tests {
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].name, "main");
         assert_eq!(snap.rows[0].agent, AgentStatus::Idle);
+    }
+
+    /// `apply_hook` reports a change only when the observable record moved:
+    /// the first ping, a status transition, or a new session id. Repeated
+    /// same-status pings (one per tool call from an active agent) return
+    /// `false` so the daemon doesn't persist + broadcast a snapshot per ping.
+    #[test]
+    fn apply_hook_reports_observable_changes_only() {
+        let mut state = DaemonState::default();
+
+        // First ping for an unknown agent is a change.
+        assert!(state.apply_hook("main", "working", None, None).unwrap());
+        // Same status again: timestamp-only, not a change.
+        assert!(!state.apply_hook("main", "working", None, None).unwrap());
+        // Status transition is a change.
+        assert!(state.apply_hook("main", "idle", None, None).unwrap());
+        // A session id appearing is a change…
+        assert!(state.apply_hook("main", "idle", None, Some("abc")).unwrap());
+        // …but repeating it (or omitting it, which preserves it) is not.
+        assert!(!state.apply_hook("main", "idle", None, Some("abc")).unwrap());
+        assert!(!state.apply_hook("main", "idle", None, None).unwrap());
+        // The in-memory timestamp still refreshes on a no-change ping.
+        let before = state.agents.get("main").unwrap().ts;
+        assert!(!state.apply_hook("main", "idle", None, None).unwrap());
+        assert!(state.agents.get("main").unwrap().ts >= before);
     }
 
     /// A session id is recorded on the agent record and preserved across a

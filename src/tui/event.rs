@@ -102,6 +102,7 @@ where
         pending_delete: None,
         pending_create: None,
         recent_tab_opens: std::collections::HashMap::new(),
+        known_worktrees: None,
         input: None,
         status_msg: None,
         toast: None,
@@ -154,7 +155,7 @@ where
                         app.status_msg = None;
                     }
                 } else {
-                    reconcile_tabs(&mut app);
+                    reconcile_tabs(&mut app, false);
                 }
             }
             AppEvent::Tick => {
@@ -188,6 +189,10 @@ where
                                 }
                             }
                         }
+                        // Manual refresh is the deliberate "put my session back
+                        // together" gesture: reopen tabs for ALL worktrees, not
+                        // just newly appeared ones.
+                        reconcile_tabs(&mut app, true);
                     }
                     Err(msg) => {
                         app.status_msg = Some(msg);
