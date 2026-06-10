@@ -4,6 +4,73 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+// ---------------------------------------------------------------------------
+// Escaping helpers
+// ---------------------------------------------------------------------------
+
+/// Escape a string for use inside a KDL double-quoted string.
+///
+/// KDL string escapes: `\` → `\\`, `"` → `\"`, newline → `\n`,
+/// carriage return → `\r`, tab → `\t`. Other ASCII control characters
+/// are escaped as `\u{XX}`.
+fn kdl_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => {
+                // Remaining ASCII control chars (0x00–0x1F, 0x7F except \n\r\t).
+                out.push_str(&format!("\\u{{{:02X}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// POSIX single-quote a string for use inside sh/bash command strings.
+///
+/// Wraps the value in `'...'`. Any embedded `'` is handled by ending
+/// the single-quoted span, emitting an escaped `\'`, then restarting
+/// the span: `'` → `'\''`.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::new();
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Fish single-quote a string for use inside fish command strings.
+///
+/// In fish single-quoted strings, only `\` and `'` are special.
+/// `\` → `\\`, `'` → `\'`.
+fn fish_quote(s: &str) -> String {
+    let mut out = String::new();
+    out.push('\'');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// ---------------------------------------------------------------------------
+
 pub(super) fn write_multi_tab_layout(
     bare: bool,
     worktrees: &[Worktree],
@@ -32,7 +99,7 @@ pub(super) fn write_multi_tab_layout(
     if bare {
         s.push_str(&format!(
             "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
-            session_cwd(worktrees, git_dir),
+            kdl_escape(&session_cwd(worktrees, git_dir)),
         ));
         push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
         s.push_str("  }\n");
@@ -57,9 +124,9 @@ pub(super) fn write_multi_tab_layout(
         let focus = if !bare && i == 0 { " focus=true" } else { "" };
         s.push_str(&format!(
             "  tab name=\"{}\"{} cwd=\"{}\" {{\n",
-            wt.name(),
+            kdl_escape(&wt.name()),
             focus,
-            wt.path.display()
+            kdl_escape(&wt.path.display().to_string())
         ));
         let resume = session_ids.get(&wt.name()).map(|s| s.as_str());
         let harness = resolve_harness(cfg.harness, harness_overrides.get(&wt.name()).copied());
@@ -236,8 +303,10 @@ fn push_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix:
         worktrees_col = d.worktrees_column,
         ai_col = d.ai_column,
         shell_col = d.shell_column,
-        shell_path = sh.path,
-        run_flag = sh.run_flag
+        shell_path = kdl_escape(&sh.path),
+        run_flag = sh.run_flag,
+        swamp_bin = kdl_escape(swamp_bin),
+        shell_glue = kdl_escape(&shell_glue),
     ));
 }
 
@@ -252,10 +321,23 @@ fn push_worktree_panes(
     let lazygit_cfg = cfg.lazygit.display().to_string();
     let sh = user_shell();
 
-    let lazygit_glue = if sh.is_fish {
-        format!("set -gx LG_CONFIG_FILE {lazygit_cfg}; exec lazygit")
+    // shell-quote lazygit_cfg for use inside a shell assignment, then
+    // KDL-escape the whole glue string for embedding in a KDL args "…" token.
+    let lazygit_cfg_shell_quoted = if sh.is_fish {
+        fish_quote(&lazygit_cfg)
     } else {
-        format!("export LG_CONFIG_FILE={lazygit_cfg}; exec lazygit")
+        sh_quote(&lazygit_cfg)
+    };
+    let lazygit_glue = if sh.is_fish {
+        format!(
+            "set -gx LG_CONFIG_FILE {}; exec lazygit",
+            lazygit_cfg_shell_quoted
+        )
+    } else {
+        format!(
+            "export LG_CONFIG_FILE={}; exec lazygit",
+            lazygit_cfg_shell_quoted
+        )
     };
 
     // Resolve the agent binary on the host's PATH first, then carry that path
@@ -263,15 +345,23 @@ fn push_worktree_panes(
     // Codex's notify gives us no resumable id, so a Codex pane always starts
     // fresh. When a Claude session id was recorded, resume it.
     let bin = harness.bin();
+    // bin is a fixed identifier from our own Harness enum; no quoting needed for
+    // `command -s`/`command -v`.  Session ids come from our own recorded values
+    // (UUIDs); still quote them for defence.
     let agent_prefix = if sh.is_fish {
         format!("set -l cp (command -s {bin}); ")
     } else {
         format!("cp=$(command -v {bin}); ")
     };
     let agent_cmd = match (harness, resume_session) {
-        (Harness::Claude, Some(id)) => format!("$cp --resume {id}"),
+        (Harness::Claude, Some(id)) => format!("$cp --resume {}", sh_quote(id)),
         _ => "$cp".to_string(),
     };
+    // shell_glue: sh.path is used as the direct-exec target and must be
+    // shell-quoted when embedded in the `bash -c '...'` wrapper and as the
+    // fallback `direct` path.  Here it is passed as the literal command to
+    // exec, so no extra quoting layer is needed beyond what nix_entry produces —
+    // but the entire resulting string is then KDL-escaped before insertion.
     let shell_glue = nix_entry(
         &sh,
         nix,
@@ -312,8 +402,13 @@ fn push_worktree_panes(
       }}
     }}
 "#,
-        shell_path = sh.path,
-        run_flag = sh.run_flag
+        shell_path = kdl_escape(&sh.path),
+        run_flag = sh.run_flag,
+        lazygit_glue = kdl_escape(&lazygit_glue),
+        swamp_bin = kdl_escape(swamp_bin),
+        agent_glue = kdl_escape(&agent_glue),
+        bin = kdl_escape(bin),
+        shell_glue = kdl_escape(&shell_glue),
     ));
 }
 
@@ -370,8 +465,17 @@ mod tests {
         }
     }
 
+    // Serializes tests that mutate process-global state: the $SHELL variable
+    // and the shared pid-keyed layout file in the temp dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn multi_tab_layout_dashboard_uses_default_branch_worktree() {
+        let _guard = env_guard();
         let worktrees = vec![
             make_wt("/repo/talks/foo", "foo"),
             make_wt("/repo/talks/main", "main"),
@@ -489,7 +593,8 @@ mod tests {
     #[test]
     fn worktree_panes_use_env_shell_not_hardcoded_fish() {
         // Force a non-fish $SHELL and confirm the generated layout follows it.
-        // SAFETY: single-threaded test; no other thread reads the environment here.
+        let _guard = env_guard();
+        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
         push_worktree_panes(
@@ -544,7 +649,8 @@ mod tests {
     /// session; without one it launches plain `claude` (#33).
     #[test]
     fn worktree_panes_resume_recorded_session() {
-        // SAFETY: single-threaded test; no other thread reads the environment.
+        let _guard = env_guard();
+        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut with = String::new();
@@ -557,7 +663,7 @@ mod tests {
             Harness::Claude,
         );
         assert!(
-            with.contains("$cp --resume abc-123"),
+            with.contains("$cp --resume 'abc-123'"),
             "recorded session should resume; got:\n{with}"
         );
 
@@ -580,7 +686,8 @@ mod tests {
     /// never resumes — Codex notify gives us no resumable id.
     #[test]
     fn worktree_panes_codex_launches_codex_fresh() {
-        // SAFETY: single-threaded test; no other thread reads the environment.
+        let _guard = env_guard();
+        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut s = String::new();
@@ -612,7 +719,8 @@ mod tests {
     /// prompt rather than a dead pane.
     #[test]
     fn worktree_agent_pane_drops_to_shell_on_exit() {
-        // SAFETY: single-threaded test; no other thread reads the environment.
+        let _guard = env_guard();
+        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut s = String::new();
@@ -632,6 +740,172 @@ mod tests {
         assert!(
             !s.contains("exec $cp"),
             "agent must not be exec'd (else the pane dies on exit); got:\n{s}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Escaping helper unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kdl_escape_basic() {
+        assert_eq!(kdl_escape("hello"), "hello");
+        assert_eq!(kdl_escape(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(kdl_escape("back\\slash"), "back\\\\slash");
+        assert_eq!(kdl_escape("new\nline"), "new\\nline");
+        assert_eq!(kdl_escape("tab\there"), "tab\\there");
+        assert_eq!(kdl_escape("cr\rhere"), "cr\\rhere");
+    }
+
+    #[test]
+    fn kdl_escape_control_chars() {
+        // NULL byte → \u{00}
+        assert_eq!(kdl_escape("\x00"), "\\u{00}");
+        // BEL → \u{07}
+        assert_eq!(kdl_escape("\x07"), "\\u{07}");
+    }
+
+    #[test]
+    fn sh_quote_basic() {
+        assert_eq!(sh_quote("/home/user/file"), "'/home/user/file'");
+        assert_eq!(sh_quote("/path with spaces/x"), "'/path with spaces/x'");
+        assert_eq!(sh_quote("it's here"), "'it'\\''s here'");
+        assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn fish_quote_basic() {
+        assert_eq!(fish_quote("/home/user/file"), "'/home/user/file'");
+        assert_eq!(fish_quote("/path with spaces/x"), "'/path with spaces/x'");
+        assert_eq!(fish_quote("it's here"), r"'it\'s here'");
+        assert_eq!(fish_quote("back\\slash"), "'back\\\\slash'");
+        assert_eq!(fish_quote(""), "''");
+    }
+
+    /// A worktree whose path basename contains `"` must not produce a raw `"`
+    /// inside a KDL quoted string attribute — that would terminate the string
+    /// early and allow KDL node injection.  `wt.name()` returns `path.file_name()`,
+    /// so the hostile content lives in the last path component.
+    ///
+    /// Note: the hostile string must not contain `/` because `Path::file_name()`
+    /// splits on path separators; we use `"` and `\` without `/`.
+    #[test]
+    fn hostile_branch_name_does_not_break_kdl() {
+        // Path basename that tries to escape the KDL string (no `/` so
+        // Path::file_name() returns the whole thing).
+        let hostile_name = "feat\" focus=true cwd=\"injected";
+        // Build a path whose file_name() is the hostile string.
+        let hostile_path = format!("/repo/work/{hostile_name}");
+        let wt = make_wt(&hostile_path, "some-branch");
+        // name() returns path.file_name() — i.e., the hostile_name.
+        let name = wt.name();
+        assert_eq!(
+            name, hostile_name,
+            "sanity: name() should return the hostile basename"
+        );
+        let escaped = kdl_escape(&name);
+        // The escaped form should contain the backslash-escaped quote sequence.
+        assert!(
+            escaped.contains("\\\""),
+            "escaped form should contain \\\"; got: {escaped}"
+        );
+        // The escaped output must not contain the raw injection sequence.
+        // Specifically: every `"` in the input should become `\"` in the output.
+        // Verify by checking the raw input's `"` characters no longer appear
+        // in an unescaped form — i.e., the input `"` count equals the `\"`
+        // (backslash-double-quote) count in the output.
+        let raw_quotes = name.chars().filter(|&c| c == '"').count();
+        let escaped_quotes = escaped.matches("\\\"").count();
+        assert_eq!(
+            raw_quotes, escaped_quotes,
+            "each raw '\"' should be escaped to '\\\"'; raw={raw_quotes} escaped={escaped_quotes}; \
+             input={name:?} output={escaped:?}"
+        );
+    }
+
+    /// A path containing spaces and a single-quote must produce shell glue that
+    /// keeps the entire value inside one quoted token (no word-splitting).
+    #[test]
+    fn hostile_path_shell_glue_stays_quoted() {
+        // Path with a space and an embedded single-quote (e.g., someone's home dir).
+        let hostile_path = "/home/o'brien/my projects/lazygit.yml";
+
+        // POSIX sh quoting
+        let sh_quoted = sh_quote(hostile_path);
+        // Must start and end with ' and contain no unescaped spaces outside quotes.
+        assert!(
+            sh_quoted.starts_with('\''),
+            "sh_quote must start with '; got: {sh_quoted}"
+        );
+        // The value must not be split: verify by checking the whole glue string
+        // has the path as one token (no whitespace outside quotes in the value).
+        let sh_glue = format!("export LG_CONFIG_FILE={sh_quoted}; exec lazygit");
+        // After `export LG_CONFIG_FILE=` the next token must end at `;`.
+        let after_eq = sh_glue
+            .strip_prefix("export LG_CONFIG_FILE=")
+            .expect("prefix");
+        let token_end = after_eq.find("; exec").expect("semicolon");
+        let token = &after_eq[..token_end];
+        assert!(
+            !token.contains(' ') || token.starts_with('\''),
+            "path token is properly quoted (no bare spaces); got token: {token}"
+        );
+
+        // Fish quoting
+        let fish_quoted = fish_quote(hostile_path);
+        assert!(
+            fish_quoted.starts_with('\''),
+            "fish_quote must start with '; got: {fish_quoted}"
+        );
+        let fish_glue = format!("set -gx LG_CONFIG_FILE {}; exec lazygit", fish_quoted);
+        let after_eq = fish_glue
+            .strip_prefix("set -gx LG_CONFIG_FILE ")
+            .expect("prefix");
+        let token_end = after_eq.find("; exec").expect("semicolon");
+        let token = &after_eq[..token_end];
+        assert!(
+            !token.contains(' ') || token.starts_with('\''),
+            "fish path token is properly quoted; got token: {token}"
+        );
+    }
+
+    /// When the KDL output is generated for a worktree with hostile inputs,
+    /// the raw injection sequence must not appear unescaped anywhere in the KDL.
+    ///
+    /// `wt.name()` = `path.file_name()`, so we put the hostile content in the
+    /// path's last component.  The basename must not contain `/` (which would
+    /// cause `Path::file_name()` to split it).  The parent dir contains a space
+    /// and a single-quote to exercise path and shell escaping.
+    #[test]
+    fn write_multi_tab_layout_hostile_branch_and_path() {
+        let _guard = env_guard();
+        // Basename tries to break out of the KDL tab name= string.
+        // No `/` so Path::file_name() returns the whole string.
+        let hostile_basename = "feat\" focus=true cwd=\"injected";
+        // Full path: parent has a space and a single-quote (exercises cwd= escaping).
+        let hostile_path = format!("/home/o'brien/my projects/{hostile_basename}");
+        let worktrees = vec![make_wt(&hostile_path, "some-branch")];
+        let cfg = dummy_cfg();
+        let layout_path =
+            write_multi_tab_layout(false, &worktrees, "test", &cfg, &dummy_git_dir()).unwrap();
+        let content = std::fs::read_to_string(&layout_path).unwrap();
+        let _ = std::fs::remove_file(&layout_path);
+
+        // The raw injection string must not appear verbatim in the KDL output.
+        assert!(
+            !content.contains("feat\" focus=true cwd=\"injected"),
+            "raw KDL injection sequence must not appear in output; got:\n{content}"
+        );
+        // The escaped form of the basename should appear (\" instead of ").
+        assert!(
+            content.contains(r#"feat\" focus=true cwd=\"injected"#),
+            "escaped basename should appear in tab name; got:\n{content}"
+        );
+        // The cwd attribute must also not contain the raw hostile path verbatim.
+        // (The raw path has unescaped `"` which would break KDL parsing.)
+        assert!(
+            !content.contains(&format!("cwd=\"{hostile_path}\"")),
+            "cwd must be KDL-escaped, not raw; got:\n{content}"
         );
     }
 }
