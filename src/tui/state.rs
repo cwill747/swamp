@@ -143,6 +143,12 @@ pub struct AppState {
     /// every snapshot in that window would see the worktree as tab-less and
     /// open another duplicate tab. See [`super::input::reconcile_tabs`].
     pub recent_tab_opens: HashMap<String, Instant>,
+    /// Worktree names seen in the last reconciled snapshot. `None` until the
+    /// first reconcile. Used to open tabs only for worktrees that *appear*:
+    /// a long-known worktree with no tab means the user closed it, and that
+    /// choice must stick instead of every snapshot resurrecting the tab. See
+    /// [`super::input::reconcile_tabs`].
+    pub known_worktrees: Option<std::collections::HashSet<String>>,
     /// Active footer prompt (create/delete), if any.
     pub input: Option<InputMode>,
     /// Transient one-line status/error shown in the footer.
