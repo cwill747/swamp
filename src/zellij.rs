@@ -75,6 +75,7 @@ pub fn new_session_with_layout(
     nested: bool,
 ) -> Result<()> {
     let layout = layout.to_string_lossy();
+    tracing::info!(session, %layout, nested, "launching zellij session from multi-tab layout");
     let mut cmd = Command::new("zellij");
     cmd.args(["--new-session-with-layout", &layout, "--session", session]);
     if nested {

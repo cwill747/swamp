@@ -228,10 +228,34 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         let d = daemon.clone();
         tokio::spawn(async move {
             if let Err(e) = socket::handle_client(d, stream).await {
-                tracing::debug!("client: {e:?}");
+                // A subscriber pane that goes away mid-broadcast surfaces as
+                // BrokenPipe/ConnectionReset on the next write (resources alone
+                // broadcast at 1Hz). That's expected client churn, not an error
+                // worth logging — keep it at trace so genuine failures stand out.
+                if is_disconnect(&e) {
+                    tracing::trace!("client disconnected: {e:?}");
+                } else {
+                    tracing::debug!("client: {e:?}");
+                }
             }
         });
     }
+}
+
+/// True when an error from a client connection is just a peer that went away —
+/// a closed/half-closed socket rather than a real fault. These are routine
+/// (every pane that closes trips one on the next broadcast) so callers downgrade
+/// the log level instead of treating them as errors.
+fn is_disconnect(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            use std::io::ErrorKind::*;
+            matches!(
+                io.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof | WriteZero
+            )
+        })
+    })
 }
 
 /// Bind the daemon's control socket, record the pid, and kick off the first

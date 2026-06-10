@@ -68,6 +68,12 @@ pub(super) fn write_multi_tab_layout(
     }
     s.push_str("}\n");
     std::fs::write(&tmp, s)?;
+    let tab_names: Vec<String> = worktrees.iter().map(|w| w.name()).collect();
+    tracing::info!(
+        bare,
+        tabs = ?tab_names,
+        "built multi-tab session layout"
+    );
     Ok(tmp)
 }
 

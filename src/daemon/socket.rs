@@ -76,7 +76,13 @@ pub enum ServerMsg {
 
 pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Result<()> {
     let mut rx = daemon.tx.subscribe();
-    // Read initial message.
+    // Only clients that send `Subscribe` want the broadcast stream. Short-lived
+    // clients (the liveness `probe`, `GetVersion`, `Hook`, one-shot `Refresh`)
+    // connect, exchange one request/reply, and close — forwarding broadcasts to
+    // them just races their close and trips a spurious BrokenPipe on the next
+    // 1Hz resource tick. Gate the broadcast arm on having subscribed; we still
+    // drain `rx` so this receiver doesn't pin the channel's ring buffer.
+    let mut subscribed = false;
     loop {
         tokio::select! {
             res = read_msg(&mut stream) => {
@@ -84,6 +90,7 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                 match msg {
                     ClientMsg::Ping => write_msg(&mut stream, &ServerMsg::Pong).await?,
                     ClientMsg::Subscribe => {
+                        subscribed = true;
                         let snap = daemon.state.read().await.snapshot();
                         write_msg(&mut stream, &ServerMsg::Snapshot(snap)).await?;
                         let res = daemon.resources.read().await.clone();
@@ -167,8 +174,11 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                 }
             }
             ev = rx.recv() => {
-                // Err means lagged or closed; keep going
-                if let Ok(m) = ev {
+                // Err means lagged or closed; keep going. Only forward to
+                // clients that asked for the stream — see `subscribed` above.
+                if let Ok(m) = ev
+                    && subscribed
+                {
                     write_msg(&mut stream, &m).await?;
                 }
             }
