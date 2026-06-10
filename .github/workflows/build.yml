@@ -24,12 +24,18 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - uses: cachix/cachix-action@v15
+        if: github.event_name != 'pull_request'
         with:
           name: cwill747-swamp
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build default package
-        run: nix build --print-build-logs .#default
+      - name: Build fast package
+        if: github.event_name == 'pull_request'
+        run: nix build --print-build-logs .#dev
+
+      - name: Build release package
+        if: github.event_name != 'pull_request'
+        run: nix build --print-build-logs .#release
 
   static:
     if: github.event_name != 'pull_request'

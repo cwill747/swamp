@@ -20,6 +20,13 @@ nix build path:.
 ./result/bin/swamp --help
 ```
 
+The default package is a fast local/PR build. Before main-branch cache work or
+release validation, build the optimized release output:
+
+```bash
+nix build path:.#release
+```
+
 Use `path:.` when building from a worktree. In a bare-repo worktree layout, each
 worktree's `.git` is a relative file, not a directory, and Nix may not resolve
 the flake through it without the explicit path.
