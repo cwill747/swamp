@@ -21,10 +21,20 @@ pub fn list_prs_for_branches(
         return Ok(HashMap::new());
     }
 
+    // Deduplicate branches before building queries (safe here; daemon/mod.rs
+    // owns the branch list but dedup at the call site is cheap and correct).
+    let mut deduped: Vec<String> = Vec::with_capacity(branches.len());
+    for b in branches {
+        if !deduped.contains(b) {
+            deduped.push(b.clone());
+        }
+    }
+    let branches = &deduped;
+
     match graphql::list_prs_for_branches(repo_root, branches) {
         Ok(map) => Ok(map),
         Err(e) => {
-            debug!("github:graphql batch failed, falling back to per-branch REST: {e}");
+            debug!("github:graphql batch failed, falling back to per-branch GraphQL: {e}");
             rest::list_prs_for_branches(repo_root, branches)
         }
     }

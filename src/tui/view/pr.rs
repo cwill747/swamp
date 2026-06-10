@@ -4,8 +4,8 @@ use crate::tui::icons;
 use crate::tui::theme::Theme;
 use crate::tui::{AppState, PrHit};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
@@ -18,8 +18,24 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
             " PR & CI Status ",
             Style::default()
                 .fg(Theme::BRANCH)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .add_modifier(Modifier::BOLD),
         ));
+
+    // If there is a fetch error, reserve one line at the bottom of the block
+    // for a dim status line.  We do this regardless of whether there are PRs
+    // to show, so stale data and failures are always surfaced.
+    let has_error = app.pr_snapshot.error.is_some();
+
+    // Split the area only when we actually have an error line to render.
+    let (table_area, error_area) = if has_error && area.height >= 4 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
 
     let mut pr_rows: Vec<(&str, &PrSummary)> = Vec::new();
     for row in &app.snapshot.rows {
@@ -29,11 +45,17 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
     }
 
     if pr_rows.is_empty() {
-        let lines = vec![Line::from(Span::styled(
-            "No PRs for any worktree branch",
-            Theme::muted(),
-        ))];
-        f.render_widget(Paragraph::new(lines).block(block), area);
+        let empty_msg = if has_error && app.pr_snapshot.fetched_at.is_none() {
+            "github unreachable"
+        } else {
+            "No PRs for any worktree branch"
+        };
+        let lines = vec![Line::from(Span::styled(empty_msg, Theme::muted()))];
+        f.render_widget(Paragraph::new(lines).block(block), table_area);
+        // Render error line if present.
+        if let (Some(err_area), Some(err)) = (error_area, &app.pr_snapshot.error) {
+            render_error_line(f, err_area, err, app.pr_snapshot.fetched_at);
+        }
         app.regions.prs = Some((inner, Vec::new()));
         return;
     }
@@ -105,7 +127,12 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
     .block(block)
     .column_spacing(1);
 
-    f.render_widget(table, area);
+    f.render_widget(table, table_area);
+
+    // Render the error/staleness line below the table (inside the outer area).
+    if let (Some(err_area), Some(err)) = (error_area, &app.pr_snapshot.error) {
+        render_error_line(f, err_area, err, app.pr_snapshot.fetched_at);
+    }
 
     // One PrHit per visible row, in the same order as `rows` above.
     let hits: Vec<PrHit> = pr_rows
@@ -117,6 +144,43 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
         .collect();
     drop(pr_rows);
     app.regions.prs = Some((inner, hits));
+}
+
+/// Render a single-line dim error/staleness notice.
+fn render_error_line(f: &mut Frame, area: Rect, err: &str, fetched_at: Option<u64>) {
+    // Truncate the error message so it fits on one line.
+    let short_err = if err.len() > 40 { &err[..40] } else { err };
+
+    let text = if let Some(ts) = fetched_at {
+        let age_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(ts);
+        let age = format_age(age_secs);
+        format!(" github: {short_err} — data as of {age} ago")
+    } else {
+        format!(" github: {short_err}")
+    };
+
+    let line = Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+    ));
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 pub(super) fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {

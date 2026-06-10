@@ -67,12 +67,23 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrSnapshot {
     pub prs: HashMap<String, PrSummary>,
+    /// Unix timestamp (seconds) of the last *successful* PR fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
+    /// Set when the most recent fetch failed; cleared on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
+#[derive(Default)]
 pub struct DaemonState {
     pub rows: HashMap<String, WorktreeRow>,
     pub agents: HashMap<String, AgentRecord>,
     pub prs: HashMap<String, PrSummary>,
+    /// Unix timestamp of the last successful PR fetch (mirrors `PrSnapshot::fetched_at`).
+    pr_fetched_at: Option<u64>,
+    /// Last PR fetch error, if any (mirrors `PrSnapshot::error`).
+    pr_error: Option<String>,
 }
 
 impl DaemonState {
@@ -86,6 +97,8 @@ impl DaemonState {
             rows: HashMap::new(),
             agents,
             prs: HashMap::new(),
+            pr_fetched_at: None,
+            pr_error: None,
         })
     }
 
@@ -201,13 +214,35 @@ impl DaemonState {
         Snapshot { rows }
     }
 
+    /// Record a successful PR fetch.
+    ///
+    /// Replaces the PR map, records `fetched_at`, and clears any previous
+    /// error.  The daemon's PR poller calls this on the `Ok(Ok(prs))` arm.
     pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>) {
         self.prs = prs;
+        self.pr_fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        self.pr_error = None;
+    }
+
+    /// Record a PR fetch failure.
+    ///
+    /// Keeps the existing `self.prs` map so the TUI continues to display
+    /// stale-but-valid data.  Sets `pr_error` for display in the PR view.
+    /// The daemon's PR poller calls this on the `Ok(Err(e))` arm.
+    pub fn record_pr_error(&mut self, error: String) {
+        // Intentionally does NOT clear `self.prs`.
+        tracing::warn!(error = %error, "github PR fetch failed; keeping previous state");
+        self.pr_error = Some(error);
     }
 
     pub fn pr_snapshot(&self) -> PrSnapshot {
         PrSnapshot {
             prs: self.prs.clone(),
+            fetched_at: self.pr_fetched_at,
+            error: self.pr_error.clone(),
         }
     }
 }
@@ -282,11 +317,7 @@ mod tests {
     /// With equal head_ts, snapshot falls back to alphabetical name order.
     #[test]
     fn snapshot_rows_sorted_by_name_when_same_ts() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
         state.rows.insert("zebra".into(), make_row("zebra"));
         state.rows.insert("alpha".into(), make_row("alpha"));
         state.rows.insert("main".into(), make_row("main"));
@@ -300,11 +331,7 @@ mod tests {
     /// snapshot() sorts by head_ts descending (most recently updated first).
     #[test]
     fn snapshot_rows_sorted_by_head_ts_descending() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
         state
             .rows
             .insert("old".into(), make_row_with_ts("old", 100));
@@ -324,11 +351,7 @@ mod tests {
     /// next snapshot reflects it — the row must not disappear from the snapshot.
     #[test]
     fn apply_hook_updates_existing_row() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
         state.rows.insert("main".into(), make_row("main"));
 
         state.apply_hook("main", "working", None, None).unwrap();
@@ -341,11 +364,7 @@ mod tests {
     /// record is stored) but the snapshot rows must remain unchanged.
     #[test]
     fn apply_hook_unknown_worktree_is_ignored_in_rows() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
         state.rows.insert("main".into(), make_row("main"));
 
         // "ghost" does not exist in rows; apply_hook must not crash.
@@ -362,11 +381,7 @@ mod tests {
     /// the id we need to resume the session (#33).
     #[test]
     fn apply_hook_records_and_preserves_session_id() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
 
         state
             .apply_hook("main", "working", None, Some("abc-123"))
@@ -436,11 +451,7 @@ mod tests {
     /// status hook that doesn't mention the harness.
     #[test]
     fn set_harness_records_and_survives_hooks() {
-        let mut state = DaemonState {
-            rows: HashMap::new(),
-            agents: HashMap::new(),
-            prs: HashMap::new(),
-        };
+        let mut state = DaemonState::default();
         state.rows.insert("main".into(), make_row("main"));
 
         state.set_harness("main", Harness::Codex);
@@ -459,5 +470,86 @@ mod tests {
             state.agents.get("main").unwrap().harness,
             Some(Harness::Codex)
         );
+    }
+
+    fn make_pr(number: u32) -> PrSummary {
+        PrSummary {
+            number,
+            title: format!("PR {number}"),
+            state: "OPEN".into(),
+            is_draft: false,
+            checks: None,
+            check_meta: None,
+            url: None,
+            review: None,
+        }
+    }
+
+    /// A successful fetch replaces the PR map and clears any prior error.
+    #[test]
+    fn update_prs_success_replaces_and_clears_error() {
+        let mut state = DaemonState::default();
+        // Seed an error state by calling record_pr_error directly.
+        state.record_pr_error("old error".into());
+
+        let mut prs = HashMap::new();
+        prs.insert("feat".into(), make_pr(42));
+        state.update_prs(prs);
+
+        assert_eq!(state.prs.len(), 1);
+        assert!(state.pr_error.is_none());
+        assert!(state.pr_fetched_at.is_some());
+
+        let snap = state.pr_snapshot();
+        assert_eq!(snap.prs.len(), 1);
+        assert!(snap.error.is_none());
+        assert!(snap.fetched_at.is_some());
+    }
+
+    /// A PR fetch error keeps the previous map and records the error message.
+    #[test]
+    fn record_pr_error_preserves_previous_map() {
+        let mut state = DaemonState::default();
+
+        // Seed a successful fetch first.
+        let mut prs = HashMap::new();
+        prs.insert("feat".into(), make_pr(7));
+        state.update_prs(prs);
+        assert!(state.pr_fetched_at.is_some());
+
+        // Now a transient failure must NOT wipe the map.
+        state.record_pr_error("network timeout".into());
+        assert_eq!(state.prs.len(), 1, "previous PR map must be preserved");
+        assert_eq!(state.pr_error.as_deref(), Some("network timeout"));
+
+        let snap = state.pr_snapshot();
+        assert_eq!(snap.prs.len(), 1);
+        assert_eq!(snap.error.as_deref(), Some("network timeout"));
+        // fetched_at from the prior success is still present.
+        assert!(snap.fetched_at.is_some());
+    }
+
+    /// A failure before any successful fetch records an empty map and an error.
+    #[test]
+    fn record_pr_error_on_empty_state() {
+        let mut state = DaemonState::default();
+        state.record_pr_error("gh not found".into());
+
+        assert!(state.prs.is_empty());
+        assert_eq!(state.pr_error.as_deref(), Some("gh not found"));
+        assert!(state.pr_fetched_at.is_none());
+    }
+
+    /// A successful fetch after a recorded error clears the error.
+    #[test]
+    fn update_prs_after_error_clears_it() {
+        let mut state = DaemonState::default();
+        state.record_pr_error("transient".into());
+        assert!(state.pr_error.is_some());
+
+        let mut prs = HashMap::new();
+        prs.insert("main".into(), make_pr(1));
+        state.update_prs(prs);
+        assert!(state.pr_error.is_none());
     }
 }
