@@ -3,7 +3,6 @@ use crate::daemon::resources;
 use crate::daemon::state::{PrSnapshot, Snapshot};
 use crate::worktree::BranchInfo;
 use ratatui::layout::Rect;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -139,20 +138,6 @@ pub struct AppState {
     pub pending_delete: Option<String>,
     pub pending_create: Option<String>,
     pub connected: bool,
-    /// Worktree name -> last time swamp issued a `new-tab` for it. `zellij
-    /// action new-tab` returns before the tab is visible to `query-tab-names`,
-    /// and worktree creation emits a burst of filesystem events the daemon
-    /// debounces into several snapshots. Without remembering in-flight opens,
-    /// every snapshot in that window would see the worktree as tab-less and
-    /// open another duplicate tab. See [`super::input::reconcile_tabs`].
-    pub recent_tab_opens: HashMap<String, Instant>,
-    pub managed_tabs: std::collections::HashSet<String>,
-    /// Worktree names seen in the last reconciled snapshot. `None` until the
-    /// first reconcile. Used to open tabs only for worktrees that *appear*:
-    /// a long-known worktree with no tab means the user closed it, and that
-    /// choice must stick instead of every snapshot resurrecting the tab. See
-    /// [`super::input::reconcile_tabs`].
-    pub known_worktrees: Option<std::collections::HashSet<String>>,
     /// Active footer prompt (create/delete), if any.
     pub input: Option<InputMode>,
     /// Transient one-line status/error shown in the footer.

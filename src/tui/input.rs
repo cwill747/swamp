@@ -2,15 +2,13 @@ use super::client::send_action;
 use super::event::AppEvent;
 use super::state::{AppState, CreateAction, CreateEntry, CreateStep, InputMode};
 use super::view;
-use crate::cli::TuiView;
 use crate::config::Harness;
 use crate::daemon::socket::ClientMsg;
 use crate::worktree::worktree_name_for_branch;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -46,14 +44,6 @@ fn is_double_click(app: &mut AppState, col: u16, row: u16) -> bool {
     dbl
 }
 
-pub(super) fn spawn_go_to_tab(tx: mpsc::Sender<AppEvent>, name: String) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = zellij::go_to_tab_name(&name) {
-            let _ = tx.blocking_send(AppEvent::ZellijError(format!("zellij jump failed: {e}")));
-        }
-    });
-}
-
 pub(super) fn spawn_close_tab(tx: mpsc::Sender<AppEvent>, name: String) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = zellij::close_tab_by_name(&name) {
@@ -62,20 +52,47 @@ pub(super) fn spawn_close_tab(tx: mpsc::Sender<AppEvent>, name: String) {
     });
 }
 
-pub(super) fn request_reconcile_tabs(tx: mpsc::Sender<AppEvent>, full: bool) {
+/// Open the worktree's zellij tab if it doesn't exist yet, then switch to it.
+///
+/// This is the only path that opens worktree tabs: tab pinning is gone, so a
+/// worktree gets a tab only when the user activates it (Enter / double-click)
+/// or when swamp itself just created the worktree. Querying `query-tab-names`
+/// first makes activation idempotent — an existing tab is switched to rather
+/// than duplicated. If tab names can't be queried the tab state is unknown, so
+/// we do nothing rather than blind-open a possible duplicate. Outside zellij
+/// there's no session to act on.
+pub(super) fn activate_worktree_tab(tx: mpsc::Sender<AppEvent>, path: PathBuf, name: String) {
     if !zellij::in_zellij() {
         return;
     }
     tokio::task::spawn_blocking(move || {
-        let tabs = zellij::list_tab_names().map_err(|e| e.to_string());
-        let _ = tx.blocking_send(AppEvent::TabsListed { full, tabs });
+        let tabs = match zellij::list_tab_names() {
+            Ok(tabs) => tabs,
+            Err(e) => {
+                // Unknown tab state: don't open, just surface the failure.
+                tracing::debug!(worktree = %name, "tab query unavailable: {e}");
+                return;
+            }
+        };
+        if !tabs.iter().any(|t| t == &name) {
+            tracing::info!(worktree = %name, "opening worktree tab on demand");
+            if let Err(e) = crate::launch::open_worktree_tab(&path, &name) {
+                let _ = tx.blocking_send(AppEvent::ZellijError(format!(
+                    "open worktree tab failed: {e}"
+                )));
+                return;
+            }
+        }
+        if let Err(e) = zellij::go_to_tab_name(&name) {
+            let _ = tx.blocking_send(AppEvent::ZellijError(format!("zellij jump failed: {e}")));
+        }
     });
 }
 
-/// Jump the zellij session to the tab for the worktree at `idx`.
+/// Open (if needed) and switch to the tab for the worktree at `idx`.
 fn jump_to_worktree(app: &AppState, tx: mpsc::Sender<AppEvent>, idx: usize) {
     if let Some(r) = app.snapshot.rows.get(idx) {
-        spawn_go_to_tab(tx, r.name.clone());
+        activate_worktree_tab(tx, r.path.clone(), r.name.clone());
     }
 }
 
@@ -396,131 +413,6 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
     }
 }
 
-/// Create zellij tabs for worktrees that newly appeared in the snapshot.
-///
-/// Swamp opens the requested target tab itself when *it* creates a worktree
-/// (the `pending_create` path), but a worktree born outside swamp — `git
-/// worktree add` in another terminal, an agent spinning one up — only shows up
-/// in the daemon snapshot. It lists in the dashboard, yet double-clicking it
-/// can't focus anything because no tab exists. Reconcile fills that gap.
-///
-/// Eligibility is *appearance*, not absence: a tab is opened for a worktree
-/// only when its name wasn't in the previously reconciled snapshot (or on the
-/// first reconcile after startup, when everything is new to us). A long-known
-/// worktree with no tab means the user closed it — treating "no tab" itself as
-/// the trigger meant every snapshot broadcast (one per agent hook ping)
-/// resurrected tabs the user had just closed. `full` restores the
-/// open-anything-missing behavior for the manual refresh key, the deliberate
-/// "put my session back together" gesture.
-///
-/// Only the dashboard's worktrees pane runs this: it's the single instance with
-/// `view == Worktrees && !pin_cwd`, so the several swamp panes (one per worktree
-/// tab, plus the dashboard's other views) don't race to create duplicate tabs.
-/// `query-tab-names` is the dedupe — a worktree that already has a tab is
-/// skipped, which also makes the first post-launch snapshot a no-op.
-///
-/// Bail unless we're inside a zellij session: `query-tab-names` has no session
-/// to query when `swamp tui` is run bare in a terminal. A failed tab query must
-/// be treated as "unknown", not "empty", because an empty tab set reads as
-/// "every worktree is missing a tab" and would spawn a duplicate `new-tab` per
-/// row. The known-set is only advanced on a successful query, so an appearance
-/// missed during a failed query is retried on the next snapshot.
-pub(super) fn reconcile_tabs(app: &mut AppState, tabs: &[String], full: bool) {
-    if app.view != TuiView::Worktrees || app.pin_cwd {
-        return;
-    }
-    // A tab we previously issued has now surfaced in zellij's list — clear its
-    // open-claim. This is what ends the suppression window: instead of guessing
-    // how long zellij takes to register a tab (a flat timer that this monorepo's
-    // ~5s git-refresh cadence raced straight past), we hold the claim until we
-    // actually observe the tab, then release it. A later same-name worktree can
-    // then reopen cleanly.
-    app.recent_tab_opens
-        .retain(|name, _| !tabs.iter().any(|t| t == name));
-    for row in &app.snapshot.rows {
-        if tabs.iter().any(|t| t == &row.name) {
-            app.managed_tabs.insert(row.name.clone());
-        }
-    }
-    let names: HashSet<String> = app
-        .snapshot
-        .rows
-        .iter()
-        .map(|row| row.name.clone())
-        .collect();
-    let eligible = eligible_for_open(app.known_worktrees.as_ref(), &names, full);
-    app.known_worktrees = Some(names);
-    // Collect first: opening a tab mutates `recent_tab_opens`, which can't
-    // alias the `snapshot.rows` borrow held by the loop.
-    let missing: Vec<(PathBuf, String)> = app
-        .snapshot
-        .rows
-        .iter()
-        .filter(|row| eligible.contains(&row.name) && !tabs.iter().any(|t| t == &row.name))
-        .map(|row| (row.path.clone(), row.name.clone()))
-        .collect();
-    if !missing.is_empty() {
-        // Log both sides so a spurious "missing" (a tab that exists but isn't
-        // yet visible to `query-tab-names`) is distinguishable from a genuinely
-        // absent tab when diagnosing duplicate-tab reports.
-        let missing_names: Vec<&str> = missing.iter().map(|(_, n)| n.as_str()).collect();
-        tracing::debug!(?tabs, missing = ?missing_names, full, "reconcile: opening tabs for new worktrees");
-    }
-    for (path, name) in missing {
-        open_worktree_tab_debounced(app, &path, &name);
-    }
-}
-
-/// Which worktree names may get a tab this round: everything on the first
-/// reconcile (`prev` is `None`) or when a full reconcile was requested,
-/// otherwise only names absent from the previous round. A name that vanishes
-/// and returns (worktree deleted then recreated) counts as new again because
-/// the caller replaces the known-set with `current` every round.
-fn eligible_for_open(
-    prev: Option<&HashSet<String>>,
-    current: &HashSet<String>,
-    full: bool,
-) -> HashSet<String> {
-    match prev {
-        Some(prev) if !full => current.difference(prev).cloned().collect(),
-        _ => current.clone(),
-    }
-}
-
-/// Failsafe lifetime of an open-claim. A claim is normally cleared the moment
-/// [`reconcile_tabs`] sees the tab appear in `query-tab-names`; this bound only
-/// matters when an open *failed* (the tab never appears) — after it elapses we
-/// allow a retry rather than suppressing forever. It must comfortably exceed the
-/// worst-case `new-tab` → tab-registered latency, so it is intentionally far
-/// longer than any single snapshot interval.
-const TAB_OPEN_FAILSAFE: Duration = Duration::from_secs(30);
-
-/// Open a worktree tab unless we already have an outstanding open-claim for the
-/// same name. Both the targeted `pending_create` path and [`reconcile_tabs`]
-/// route through here. A claim is held until [`reconcile_tabs`] observes the tab
-/// in zellij's list (the normal release) or [`TAB_OPEN_FAILSAFE`] elapses (the
-/// failed-open retry), so the freshly-opened tab is never reopened by the
-/// snapshots that arrive before zellij registers it.
-pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name: &str) {
-    let now = Instant::now();
-    app.recent_tab_opens
-        .retain(|_, t| now.duration_since(*t) < TAB_OPEN_FAILSAFE);
-    if app.recent_tab_opens.contains_key(name) {
-        tracing::debug!(worktree = %name, "tab open suppressed (claim outstanding)");
-        return;
-    }
-    app.recent_tab_opens.insert(name.to_string(), now);
-    app.managed_tabs.insert(name.to_string());
-    tracing::info!(worktree = %name, "opening worktree tab");
-    let path = path.to_path_buf();
-    let name = name.to_string();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::launch::open_worktree_tab(&path, &name) {
-            tracing::warn!(worktree = %name, "open worktree tab failed: {e}");
-        }
-    });
-}
-
 /// Fire a worktree-create request and arm the pending-create tracking so only
 /// that target's tab opens when the next snapshot arrives. Leaves `app.input`
 /// closed.
@@ -595,58 +487,6 @@ mod tests {
         assert!(!point_in(r, 6, 4)); // one past width
         assert!(!point_in(r, 5, 5)); // one past height
         assert!(!point_in(r, 1, 3)); // left of region
-    }
-
-    fn names(items: &[&str]) -> HashSet<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Tab opens are driven by worktree *appearance*: everything qualifies on
-    /// the first round, only additions afterwards, and `full` (manual refresh)
-    /// re-qualifies everything. A worktree that disappears and returns is an
-    /// appearance again.
-    #[test]
-    fn eligible_for_open_tracks_appearances() {
-        // First reconcile: no previous set, everything is new.
-        assert_eq!(
-            eligible_for_open(None, &names(&["main", "feat"]), false),
-            names(&["main", "feat"])
-        );
-        // Steady state: nothing new, nothing eligible — a closed tab for a
-        // known worktree must NOT be resurrected by the next snapshot.
-        assert_eq!(
-            eligible_for_open(
-                Some(&names(&["main", "feat"])),
-                &names(&["main", "feat"]),
-                false
-            ),
-            names(&[])
-        );
-        // Only the addition qualifies.
-        assert_eq!(
-            eligible_for_open(Some(&names(&["main"])), &names(&["main", "feat"]), false),
-            names(&["feat"])
-        );
-        // Removals alone qualify nothing.
-        assert_eq!(
-            eligible_for_open(Some(&names(&["main", "feat"])), &names(&["main"]), false),
-            names(&[])
-        );
-        // Full reconcile (manual refresh) re-qualifies everything known.
-        assert_eq!(
-            eligible_for_open(
-                Some(&names(&["main", "feat"])),
-                &names(&["main", "feat"]),
-                true
-            ),
-            names(&["main", "feat"])
-        );
-        // Deleted-then-recreated: the caller replaced the known-set with the
-        // post-deletion set, so the name's return is an appearance.
-        assert_eq!(
-            eligible_for_open(Some(&names(&["main"])), &names(&["main", "feat"]), false),
-            names(&["feat"])
-        );
     }
 
     #[test]

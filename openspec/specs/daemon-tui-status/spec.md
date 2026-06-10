@@ -3,7 +3,7 @@
 ## Purpose
 
 Describe swamp's per-repository daemon, client protocol, live TUI behavior,
-resource reporting, tab reconciliation, and session shutdown behavior.
+resource reporting, on-demand worktree tab opening, and session shutdown behavior.
 
 ## Requirements
 
@@ -103,25 +103,25 @@ The TUI SHALL support keyboard and mouse workflows for selection movement, tab s
 - **WHEN** the daemon refuses deletion because a worktree is dirty
 - **THEN** the TUI reopens the delete confirmation as a force-delete prompt
 
-### Requirement: Tab Reconciliation
-The dashboard TUI SHALL reconcile missing Zellij tabs for externally-created worktrees when running inside Zellij and SHALL apply a duplicate-open cooldown.
+### Requirement: On-Demand Worktree Tab Opening
+The dashboard TUI SHALL open a worktree's Zellij tab only in response to explicit user activation of that worktree, and SHALL NOT open worktree tabs in response to daemon snapshot updates. When the worktree already has a tab, activation SHALL switch to the existing tab rather than open a duplicate.
 
-#### Scenario: New worktree appears
-- **WHEN** a new worktree appears in daemon snapshots while the dashboard is running inside Zellij
-- **THEN** the TUI opens a matching worktree tab
+#### Scenario: User activates a worktree without a tab
+- **WHEN** the user activates a worktree in the dashboard while running inside Zellij
+- **AND** no tab currently exists for that worktree
+- **THEN** the TUI opens a worktree tab for it and switches focus to it
 
-#### Scenario: Duplicate reconciliation
-- **WHEN** a tab was opened recently for the same worktree
-- **THEN** the TUI suppresses duplicate opens during the cooldown window
+#### Scenario: User activates a worktree that already has a tab
+- **WHEN** the user activates a worktree whose tab already exists
+- **THEN** the TUI switches to the existing tab instead of opening a duplicate
+
+#### Scenario: New worktree appears without user action
+- **WHEN** a new worktree appears in daemon snapshots and the user has not activated it
+- **THEN** the TUI does not open a tab for it
 
 #### Scenario: Outside Zellij
 - **WHEN** the TUI is not running inside Zellij
-- **THEN** tab reconciliation does not attempt to open Zellij tabs
-
-#### Scenario: Tab query unavailable
-- **WHEN** the dashboard TUI cannot query the current Zellij tab names
-- **THEN** tab reconciliation treats tab state as unknown
-- **AND** it does not open replacement worktree tabs
+- **THEN** worktree activation does not attempt to open Zellij tabs
 
 ### Requirement: Resource Reporting
 The daemon SHALL sample Zellij-session process descendants, aggregate CPU, RSS, elapsed time, system load, and memory, and broadcast resource snapshots.

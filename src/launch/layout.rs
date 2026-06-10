@@ -1,5 +1,5 @@
-use crate::config::{ConfigPaths, Harness, resolve_harness};
-use crate::worktree::{Worktree, find_default_worktree, git_common_dir};
+use crate::config::{ConfigPaths, Harness};
+use crate::worktree::{Worktree, find_default_worktree};
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -75,7 +75,6 @@ fn fish_quote(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub(super) fn write_multi_tab_layout(
-    bare: bool,
     worktrees: &[Worktree],
     _session: &str,
     cfg: &ConfigPaths,
@@ -98,51 +97,20 @@ pub(super) fn write_multi_tab_layout(
     s.push_str("    }\n");
     s.push_str("  }\n");
 
-    if bare {
-        s.push_str(&format!(
-            "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
-            kdl_escape(&session_cwd(worktrees, git_dir)),
-        ));
-        push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
-        s.push_str("  }\n");
-    }
-
-    // Resume map: worktree name → recorded Claude session id. A worktree that
-    // still exists and had an active session gets its Claude pane launched with
-    // `claude --resume <id>` so a swamp restart picks the conversation back up
-    // (#33).
-    let common = git_common_dir(git_dir).ok();
-    let session_ids = common
-        .as_deref()
-        .map(super::load_session_ids)
-        .unwrap_or_default();
-    // Per-worktree harness overrides, honored when the repo setting is `choose`.
-    let harness_overrides = common
-        .as_deref()
-        .map(super::load_harness_overrides)
-        .unwrap_or_default();
-
-    for (i, wt) in worktrees.iter().enumerate() {
-        let focus = if !bare && i == 0 { " focus=true" } else { "" };
-        s.push_str(&format!(
-            "  tab name=\"{}\"{} cwd=\"{}\" {{\n",
-            kdl_escape(&wt.name()),
-            focus,
-            kdl_escape(&wt.path.display().to_string())
-        ));
-        let resume = session_ids.get(&wt.name()).map(|s| s.as_str());
-        let harness = resolve_harness(cfg.harness, harness_overrides.get(&wt.name()).copied());
-        push_worktree_panes(&mut s, cfg, &swamp_bin, nix, resume, harness);
-        s.push_str("  }\n");
-    }
+    // A new session opens to a single focused dashboard tab — for bare and
+    // normal repos alike. Worktree tabs are no longer pre-created per worktree;
+    // the user opens them on demand from the dashboard (see
+    // `crate::launch::open_worktree_tab`), so the tab count is independent of
+    // the worktree count.
+    s.push_str(&format!(
+        "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
+        kdl_escape(&session_cwd(worktrees, git_dir)),
+    ));
+    push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
+    s.push_str("  }\n");
     s.push_str("}\n");
     let tmp = TempLayout::create("layout", &s)?;
-    let tab_names: Vec<String> = worktrees.iter().map(|w| w.name()).collect();
-    tracing::info!(
-        bare,
-        tabs = ?tab_names,
-        "built multi-tab session layout"
-    );
+    tracing::info!("built single dashboard-tab session layout");
     Ok(tmp)
 }
 
@@ -155,7 +123,11 @@ fn session_cwd(worktrees: &[Worktree], git_dir: &Path) -> String {
 /// Generate a single-tab worktree layout for `zellij action new-tab`. Mirrors
 /// the externally-installed `swamp` layout we used to depend on, but built from
 /// the `$SHELL`-aware `push_worktree_panes` so it works for non-fish users.
-pub(super) fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Result<TempLayout> {
+pub(super) fn write_worktree_layout(
+    cfg: &ConfigPaths,
+    harness: Harness,
+    resume_session: Option<&str>,
+) -> Result<TempLayout> {
     let swamp_bin = std::env::current_exe()
         .context("resolve current executable")?
         .display()
@@ -177,8 +149,16 @@ pub(super) fn write_worktree_layout(cfg: &ConfigPaths, harness: Harness) -> Resu
     s.push_str("    }\n");
     s.push_str("  }\n");
     s.push_str("  tab {\n");
-    // A freshly-opened worktree tab has no prior session to resume.
-    push_worktree_panes(&mut s, cfg, &swamp_bin, nix_available(), None, harness);
+    // An on-demand worktree tab resumes its recorded Claude session when one
+    // exists (`claude --resume <id>`), else starts the agent fresh.
+    push_worktree_panes(
+        &mut s,
+        cfg,
+        &swamp_bin,
+        nix_available(),
+        resume_session,
+        harness,
+    );
     s.push_str("  }\n");
     s.push_str("}\n");
     TempLayout::create("worktree", &s)
@@ -542,7 +522,7 @@ mod tests {
         ];
         let cfg = dummy_cfg();
         let layout_path =
-            write_multi_tab_layout(true, &worktrees, "talks", &cfg, &dummy_git_dir()).unwrap();
+            write_multi_tab_layout(&worktrees, "talks", &cfg, &dummy_git_dir()).unwrap();
         let content = std::fs::read_to_string(&layout_path).unwrap();
         let _ = std::fs::remove_file(&layout_path);
 
@@ -568,16 +548,52 @@ mod tests {
             !content.contains("command=\"swamp\""),
             "layout should use resolved binary path, not bare 'swamp'; got:\n{content}"
         );
-        // Worktree-tab panes pin their cwd; the dashboard worktrees pane does not.
+        // No worktree tabs are pre-created at launch, so nothing passes
+        // --pin-cwd (only worktree-tab panes ever do).
         assert!(
-            content.contains("\"--view\" \"worktrees\" \"--pin-cwd\""),
-            "worktree-tab pane should pass --pin-cwd; got:\n{content}"
+            !content.contains("--pin-cwd"),
+            "launch layout must not pre-create pinned worktree tabs; got:\n{content}"
         );
+        // Exactly one tab — the dashboard — regardless of worktree count.
         assert_eq!(
-            content.matches("--pin-cwd").count(),
-            worktrees.len(),
-            "exactly one --pin-cwd per worktree tab (none on dashboard); got:\n{content}"
+            content.matches("  tab name=").count(),
+            1,
+            "launch layout should contain only the dashboard tab; got:\n{content}"
         );
+        assert!(
+            content.contains("tab name=\"dashboard\""),
+            "the sole tab should be the dashboard; got:\n{content}"
+        );
+    }
+
+    /// The launch layout is dashboard-only: the tab count does not track the
+    /// worktree count, and worktree names never appear as tabs.
+    #[test]
+    fn multi_tab_layout_is_single_dashboard_tab_for_many_worktrees() {
+        let _guard = env_guard();
+        let worktrees = vec![
+            make_wt("/repo/talks/main", "main"),
+            make_wt("/repo/talks/foo", "foo"),
+            make_wt("/repo/talks/bar", "bar"),
+            make_wt("/repo/talks/baz", "baz"),
+        ];
+        let cfg = dummy_cfg();
+        let layout_path =
+            write_multi_tab_layout(&worktrees, "talks", &cfg, &dummy_git_dir()).unwrap();
+        let content = std::fs::read_to_string(&layout_path).unwrap();
+        let _ = std::fs::remove_file(&layout_path);
+
+        assert_eq!(
+            content.matches("  tab name=").count(),
+            1,
+            "only the dashboard tab regardless of worktree count; got:\n{content}"
+        );
+        for wt in &["foo", "bar", "baz"] {
+            assert!(
+                !content.contains(&format!("tab name=\"{wt}\"")),
+                "worktree {wt} must not get its own tab at launch; got:\n{content}"
+            );
+        }
     }
 
     #[test]
@@ -929,25 +945,23 @@ mod tests {
         );
     }
 
-    /// When the KDL output is generated for a worktree with hostile inputs,
-    /// the raw injection sequence must not appear unescaped anywhere in the KDL.
-    ///
-    /// `wt.name()` = `path.file_name()`, so we put the hostile content in the
-    /// path's last component.  The basename must not contain `/` (which would
-    /// cause `Path::file_name()` to split it).  The parent dir contains a space
-    /// and a single-quote to exercise path and shell escaping.
+    /// The dashboard tab's `cwd` comes from the default worktree's path, so a
+    /// hostile path must be KDL-escaped rather than appearing raw (which would
+    /// let `"` terminate the string early and inject KDL nodes).
     #[test]
-    fn write_multi_tab_layout_hostile_branch_and_path() {
+    fn write_multi_tab_layout_hostile_dashboard_cwd() {
         let _guard = env_guard();
-        // Basename tries to break out of the KDL tab name= string.
-        // No `/` so Path::file_name() returns the whole string.
+        // A basename that tries to break out of the KDL cwd= string. No `/` so
+        // Path::file_name() returns the whole string. The parent dir adds a
+        // space and a single-quote to exercise the rest of the path.
         let hostile_basename = "feat\" focus=true cwd=\"injected";
-        // Full path: parent has a space and a single-quote (exercises cwd= escaping).
         let hostile_path = format!("/home/o'brien/my projects/{hostile_basename}");
+        // Single worktree → session_cwd falls back to it, so it becomes the
+        // dashboard cwd.
         let worktrees = vec![make_wt(&hostile_path, "some-branch")];
         let cfg = dummy_cfg();
         let layout_path =
-            write_multi_tab_layout(false, &worktrees, "test", &cfg, &dummy_git_dir()).unwrap();
+            write_multi_tab_layout(&worktrees, "test", &cfg, &dummy_git_dir()).unwrap();
         let content = std::fs::read_to_string(&layout_path).unwrap();
         let _ = std::fs::remove_file(&layout_path);
 
@@ -956,13 +970,12 @@ mod tests {
             !content.contains("feat\" focus=true cwd=\"injected"),
             "raw KDL injection sequence must not appear in output; got:\n{content}"
         );
-        // The escaped form of the basename should appear (\" instead of ").
+        // The escaped form of the hostile path should appear in the cwd (\").
         assert!(
             content.contains(r#"feat\" focus=true cwd=\"injected"#),
-            "escaped basename should appear in tab name; got:\n{content}"
+            "escaped hostile path should appear in dashboard cwd; got:\n{content}"
         );
-        // The cwd attribute must also not contain the raw hostile path verbatim.
-        // (The raw path has unescaped `"` which would break KDL parsing.)
+        // The cwd attribute must not contain the raw hostile path verbatim.
         assert!(
             !content.contains(&format!("cwd=\"{hostile_path}\"")),
             "cwd must be KDL-escaped, not raw; got:\n{content}"

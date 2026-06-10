@@ -24,7 +24,7 @@ pub use model::{
     worktree_name_for_branch,
 };
 pub use remove::remove_worktree;
-pub use repo::{git_common_dir, is_bare, resolve_git_dir};
+pub use repo::{git_common_dir, resolve_git_dir};
 pub use status::git_info;
 
 #[cfg(test)]

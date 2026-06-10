@@ -15,9 +15,10 @@
 
 ---
 
-swamp turns a git repo into a [Zellij](https://zellij.dev) session with one tab
-per worktree, a live status TUI, and per-worktree agent status reporting. It is
-built for parallel AI-agent workflows: every worktree gets its own tab with
+swamp turns a git repo into a [Zellij](https://zellij.dev) session: a dashboard
+tab listing every worktree, a live status TUI, and per-worktree agent status
+reporting. It is built for parallel AI-agent workflows — open a worktree's tab
+on demand from the dashboard and it comes up with
 [lazygit](https://github.com/jesseduffield/lazygit), an agent pane, a shell, and
 a status sidebar.
 
@@ -84,9 +85,11 @@ swamp
 swamp lists the repo's worktrees, generates a Zellij layout, and attaches to a
 session named after the repo. The session name is `{repo-basename}-{4-hex}`
 (e.g. `myrepo-3b8b`) so two repos with the same directory name but different
-paths get distinct sessions. In a bare clone, the first tab is a dashboard and
-the remaining tabs are worktrees. In a normal repo, the worktree layout opens
-directly.
+paths get distinct sessions. A new session opens to a single dashboard tab — for
+bare clones and normal repos alike. The dashboard lists every worktree; open a
+worktree's own tab on demand (`Enter` or double-click), and swamp switches to it
+if it is already open. The tab count is no longer tied to the worktree count,
+and tabs you open stay part of the Zellij session across detach/reattach.
 
 If you are already inside Zellij, `swamp` adds tabs to the current session
 instead of starting a new one.
@@ -142,7 +145,7 @@ Useful keys:
 | --------- | ----------------------------------- |
 | `j` / `↓` | Move selection down                 |
 | `k` / `↑` | Move selection up                   |
-| `Enter`   | Switch to the selected worktree tab |
+| `Enter`   | Open or switch to the selected worktree tab |
 | `c`       | Create a worktree                   |
 | `d`       | Delete a worktree                   |
 | `h`       | Choose Claude or Codex harness      |
