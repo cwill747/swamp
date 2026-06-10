@@ -1,4 +1,4 @@
-use crate::worktree::branches::default_branch_name;
+use crate::worktree::branches::{default_branch_name, default_remote};
 use crate::worktree::model::{Worktree, worktree_name_for_branch};
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository, WorktreeAddOptions};
@@ -30,6 +30,14 @@ fn find_remote_tracking_branch(
     repo: &Repository,
     branch_name: &str,
 ) -> Option<(String, git2::Oid)> {
+    let preferred = default_remote(repo);
+    if let Some(remote) = preferred.as_deref()
+        && let Some(oid) = remote_tracking_branch_oid(repo, remote, branch_name)
+    {
+        return Some((remote.to_string(), oid));
+    }
+
+    let mut match_: Option<(String, git2::Oid)> = None;
     for entry in repo.branches(Some(BranchType::Remote)).ok()?.flatten() {
         let (branch, _) = entry;
         if let Ok(Some(full)) = branch.name()
@@ -37,10 +45,23 @@ fn find_remote_tracking_branch(
             && name == branch_name
             && let Some(oid) = branch.get().target()
         {
-            return Some((remote.to_string(), oid));
+            if match_.is_some() {
+                return None;
+            }
+            match_ = Some((remote.to_string(), oid));
         }
     }
-    None
+    match_
+}
+
+fn remote_tracking_branch_oid(
+    repo: &Repository,
+    remote: &str,
+    branch_name: &str,
+) -> Option<git2::Oid> {
+    repo.find_branch(&format!("{remote}/{branch_name}"), BranchType::Remote)
+        .ok()
+        .and_then(|b| b.get().target())
 }
 
 /// Create a worktree for `branch` under the repo's worktree root.
@@ -67,16 +88,12 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
                 let _ = local.set_upstream(Some(&format!("{remote}/{branch}")));
                 (local.into_reference(), Some(remote))
             } else {
-                let name = default_branch_name(&repo).unwrap_or_else(|| "main".into());
-                let base = repo
-                    .find_branch(&name, BranchType::Local)
-                    .map(git2::Branch::into_reference)
-                    .or_else(|_| {
-                        repo.find_branch(&format!("origin/{name}"), BranchType::Remote)
-                            .map(git2::Branch::into_reference)
-                    })
-                    .or_else(|_| repo.head())?
-                    .peel_to_commit()?;
+                let base = match default_branch_name(&repo) {
+                    Some(name) => resolve_branch_reference(&repo, &name)?
+                        .peel_to_commit()
+                        .with_context(|| format!("peel default branch {name}"))?,
+                    None => repo.head()?.peel_to_commit()?,
+                };
                 (repo.branch(branch, &base, false)?.into_reference(), None)
             }
         }
@@ -88,9 +105,10 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
 /// Create a worktree for a brand-new `new_branch` cut from `base`.
 ///
 /// `base` is resolved to a commit via, in order: a local branch, the
-/// `origin/<base>` remote-tracking branch, then a generic revparse (so a tag or
-/// raw sha works too). The new branch carries no upstream - it's local-only
-/// until pushed. `common_dir` must point at the bare/common git dir.
+/// configured-default-remote `<base>` remote-tracking branch, then a generic
+/// revparse (so a tag or raw sha works too). The new branch carries no upstream
+/// - it's local-only until pushed. `common_dir` must point at the bare/common
+///   git dir.
 pub fn create_worktree_from_base(
     common_dir: &Path,
     new_branch: &str,
@@ -99,13 +117,7 @@ pub fn create_worktree_from_base(
     let repo = Repository::open(common_dir)
         .with_context(|| format!("open bare repo at {}", common_dir.display()))?;
 
-    let base_commit = repo
-        .find_branch(base, BranchType::Local)
-        .map(git2::Branch::into_reference)
-        .or_else(|_| {
-            repo.find_branch(&format!("origin/{base}"), BranchType::Remote)
-                .map(git2::Branch::into_reference)
-        })
+    let base_commit = resolve_branch_reference(&repo, base)
         .and_then(|r| r.peel_to_commit())
         .or_else(|_| repo.revparse_single(base).and_then(|o| o.peel_to_commit()))
         .with_context(|| format!("resolve base branch {base}"))?;
@@ -149,9 +161,14 @@ fn add_worktree(
 
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(reference));
-    let wt = repo
-        .worktree(&wt_name, &wt_path, Some(&opts))
-        .with_context(|| format!("create worktree {wt_name} at {}", wt_path.display()))?;
+    let wt = match repo.worktree(&wt_name, &wt_path, Some(&opts)) {
+        Ok(wt) => wt,
+        Err(err) => {
+            let _ = std::fs::remove_dir(&wt_path);
+            return Err(err)
+                .with_context(|| format!("create worktree {wt_name} at {}", wt_path.display()));
+        }
+    };
 
     let path = wt.path().to_path_buf();
     inflate_lfs(&path, remote);
@@ -168,6 +185,23 @@ fn branch_remote(repo: &Repository, branch: &str) -> Option<String> {
     repo.branch_upstream_remote(&refname)
         .ok()
         .and_then(|buf| buf.as_str().ok().map(String::from))
+}
+
+fn resolve_branch_reference<'repo>(
+    repo: &'repo Repository,
+    branch: &str,
+) -> std::result::Result<git2::Reference<'repo>, git2::Error> {
+    repo.find_branch(branch, BranchType::Local)
+        .map(git2::Branch::into_reference)
+        .or_else(|_| {
+            default_remote(repo)
+                .and_then(|remote| {
+                    repo.find_branch(&format!("{remote}/{branch}"), BranchType::Remote)
+                        .ok()
+                })
+                .map(git2::Branch::into_reference)
+                .ok_or_else(|| git2::Error::from_str("branch not found on default remote"))
+        })
 }
 
 /// The remote that a `base` (for a brand-new branch) draws its objects from:

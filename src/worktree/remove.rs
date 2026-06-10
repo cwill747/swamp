@@ -37,6 +37,16 @@ pub fn remove_worktree(
         .with_context(|| format!("find worktree {name}"))?;
     let wt_path = wt.path().to_path_buf();
 
+    if let Ok(cwd) = std::env::current_dir()
+        && path_contains(&wt_path, &cwd)
+    {
+        return Err(RemoveRefused {
+            name: name.to_string(),
+            reason: RemoveRefusedReason::CurrentDirectory,
+        }
+        .into());
+    }
+
     // Capture the branch before we tear the worktree down (also needed by the
     // pre-removal safety checks below).
     let branch = if delete_branch {
@@ -155,6 +165,12 @@ fn reachable_from_other_branch(repo: &Repository, branch_name: &str, tip: git2::
         }
     }
     false
+}
+
+fn path_contains(root: &Path, child: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let child = child.canonicalize().unwrap_or_else(|_| child.to_path_buf());
+    child == root || child.starts_with(root)
 }
 
 #[cfg(test)]

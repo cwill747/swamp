@@ -26,7 +26,9 @@ fn git_info_with_status_mode(dir: &Path, status_mode: StatusMode) -> Result<GitI
     let detached = repo.head_detached().unwrap_or(false);
     let head = repo.head().ok();
 
-    info.branch = if detached {
+    info.branch = if head.is_none() {
+        "(unborn)".into()
+    } else if detached {
         "(detached)".into()
     } else {
         head.as_ref()
@@ -41,27 +43,47 @@ fn git_info_with_status_mode(dir: &Path, status_mode: StatusMode) -> Result<GitI
 
     // Upstream tracking + ahead/behind.
     if !detached
+        && info.branch != "(unborn)"
         && let (Some(local_oid), Ok(branch)) = (
             head.as_ref().and_then(|h| h.target()),
             repo.find_branch(&info.branch, BranchType::Local),
         )
-        && let Ok(upstream) = branch.upstream()
     {
-        if let Ok(Some(name)) = upstream.name() {
-            info.upstream = Some(name.to_string());
+        let refname = format!("refs/heads/{}", info.branch);
+        let upstream_name = repo
+            .branch_upstream_name(&refname)
+            .ok()
+            .and_then(|buf| buf.as_str().ok().map(short_upstream_name));
+        if let Ok(upstream) = branch.upstream() {
+            info.upstream = upstream
+                .name()
+                .ok()
+                .flatten()
+                .map(String::from)
+                .or(upstream_name);
+            if let Some(up_oid) = upstream.get().target()
+                && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid)
+            {
+                info.ahead = ahead as u32;
+                info.behind = behind as u32;
+            }
+        } else if let Some(name) = upstream_name {
+            info.upstream = Some(name);
+            info.upstream_gone = true;
         }
-        if let Some(up_oid) = upstream.get().target()
-            && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid)
-        {
-            info.ahead = ahead as u32;
-            info.behind = behind as u32;
-        }
+    }
+
+    fn short_upstream_name(name: &str) -> String {
+        name.strip_prefix("refs/remotes/")
+            .unwrap_or(name)
+            .to_string()
     }
 
     // Working-tree status counts.
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(false)
+        .exclude_submodules(true)
         .include_ignored(false);
     let statuses = match repo.statuses(Some(&mut opts)) {
         Ok(statuses) => Some(statuses),
@@ -148,6 +170,27 @@ mod tests {
         let info = git_info(&wt.path).unwrap();
         assert_eq!(info.staged, 1);
         assert_eq!(info.untracked, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_info_distinguishes_deleted_upstream() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+
+        run(&bare, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&wt.path, &["push", "--set-upstream", "origin", "feature"]);
+        run(&bare, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+
+        let info = git_info(&wt.path).unwrap();
+        assert_eq!(info.upstream.as_deref(), Some("origin/feature"));
+        assert!(info.upstream_gone);
+        assert_eq!(info.ahead, 0);
+        assert_eq!(info.behind, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

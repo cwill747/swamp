@@ -286,6 +286,7 @@ mod tests {
                     path: PathBuf::from(format!("/repo/{}", n)),
                     branch: n.to_string(),
                     upstream: None,
+                    upstream_gone: false,
                     ahead: 0,
                     behind: 0,
                     staged: 0,

@@ -234,6 +234,14 @@ pub(super) fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
         ));
         spans.push(Span::raw(" "));
     }
+    if r.upstream_gone {
+        spans.push(Span::styled(
+            "gone ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if r.rebase {
         spans.push(Span::styled(
             "R ",
