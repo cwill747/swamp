@@ -34,23 +34,48 @@ fn row_index(area: Rect, count: usize, col: u16, row: u16) -> Option<usize> {
     (idx < count).then_some(idx)
 }
 
-/// Detect a double-click: a left-press on the same row as the previous one
-/// within 400ms. Records the click for next time.
+/// Detect a double-click at the same cell within 400ms.
 fn is_double_click(app: &mut AppState, col: u16, row: u16) -> bool {
     let now = Instant::now();
     let dbl = matches!(
         app.last_click,
-        Some((_, r, t)) if r == row && now.duration_since(t) < Duration::from_millis(400)
+        Some((c, r, t)) if c == col && r == row && now.duration_since(t) < Duration::from_millis(400)
     );
     // Reset after a double so a third click starts a fresh pair.
     app.last_click = if dbl { None } else { Some((col, row, now)) };
     dbl
 }
 
+pub(super) fn spawn_go_to_tab(tx: mpsc::Sender<AppEvent>, name: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = zellij::go_to_tab_name(&name) {
+            let _ = tx.blocking_send(AppEvent::ZellijError(format!("zellij jump failed: {e}")));
+        }
+    });
+}
+
+pub(super) fn spawn_close_tab(tx: mpsc::Sender<AppEvent>, name: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = zellij::close_tab_by_name(&name) {
+            let _ = tx.blocking_send(AppEvent::ZellijError(format!("zellij close failed: {e}")));
+        }
+    });
+}
+
+pub(super) fn request_reconcile_tabs(tx: mpsc::Sender<AppEvent>, full: bool) {
+    if !zellij::in_zellij() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let tabs = zellij::list_tab_names().map_err(|e| e.to_string());
+        let _ = tx.blocking_send(AppEvent::TabsListed { full, tabs });
+    });
+}
+
 /// Jump the zellij session to the tab for the worktree at `idx`.
-fn jump_to_worktree(app: &AppState, idx: usize) {
+fn jump_to_worktree(app: &AppState, tx: mpsc::Sender<AppEvent>, idx: usize) {
     if let Some(r) = app.snapshot.rows.get(idx) {
-        let _ = zellij::go_to_tab_name(&r.name);
+        spawn_go_to_tab(tx, r.name.clone());
     }
 }
 
@@ -65,6 +90,14 @@ pub(super) fn handle_mouse(
         handle_create_mouse(app, m, tx, common);
         return;
     }
+    if matches!(
+        app.input,
+        Some(InputMode::ConfirmDelete { .. } | InputMode::PickHarness { .. })
+    ) {
+        app.input = None;
+        app.last_click = None;
+        return;
+    }
     let (col, row) = (m.column, m.row);
     match m.kind {
         // Scroll routes to whatever panel the cursor is over.
@@ -75,10 +108,10 @@ pub(super) fn handle_mouse(
             } else if app
                 .regions
                 .worktrees
-                .is_some_and(|(r, _)| point_in(r, col, row))
+                .is_some_and(|(r, _, _)| point_in(r, col, row))
                 && !app.snapshot.rows.is_empty()
             {
-                app.selected = (app.selected + 1).min(app.snapshot.rows.len() - 1);
+                app.move_selection(1);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -87,9 +120,9 @@ pub(super) fn handle_mouse(
             } else if app
                 .regions
                 .worktrees
-                .is_some_and(|(r, _)| point_in(r, col, row))
+                .is_some_and(|(r, _, _)| point_in(r, col, row))
             {
-                app.selected = app.selected.saturating_sub(1);
+                app.move_selection(-1);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -97,9 +130,10 @@ pub(super) fn handle_mouse(
 
             // Worktree table: click selects, double-click jumps. Clicking the
             // PR-icon column opens the PR instead.
-            if let Some((area, count)) = app.regions.worktrees
-                && let Some(idx) = row_index(area, count, col, row)
+            if let Some((area, count, offset)) = app.regions.worktrees
+                && let Some(row_idx) = row_index(area, count, col, row)
             {
+                let idx = offset + row_idx;
                 // Fixed leading columns: #(3) + sp + agent(2) + sp = 7,
                 // then the 1-wide PR icon.
                 let pr_col = area.x + 7;
@@ -114,9 +148,9 @@ pub(super) fn handle_mouse(
                     crate::util::open_url(&url);
                     return;
                 }
-                app.selected = idx;
+                app.select_index(idx);
                 if dbl {
-                    jump_to_worktree(app, idx);
+                    jump_to_worktree(app, tx.clone(), idx);
                 }
                 return;
             }
@@ -127,9 +161,9 @@ pub(super) fn handle_mouse(
                     row_index(*area, idxs.len(), col, row).map(|i| idxs[i])
                 });
             if let Some(idx) = ai_target {
-                app.selected = idx;
+                app.select_index(idx);
                 if dbl {
-                    jump_to_worktree(app, idx);
+                    jump_to_worktree(app, tx.clone(), idx);
                 }
                 return;
             }
@@ -391,13 +425,10 @@ fn create_confirm(app: &mut AppState, tx: &mpsc::Sender<AppEvent>, common: &std:
 /// "every worktree is missing a tab" and would spawn a duplicate `new-tab` per
 /// row. The known-set is only advanced on a successful query, so an appearance
 /// missed during a failed query is retried on the next snapshot.
-pub(super) fn reconcile_tabs(app: &mut AppState, full: bool) {
-    if app.view != TuiView::Worktrees || app.pin_cwd || !zellij::in_zellij() {
+pub(super) fn reconcile_tabs(app: &mut AppState, tabs: &[String], full: bool) {
+    if app.view != TuiView::Worktrees || app.pin_cwd {
         return;
     }
-    let Ok(tabs) = zellij::list_tab_names() else {
-        return;
-    };
     // A tab we previously issued has now surfaced in zellij's list — clear its
     // open-claim. This is what ends the suppression window: instead of guessing
     // how long zellij takes to register a tab (a flat timer that this monorepo's
@@ -406,6 +437,11 @@ pub(super) fn reconcile_tabs(app: &mut AppState, full: bool) {
     // then reopen cleanly.
     app.recent_tab_opens
         .retain(|name, _| !tabs.iter().any(|t| t == name));
+    for row in &app.snapshot.rows {
+        if tabs.iter().any(|t| t == &row.name) {
+            app.managed_tabs.insert(row.name.clone());
+        }
+    }
     let names: HashSet<String> = app
         .snapshot
         .rows
@@ -474,8 +510,15 @@ pub(super) fn open_worktree_tab_debounced(app: &mut AppState, path: &Path, name:
         return;
     }
     app.recent_tab_opens.insert(name.to_string(), now);
+    app.managed_tabs.insert(name.to_string());
     tracing::info!(worktree = %name, "opening worktree tab");
-    let _ = crate::launch::open_worktree_tab(path, name);
+    let path = path.to_path_buf();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::launch::open_worktree_tab(&path, &name) {
+            tracing::warn!(worktree = %name, "open worktree tab failed: {e}");
+        }
+    });
 }
 
 /// Fire a worktree-create request and arm the pending-create tracking so only

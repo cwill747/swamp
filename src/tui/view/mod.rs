@@ -155,6 +155,12 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
         return;
     }
     let mut spans = Vec::new();
+    if !app.connected {
+        spans.push(Span::styled(
+            "disconnected · ",
+            Style::default().fg(Theme::DIRTY),
+        ));
+    }
     if app.refreshing {
         let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];
         spans.push(Span::styled(

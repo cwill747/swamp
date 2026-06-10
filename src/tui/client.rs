@@ -101,6 +101,7 @@ pub(super) async fn subscribe_loop(
     let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &ClientMsg::Subscribe).await?;
+    let _ = tx.send(AppEvent::Connected).await;
     while let Some(msg) = read_server_msg(&mut stream).await? {
         let event = match msg {
             ServerMsg::Snapshot(s) => AppEvent::Snapshot(s),

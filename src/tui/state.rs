@@ -114,9 +114,8 @@ pub struct PrHit {
 /// aren't drawn this frame stay `None`.
 #[derive(Default)]
 pub struct HitRegions {
-    /// Worktree table: (row area, visible row count). Display row index equals
-    /// the snapshot index, so a hit row maps straight to `selected`.
-    pub worktrees: Option<(Rect, usize)>,
+    /// Worktree table: (row area, visible row count, scroll offset).
+    pub worktrees: Option<(Rect, usize, usize)>,
     /// AI status table: (row area, snapshot index per visible row).
     pub ai: Option<(Rect, Vec<usize>)>,
     /// PR & CI table: (row area, PR per visible row).
@@ -129,13 +128,17 @@ pub struct HitRegions {
 
 pub struct AppState {
     pub snapshot: Snapshot,
-    pub selected: usize,
+    /// Selected worktree name. Resolved against the latest snapshot before use
+    /// because snapshots reorder rows and the current tab can be pinned to row 0.
+    pub selected: Option<String>,
+    pub worktree_scroll: usize,
     pub spinner_frame: usize,
     pub repo_name: String,
     pub view: TuiView,
     pub refreshing: bool,
     pub pending_delete: Option<String>,
     pub pending_create: Option<String>,
+    pub connected: bool,
     /// Worktree name -> last time swamp issued a `new-tab` for it. `zellij
     /// action new-tab` returns before the tab is visible to `query-tab-names`,
     /// and worktree creation emits a burst of filesystem events the daemon
@@ -143,6 +146,7 @@ pub struct AppState {
     /// every snapshot in that window would see the worktree as tab-less and
     /// open another duplicate tab. See [`super::input::reconcile_tabs`].
     pub recent_tab_opens: HashMap<String, Instant>,
+    pub managed_tabs: std::collections::HashSet<String>,
     /// Worktree names seen in the last reconciled snapshot. `None` until the
     /// first reconcile. Used to open tabs only for worktrees that *appear*:
     /// a long-known worktree with no tab means the user closed it, and that
@@ -179,6 +183,60 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        let name = self.selected.as_ref()?;
+        self.snapshot.rows.iter().position(|r| &r.name == name)
+    }
+
+    pub(crate) fn selected_row(&self) -> Option<&crate::daemon::state::WorktreeRow> {
+        self.selected_index()
+            .and_then(|idx| self.snapshot.rows.get(idx))
+    }
+
+    pub(crate) fn select_index(&mut self, idx: usize) {
+        self.selected = self.snapshot.rows.get(idx).map(|r| r.name.clone());
+    }
+
+    pub(crate) fn move_selection(&mut self, delta: i32) {
+        if self.snapshot.rows.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let idx = self.selected_index().unwrap_or(0) as i32;
+        let max = self.snapshot.rows.len() as i32 - 1;
+        self.select_index((idx + delta).clamp(0, max) as usize);
+    }
+
+    pub(crate) fn select_first(&mut self) {
+        if self.snapshot.rows.is_empty() {
+            self.selected = None;
+        } else {
+            self.select_index(0);
+        }
+    }
+
+    pub(crate) fn select_last(&mut self) {
+        if self.snapshot.rows.is_empty() {
+            self.selected = None;
+        } else {
+            self.select_index(self.snapshot.rows.len() - 1);
+        }
+    }
+
+    pub(crate) fn reconcile_selection(&mut self) {
+        if self.snapshot.rows.is_empty() {
+            self.selected = None;
+            self.worktree_scroll = 0;
+            return;
+        }
+        if self.selected_index().is_none() {
+            self.select_index(0);
+        }
+        if self.worktree_scroll >= self.snapshot.rows.len() {
+            self.worktree_scroll = self.snapshot.rows.len().saturating_sub(1);
+        }
+    }
+
     /// Identify the active worktree row: prefer the one whose path contains
     /// this pane's working directory, falling back to the zellij tab name.
     fn resolve_current_tab(&self) -> Option<String> {
