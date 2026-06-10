@@ -180,19 +180,88 @@ fn footer_hint(view: TuiView) -> &'static str {
     }
 }
 
-/// Truncate `s` to at most `max` chars, appending an ellipsis when cut.
+/// Truncate `s` to at most `max` *characters* (Unicode scalar values),
+/// appending an ellipsis ("…") when the string is cut.  The ellipsis counts
+/// as one character, so the returned string is never longer than `max` chars.
 pub(super) fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
+    } else if max == 0 {
+        String::new()
     } else {
-        let end = max.saturating_sub(1);
-        format!("{}…", &s[..end])
+        // Keep (max - 1) chars to leave room for the ellipsis.
+        let keep = max - 1;
+        // Use char_indices to find the byte offset after `keep` chars.
+        let byte_end = s
+            .char_indices()
+            .nth(keep)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}…", &s[..byte_end])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_ascii_unchanged() {
+        // Strings at or below max are returned verbatim.
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_cut() {
+        // String longer than max gets cut with ellipsis; result is max chars.
+        let result = truncate("hello world", 6);
+        assert_eq!(result, "hello…");
+        assert_eq!(result.chars().count(), 6);
+    }
+
+    #[test]
+    fn truncate_emoji_boundary() {
+        // Each emoji is one char; cutting must not split a multi-byte sequence.
+        let s = "hi 🎉🎊🎈 there";
+        let result = truncate(s, 5);
+        assert_eq!(result.chars().count(), 5);
+        assert_eq!(result, "hi 🎉…");
+    }
+
+    #[test]
+    fn truncate_cjk() {
+        // Each CJK character is one char (but 3 bytes).
+        let s = "你好世界朋友";
+        let result = truncate(s, 4);
+        assert_eq!(result.chars().count(), 4);
+        assert_eq!(result, "你好世…");
+    }
+
+    #[test]
+    fn truncate_shorter_than_max() {
+        assert_eq!(truncate("abc", 100), "abc");
+    }
+
+    #[test]
+    fn truncate_max_zero() {
+        assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_max_one() {
+        // With max=1, the only room is for the ellipsis itself.
+        let result = truncate("hello", 1);
+        assert_eq!(result, "…");
+        assert_eq!(result.chars().count(), 1);
+    }
+
+    #[test]
+    fn truncate_max_one_emoji() {
+        let result = truncate("🎉hello", 1);
+        assert_eq!(result, "…");
+    }
 
     #[test]
     fn footer_hint_matches_panel_keys() {

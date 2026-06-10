@@ -46,9 +46,26 @@ pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<(
 
     ensure_daemon(&start).await?;
 
+    // Install a panic hook that restores the terminal before printing the
+    // panic message.  This ensures that a panic (e.g. from a UTF-8 slice
+    // bug mid-draw) doesn't leave the user's pane stuck in raw mode /
+    // alternate screen / with mouse capture active.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort teardown — ignore all errors.
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut out = stdout();
-    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(e) = crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture) {
+        // raw mode is active but alternate screen failed; clean up before
+        // propagating the error so the caller's terminal is not corrupted.
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
