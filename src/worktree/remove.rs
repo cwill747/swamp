@@ -1,5 +1,5 @@
 use super::{RemoveRefused, RemoveRefusedReason};
-use crate::worktree::status::git_info;
+use crate::worktree::status::git_info_strict;
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository, WorktreeLockStatus, WorktreePruneOptions};
 use std::fs;
@@ -67,7 +67,7 @@ pub fn remove_worktree(
             // A status error refuses removal (fail closed) instead of assuming
             // clean: a transient libgit2 error is exactly when an automatic
             // remove_dir_all is least wanted.
-            match git_info(&wt_path) {
+            match git_info_strict(&wt_path) {
                 Err(_) => {
                     return Err(RemoveRefused {
                         name: name.to_string(),
@@ -340,6 +340,37 @@ mod tests {
         remove_worktree(&bare, "feature", true, true).unwrap();
         assert!(!wt.path.exists());
         assert!(list_worktrees(&bare).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_refuses_unreadable_status_without_force() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&wt.path)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let git_dir = String::from_utf8(output.stdout).unwrap();
+        let git_dir = wt.path.join(git_dir.trim());
+        std::fs::write(git_dir.join("index"), "not a git index").unwrap();
+
+        let err = remove_worktree(&bare, "feature", true, false).unwrap_err();
+        let refused = err.downcast_ref::<RemoveRefused>().unwrap();
+        assert_eq!(refused.reason, RemoveRefusedReason::StatusUnreadable);
+        assert!(wt.path.exists());
+        assert_eq!(list_worktrees(&bare).unwrap().len(), 1);
+
+        remove_worktree(&bare, "feature", true, true).unwrap();
+        assert!(!wt.path.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
