@@ -35,7 +35,7 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
         loop {
             match rx.recv().await {
                 None => return Ok(()),
-                Some(res) if !is_own_status_event(&res) => break,
+                Some(res) if warrants_rescan(&res) => break,
                 Some(_) => continue,
             }
         }
@@ -68,15 +68,31 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
     }
 }
 
-/// True when every path in the event is one of swamp's own status files
-/// (`.swamp-status.json` or its rename-source `.tmp`), i.e. the event was
-/// caused by a hook persist rather than a git state change. Watch errors and
-/// events with no paths are treated as relevant so a real change is never
-/// dropped.
-fn is_own_status_event(res: &notify::Result<notify::Event>) -> bool {
+/// Whether an event should trigger a git rescan. Watch errors and events with
+/// no paths are treated as relevant so a real change is never dropped, but two
+/// classes of event are filtered out:
+///
+/// - `Access` (open/read) events: reads never change git state, and the daemon
+///   itself opens `config`, `refs/`, and per-worktree files on every refresh.
+///   libgit2's own reads emitting `Access(Open)` events otherwise feed straight
+///   back into the watcher, spinning `refresh_all` ~5x/sec forever.
+/// - Swamp's own status-file writes (`.swamp-status.json` / its `.tmp`
+///   rename-source), which every hook ping persists into the watched common
+///   dir; treating them as git changes echoed each hook into a full rescan.
+fn warrants_rescan(res: &notify::Result<notify::Event>) -> bool {
     let Ok(ev) = res else {
-        return false;
+        return true;
     };
+    if matches!(ev.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    !is_own_status_event(ev)
+}
+
+/// True when every path in the event is one of swamp's own status files
+/// (`.swamp-status.json` or its rename-source `.tmp`). An event with no paths
+/// is not treated as own-status, so it still warrants a rescan.
+fn is_own_status_event(ev: &notify::Event) -> bool {
     !ev.paths.is_empty()
         && ev.paths.iter().all(|p| {
             p.file_name()
@@ -103,10 +119,20 @@ fn ensure_watch_if_exists(
 mod tests {
     use super::*;
     use notify::Event;
+    use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
     use std::path::PathBuf;
 
-    fn event_with_paths(paths: &[&str]) -> notify::Result<Event> {
+    fn modify_event(paths: &[&str]) -> notify::Result<Event> {
         Ok(Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: paths.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn access_event(paths: &[&str]) -> notify::Result<Event> {
+        Ok(Event {
+            kind: EventKind::Access(AccessKind::Open(AccessMode::Any)),
             paths: paths.iter().map(PathBuf::from).collect(),
             ..Default::default()
         })
@@ -116,25 +142,34 @@ mod tests {
     /// writes and must not trigger a rescan; anything touching other files —
     /// even in the same burst — must.
     #[test]
-    fn status_file_events_are_ignored_others_are_not() {
-        assert!(is_own_status_event(&event_with_paths(&[
+    fn status_file_writes_do_not_warrant_rescan_others_do() {
+        assert!(!warrants_rescan(&modify_event(&[
             "/repo/.git/.swamp-status.json"
         ])));
-        assert!(is_own_status_event(&event_with_paths(&[
+        assert!(!warrants_rescan(&modify_event(&[
             "/repo/.git/.swamp-status.json.tmp",
             "/repo/.git/.swamp-status.json",
         ])));
         // A git change is relevant.
-        assert!(!is_own_status_event(&event_with_paths(&[
-            "/repo/.git/HEAD"
-        ])));
+        assert!(warrants_rescan(&modify_event(&["/repo/.git/HEAD"])));
         // Mixed events stay relevant.
-        assert!(!is_own_status_event(&event_with_paths(&[
+        assert!(warrants_rescan(&modify_event(&[
             "/repo/.git/.swamp-status.json",
             "/repo/.git/packed-refs",
         ])));
         // No paths / errors: treated as relevant so changes are never dropped.
-        assert!(!is_own_status_event(&event_with_paths(&[])));
-        assert!(!is_own_status_event(&Err(notify::Error::generic("boom"))));
+        assert!(warrants_rescan(&modify_event(&[])));
+        assert!(warrants_rescan(&Err(notify::Error::generic("boom"))));
+    }
+
+    /// Read/open (`Access`) events never warrant a rescan: reads don't change
+    /// git state, and the daemon opens `config`/`refs/` on every refresh, so
+    /// honoring them spins `refresh_all` in a tight loop.
+    #[test]
+    fn access_events_do_not_warrant_rescan() {
+        assert!(!warrants_rescan(&access_event(&["/repo/.git/config"])));
+        assert!(!warrants_rescan(&access_event(&["/repo/.git/refs"])));
+        // Even an access touching a "real" git path must be ignored.
+        assert!(!warrants_rescan(&access_event(&["/repo/.git/HEAD"])));
     }
 }
