@@ -111,8 +111,14 @@ pub(super) fn handle_mouse(
         app.input,
         Some(InputMode::ConfirmDelete { .. } | InputMode::PickHarness { .. })
     ) {
-        app.input = None;
-        app.last_click = None;
+        // Swallow all mouse input while a footer prompt is open, but only a real
+        // click dismisses it. Mouse capture enables motion reporting (xterm mode
+        // 1003), so crossterm emits a `Moved` event for every cursor movement;
+        // clearing on those would erase the prompt the instant the cursor twitches.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            app.input = None;
+            app.last_click = None;
+        }
         return;
     }
     let (col, row) = (m.column, m.row);
