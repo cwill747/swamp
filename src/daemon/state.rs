@@ -234,6 +234,18 @@ impl DaemonState {
         }
     }
 
+    /// Optimistically drop a single worktree row after a delete, without the
+    /// full rescan `apply_scanned_rows` performs. Lets the daemon broadcast the
+    /// removal immediately; a background refresh reconciles the rest. Returns
+    /// whether a row was actually present.
+    pub fn remove_row(&mut self, name: &str) -> bool {
+        let removed = self.rows.remove(name).is_some();
+        // Drop the now-orphaned agent record so a later worktree reusing the
+        // name can't inherit stale status.
+        self.agents.remove(name);
+        removed
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let mut rows: Vec<WorktreeRow> = self.rows.values().cloned().collect();
         rows.sort_by(|a, b| b.head_ts.cmp(&a.head_ts).then(a.name.cmp(&b.name)));
