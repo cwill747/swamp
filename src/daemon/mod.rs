@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, watch};
 
 use self::socket::{ClientMsg, ServerMsg};
 use self::state::DaemonState;
@@ -27,6 +27,10 @@ pub struct Daemon {
     pub fetch_op: Arc<Mutex<Option<SharedOpRx>>>,
     pub tx: broadcast::Sender<ServerMsg>,
     pub pr_subscribers: Arc<AtomicUsize>,
+    /// Wakes the PR poller so it can fetch immediately instead of sleeping out
+    /// its interval. Poked on subscribe when no successful fetch has happened
+    /// yet; `Notify` coalesces concurrent pokes into a single wake.
+    pub pr_wake: Arc<Notify>,
 }
 
 type SharedOpResult = std::result::Result<(), String>;
@@ -157,6 +161,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         fetch_op: Arc::new(Mutex::new(None)),
         tx: tx.clone(),
         pr_subscribers: Arc::new(AtomicUsize::new(0)),
+        pr_wake: Arc::new(Notify::new()),
     });
 
     // Bind the control socket *before* the first state scan. The TUI waits
@@ -241,11 +246,21 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     {
         let d = daemon.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Settle briefly on startup, but wake immediately if a subscriber
+            // connects first so the first fetch isn't gated on this delay.
+            tokio::select! {
+                _ = d.pr_wake.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
             let mut delay = Duration::from_secs(60);
             loop {
                 if d.pr_subscribers.load(Ordering::Relaxed) == 0 {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // No subscribers: idle until one connects (which wakes us) or
+                    // re-check shortly in case a subscriber raced the gate.
+                    tokio::select! {
+                        _ = d.pr_wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
 
@@ -280,7 +295,12 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                     }
                     Err(e) => tracing::warn!("pr status poll join: {e:?}"),
                 }
-                tokio::time::sleep(delay).await;
+                // Sleep out the steady-state cadence/backoff, but cut it short if
+                // a new subscriber pokes us (e.g. another pane connecting).
+                tokio::select! {
+                    _ = d.pr_wake.notified() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
         });
     }
@@ -426,6 +446,10 @@ impl Daemon {
             s.agents.clone()
         };
 
+        // `scan_worktrees` fans the per-worktree git status out across a bounded
+        // pool of scoped threads internally, so a single `spawn_blocking` keeps
+        // the whole concurrent scan off the async runtime. No async lock is held
+        // across this await — `agents` was cloned out above under a read lock.
         let common = self.common_dir.clone();
         let new_rows = tokio::task::spawn_blocking(move || {
             crate::daemon::state::scan_worktrees(&common, &agents)
@@ -730,6 +754,7 @@ mod tests {
             fetch_op: Arc::new(Mutex::new(None)),
             tx: broadcast::channel(64).0,
             pr_subscribers: Arc::new(AtomicUsize::new(0)),
+            pr_wake: Arc::new(Notify::new()),
         })
     }
 

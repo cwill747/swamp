@@ -214,6 +214,17 @@ fn build_row<'a>(
     if ctx.layout == WorktreeTableLayout::Expanded {
         if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
             cells.extend(pr_status_cells(pr, app.spinner_frame));
+        } else if app.pr_snapshot.loading {
+            // PR data hasn't landed yet: mark the row as loading in the PR state
+            // column rather than leaving it blank (which reads as "no PR"). A
+            // static muted glyph, never the cyan CI build-running spinner.
+            cells.push(Cell::from(Span::styled(
+                icons::pr_loading(),
+                Theme::muted(),
+            )));
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
         } else {
             cells.push(Cell::from(""));
             cells.push(Cell::from(""));
@@ -221,7 +232,10 @@ fn build_row<'a>(
             cells.push(Cell::from(""));
         }
     } else {
-        cells.push(compact_pr_cell(app.pr_snapshot.prs.get(&r.branch)));
+        cells.push(compact_pr_cell(
+            app.pr_snapshot.prs.get(&r.branch),
+            app.pr_snapshot.loading,
+        ));
     }
 
     cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
@@ -235,7 +249,7 @@ fn build_row<'a>(
     }
 }
 
-fn compact_pr_cell<'a>(pr: Option<&PrSummary>) -> Cell<'a> {
+fn compact_pr_cell<'a>(pr: Option<&PrSummary>, loading: bool) -> Cell<'a> {
     if let Some(pr) = pr {
         let (icon, color) = if pr.state == "OPEN" && !pr.is_draft {
             match &pr.review {
@@ -248,6 +262,10 @@ fn compact_pr_cell<'a>(pr: Option<&PrSummary>) -> Cell<'a> {
             pr_state_icon_color(pr)
         };
         Cell::from(Span::styled(icon, Style::default().fg(color)))
+    } else if loading {
+        // No summary yet but a fetch is outstanding: show a muted loading glyph
+        // (static, distinct from the CI spinner) instead of a blank "no PR" cell.
+        Cell::from(Span::styled(icons::pr_loading(), Theme::muted()))
     } else {
         Cell::from(Span::raw(" "))
     }
