@@ -160,16 +160,20 @@ fn spawn_new_session(
     let layout_path = write_multi_tab_layout(worktrees, session, cfg, &git_dir)?;
     if nested {
         // Create the repo session from the layout AND move this client into it in
-        // one `switch-session --layout` call, then close the tab we launched from.
-        nested_handover(session, Some(&layout_path))
+        // one `switch-session --layout-string` call, then close the tab we
+        // launched from. Passing the layout contents avoids deleting the temp
+        // layout before the zellij server has consumed the switch action.
+        let layout = std::fs::read_to_string(&layout_path)
+            .with_context(|| format!("read generated layout {}", layout_path.display()))?;
+        nested_handover(session, Some(&layout))
     } else {
         zellij::new_session_with_layout(&layout_path, target, session)
     }
 }
 
-/// Hand the live zellij client over to `session` (creating it from `layout` when
-/// `Some`) and best-effort close the tab swamp was launched from, so the user is
-/// dropped into the repo session rather than stranded on a stale tab.
+/// Hand the live zellij client over to `session` (creating it from `layout` KDL
+/// when `Some`) and best-effort close the tab swamp was launched from, so the
+/// user is dropped into the repo session rather than stranded on a stale tab.
 ///
 /// The originating tab's host session and stable id are captured *before*
 /// switching — afterwards the host's "current tab" is ambiguous. Closing is
@@ -178,7 +182,7 @@ fn spawn_new_session(
 /// the originating tab is a live tab the user wants to keep); the user then drops
 /// back to the shell they launched from. The close is best-effort: a failure
 /// never fails the launch, since the switch already succeeded.
-fn nested_handover(session: &str, layout: Option<&Path>) -> Result<()> {
+fn nested_handover(session: &str, layout: Option<&str>) -> Result<()> {
     let host = std::env::var("ZELLIJ_SESSION_NAME").ok();
     let origin_tab = match zellij::current_tab_id() {
         Ok(id) => Some(id),
