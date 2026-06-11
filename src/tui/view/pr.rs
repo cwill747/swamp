@@ -77,23 +77,7 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
             Style::default().fg(color),
         ));
 
-        let checks_cell = if let Some(ref checks) = pr.checks {
-            let (check_icon, check_color) = check_state_icon_color(checks, app.spinner_frame);
-            let mut spans = vec![Span::styled(check_icon, Style::default().fg(check_color))];
-            match checks {
-                CheckState::Failure { passed, total, .. }
-                | CheckState::Pending { passed, total } => {
-                    spans.push(Span::styled(
-                        format!(" {}/{}", passed, total),
-                        Style::default().fg(check_color),
-                    ));
-                }
-                CheckState::Success => {}
-            }
-            Cell::from(Line::from(spans))
-        } else {
-            Cell::from("")
-        };
+        let checks_cell = checks_status_cell(&pr.checks, app.spinner_frame);
 
         let review_cell = review_status_cell(&pr.review);
 
@@ -199,7 +183,7 @@ pub(super) fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
     (icon, color)
 }
 
-fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
+pub(super) fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
     match review {
         Some(ReviewDecision::Approved) => Cell::from(Span::styled(
             icons::review_approved(),
@@ -214,6 +198,28 @@ fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
             Style::default().fg(Color::Yellow),
         )),
         _ => Cell::from(""),
+    }
+}
+
+pub(super) fn checks_status_cell<'a>(
+    checks: &Option<CheckState>,
+    spinner_frame: usize,
+) -> Cell<'a> {
+    if let Some(checks) = checks {
+        let (check_icon, check_color) = check_state_icon_color(checks, spinner_frame);
+        let mut spans = vec![Span::styled(check_icon, Style::default().fg(check_color))];
+        match checks {
+            CheckState::Failure { passed, total, .. } | CheckState::Pending { passed, total } => {
+                spans.push(Span::styled(
+                    format!(" {}/{}", passed, total),
+                    Style::default().fg(check_color),
+                ));
+            }
+            CheckState::Success => {}
+        }
+        Cell::from(Line::from(spans))
+    } else {
+        Cell::from("")
     }
 }
 
