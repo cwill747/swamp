@@ -30,7 +30,7 @@ Swamp SHALL prefer batched GraphQL PR queries and fall back to per-branch REST q
 - **THEN** swamp attempts REST lookup for individual branches
 
 ### Requirement: Pull Request Summary Fields
-PR summaries SHALL expose branch name, PR number, title, state, draft flag, URL, check state, check metadata, and review decision.
+PR summaries SHALL expose branch name, PR number, title, state, draft flag, URL, check state, check metadata, comment count, and review decision.
 
 #### Scenario: Open pull request found
 - **WHEN** a worktree branch has a matching pull request
@@ -39,6 +39,10 @@ PR summaries SHALL expose branch name, PR number, title, state, draft flag, URL,
 #### Scenario: No pull request found
 - **WHEN** a worktree branch has no matching pull request
 - **THEN** the PR snapshot omits a PR summary for that branch
+
+#### Scenario: Pull request has comments
+- **WHEN** a matching pull request has comments available from GitHub
+- **THEN** the PR summary includes the pull request comment count
 
 ### Requirement: Check Status Aggregation
 Swamp SHALL aggregate GitHub check rollups into success, pending, or failure status with passed and total counts where applicable.
@@ -87,3 +91,14 @@ The PR status TUI SHALL display PR and CI state from daemon PR snapshots for wor
 #### Scenario: PR summary missing
 - **WHEN** no PR summary exists for a worktree branch
 - **THEN** the PR panel indicates that no PR status is available for that branch
+
+### Requirement: Worktrees Pane PR Status Consumption
+The worktrees pane SHALL consume existing PR summaries to display CI and review status for matching worktree branches.
+
+#### Scenario: Matching worktree branch
+- **WHEN** a worktree branch has a matching pull request summary
+- **THEN** the worktrees pane can derive failed-build count, comment count, and review status from that summary
+
+#### Scenario: PR refresh unavailable
+- **WHEN** PR status refresh is unavailable or has not returned data for a branch
+- **THEN** the worktrees pane does not fabricate failed-build, comment, or review-status values for that branch

@@ -543,6 +543,7 @@ mod tests {
             checks: None,
             check_meta: None,
             url: None,
+            comment_count: 0,
             review: None,
             reviews_partial: false,
         }
