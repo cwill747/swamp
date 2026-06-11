@@ -3,7 +3,7 @@ use super::pr::pr_state_icon_color;
 use crate::cli::TuiView;
 use crate::config::Harness;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
-use crate::github::ReviewDecision;
+use crate::github::{CheckState, PrSummary, ReviewDecision};
 use crate::tui::AppState;
 use crate::tui::icons;
 use crate::tui::theme::Theme;
@@ -15,32 +15,58 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use std::time::{Duration, SystemTime};
 
+const EXPANDED_PR_COLUMNS_WIDTH: u16 = 92;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeTableLayout {
+    Compact,
+    Expanded,
+}
+
 pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rect) {
     let now = now_unix();
     let current_tab = app.current_tab.as_deref();
     let pin_current = app.view == TuiView::Worktrees;
     let selected = app.selected_index();
+    let layout = worktree_table_layout(area);
 
     let rows: Vec<Row> = app
         .snapshot
         .rows
         .iter()
         .enumerate()
-        .map(|(i, r)| build_row(i, r, app, selected, now, current_tab, pin_current))
+        .map(|(i, r)| build_row(i, r, app, selected, now, current_tab, pin_current, layout))
         .collect();
 
+    let compact_constraints = [
+        Constraint::Length(3), // # + caret
+        Constraint::Length(2), // agent icon
+        Constraint::Length(1), // PR icon
+        Constraint::Min(8),    // worktree name
+        Constraint::Min(10),   // branch
+        Constraint::Min(12),   // git
+        Constraint::Length(5), // age
+        Constraint::Length(1), // harness override (C/X)
+    ];
+    let expanded_constraints = [
+        Constraint::Length(3), // # + caret
+        Constraint::Length(2), // agent icon
+        Constraint::Length(1), // PR icon
+        Constraint::Length(3), // failed builds
+        Constraint::Length(4), // comments
+        Constraint::Length(2), // review
+        Constraint::Min(8),    // worktree name
+        Constraint::Min(10),   // branch
+        Constraint::Min(10),   // git
+        Constraint::Length(5), // age
+        Constraint::Length(1), // harness override (C/X)
+    ];
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(3), // # + caret
-            Constraint::Length(2), // agent icon
-            Constraint::Length(1), // PR icon
-            Constraint::Min(8),    // worktree name
-            Constraint::Min(10),   // branch
-            Constraint::Min(12),   // git
-            Constraint::Length(5), // age
-            Constraint::Length(1), // harness override (C/X)
-        ],
+        match layout {
+            WorktreeTableLayout::Compact => compact_constraints.as_slice(),
+            WorktreeTableLayout::Expanded => expanded_constraints.as_slice(),
+        },
     )
     .block(
         Block::default()
@@ -80,6 +106,14 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
     app.regions.worktrees = Some((inner, visible, app.worktree_scroll));
 }
 
+fn worktree_table_layout(area: Rect) -> WorktreeTableLayout {
+    if bordered_inner(area).width >= EXPANDED_PR_COLUMNS_WIDTH {
+        WorktreeTableLayout::Expanded
+    } else {
+        WorktreeTableLayout::Compact
+    }
+}
+
 fn build_row<'a>(
     i: usize,
     r: &'a WorktreeRow,
@@ -88,6 +122,7 @@ fn build_row<'a>(
     now: u64,
     current_tab: Option<&str>,
     pin_current: bool,
+    layout: WorktreeTableLayout,
 ) -> Row<'a> {
     let is_current = current_tab.map(|t| t == r.name).unwrap_or(false);
     let is_pinned = pin_current && is_current;
@@ -182,22 +217,72 @@ fn build_row<'a>(
         None => Cell::from(Span::raw(" ")),
     };
 
-    let row = Row::new(vec![
-        idx_cell,
-        agent_cell,
-        pr_cell,
-        name_cell,
-        branch_cell,
-        git_cell,
-        age_cell,
-        harness_cell,
-    ]);
+    let mut cells = vec![idx_cell, agent_cell, pr_cell];
+
+    if layout == WorktreeTableLayout::Expanded {
+        if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
+            cells.push(failed_builds_cell(pr));
+            cells.push(comment_count_cell(pr));
+            cells.push(review_status_cell(&pr.review));
+        } else {
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+        }
+    }
+
+    cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
+    let row = Row::new(cells);
     if selected == Some(i) {
         row.style(Theme::selected())
     } else if is_current {
         row.style(Theme::current())
     } else {
         row
+    }
+}
+
+fn failed_builds_cell<'a>(pr: &PrSummary) -> Cell<'a> {
+    Cell::from(match failed_build_count(pr) {
+        Some(count) => Span::styled(count.to_string(), Style::default().fg(Color::Red)),
+        None => Span::raw(""),
+    })
+}
+
+fn comment_count_cell<'a>(pr: &PrSummary) -> Cell<'a> {
+    if pr.comment_count > 0 {
+        Cell::from(Span::styled(
+            pr.comment_count.to_string(),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        Cell::from("")
+    }
+}
+
+fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
+    match review {
+        Some(ReviewDecision::Approved) => Cell::from(Span::styled(
+            icons::review_approved(),
+            Style::default().fg(Color::Green),
+        )),
+        Some(ReviewDecision::ChangesRequested) => Cell::from(Span::styled(
+            icons::review_changes(),
+            Style::default().fg(Color::Red),
+        )),
+        Some(ReviewDecision::Commented) => Cell::from(Span::styled(
+            icons::review_commented(),
+            Style::default().fg(Color::Yellow),
+        )),
+        Some(ReviewDecision::ReviewRequired) => Cell::from(Span::styled("?", Theme::muted())),
+        None => Cell::from(""),
+    }
+}
+
+fn failed_build_count(pr: &PrSummary) -> Option<u32> {
+    match pr.checks {
+        Some(CheckState::Failure { passed, total }) => Some(total.saturating_sub(passed).max(1)),
+        _ => None,
     }
 }
 
@@ -259,4 +344,55 @@ pub(super) fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr_with_checks(checks: Option<CheckState>) -> PrSummary {
+        PrSummary {
+            number: 1,
+            title: "PR".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            checks,
+            check_meta: None,
+            url: None,
+            comment_count: 0,
+            review: None,
+            reviews_partial: false,
+        }
+    }
+
+    #[test]
+    fn worktree_table_layout_expands_only_when_inner_width_fits() {
+        assert_eq!(
+            worktree_table_layout(Rect::new(0, 0, EXPANDED_PR_COLUMNS_WIDTH + 2, 8)),
+            WorktreeTableLayout::Expanded
+        );
+        assert_eq!(
+            worktree_table_layout(Rect::new(0, 0, EXPANDED_PR_COLUMNS_WIDTH + 1, 8)),
+            WorktreeTableLayout::Compact
+        );
+    }
+
+    #[test]
+    fn failed_build_count_only_reports_failures() {
+        assert_eq!(
+            failed_build_count(&pr_with_checks(Some(CheckState::Failure {
+                passed: 3,
+                total: 5
+            }))),
+            Some(2)
+        );
+        assert_eq!(
+            failed_build_count(&pr_with_checks(Some(CheckState::Pending {
+                passed: 3,
+                total: 5
+            }))),
+            None
+        );
+        assert_eq!(failed_build_count(&pr_with_checks(None)), None);
+    }
 }

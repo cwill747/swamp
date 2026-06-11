@@ -40,6 +40,8 @@ pub struct PrSummary {
     pub check_meta: Option<CheckMeta>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub comment_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewDecision>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -48,4 +50,22 @@ pub struct PrSummary {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_summary_defaults_missing_comment_count() {
+        let pr: PrSummary = serde_json::from_value(serde_json::json!({
+            "number": 7,
+            "title": "Add status",
+            "state": "OPEN",
+            "isDraft": false
+        }))
+        .unwrap();
+
+        assert_eq!(pr.comment_count, 0);
+    }
 }

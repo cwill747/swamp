@@ -44,6 +44,7 @@ struct GraphqlPrNode {
     url: String,
     #[serde(rename = "reviewDecision")]
     review_decision: Option<String>,
+    comments: GraphqlTotalCount,
     #[serde(rename = "latestReviews")]
     latest_reviews: Option<GraphqlReviews>,
     commits: GraphqlCommits,
@@ -54,6 +55,12 @@ struct GraphqlReviews {
     #[serde(rename = "totalCount")]
     total_count: u32,
     nodes: Vec<GraphqlReviewNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlTotalCount {
+    #[serde(rename = "totalCount")]
+    total_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +285,7 @@ fn fetch_pr_chunk(
                     checks,
                     check_meta,
                     url: Some(node.url),
+                    comment_count: node.comments.total_count,
                     review,
                     reviews_partial,
                 },
@@ -305,6 +313,7 @@ fn build_branch_fragment(alias: &str, branch_var: &str) -> String {
         r#"    {alias}: pullRequests(headRefName: ${branch_var}, first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
         number title state isDraft headRefName url reviewDecision
+        comments {{ totalCount }}
         latestReviews(first: 10) {{ totalCount nodes {{ state }} }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{
           totalCount nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt }} ... on StatusContext {{ context state createdAt }} }}
@@ -379,6 +388,7 @@ mod tests {
     fn branch_fragment_uses_variable_and_total_counts() {
         let fragment = build_branch_fragment("br0_feature", "branch0");
         assert!(fragment.contains("headRefName: $branch0"));
+        assert!(fragment.contains("comments { totalCount }"));
         assert!(fragment.contains("latestReviews(first: 10) { totalCount"));
         assert!(fragment.contains("contexts(first: 100) {\n          totalCount"));
         assert!(!fragment.contains("headRefName: \""));
