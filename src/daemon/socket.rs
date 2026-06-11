@@ -102,6 +102,13 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         let res = daemon.resources.read().await.clone();
                         write_msg(&mut stream, &ServerMsg::Resources(res)).await?;
                         let pr_snap = daemon.state.read().await.pr_snapshot();
+                        // Kick the poller to fetch now (rather than on its next
+                        // cadence) when no fetch has resolved yet. `Notify`
+                        // coalesces concurrent subscribers into a single wake, and
+                        // the poller serializes fetches, so this can't fan out.
+                        if pr_snap.loading {
+                            daemon.pr_wake.notify_one();
+                        }
                         write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
                     ClientMsg::Hook { worktree, status, session_name, session_id } => {

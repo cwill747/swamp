@@ -47,6 +47,8 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
     if pr_rows.is_empty() {
         let empty_msg = if has_error && app.pr_snapshot.fetched_at.is_none() {
             "github unreachable"
+        } else if app.pr_snapshot.loading {
+            "Loading PRs…"
         } else {
             "No PRs for any worktree branch"
         };

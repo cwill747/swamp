@@ -122,7 +122,12 @@ where
         status_msg: None,
         toast: None,
         resources: resources::Snapshot::default(),
-        pr_snapshot: PrSnapshot::default(),
+        // Start in the loading state so the very first frame (drawn before the
+        // daemon's first PrStatus arrives) shows "Loading PRs…", not "No PRs".
+        pr_snapshot: PrSnapshot {
+            loading: true,
+            ..PrSnapshot::default()
+        },
         resource_scroll: 0,
         resource_viewport_height: 0,
         current_dir: cwd.canonicalize().ok(),

@@ -90,3 +90,11 @@ pub fn review_changes() -> &'static str {
 pub fn review_approved() -> &'static str {
     if ascii_mode() { "A" } else { "\u{f00c}" }
 }
+
+/// A static, muted "PR data still loading" mark for the worktrees pane. This is
+/// deliberately NOT the [`SPINNER_FRAMES`] braille spinner used for CI-pending
+/// checks — a network PR fetch in flight must read differently from a build that
+/// is actively running.
+pub fn pr_loading() -> &'static str {
+    if ascii_mode() { "..." } else { "…" }
+}

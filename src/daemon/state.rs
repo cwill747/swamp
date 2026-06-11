@@ -6,6 +6,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -75,9 +77,15 @@ pub struct PrSnapshot {
     /// Set when the most recent fetch failed; cleared on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True until the first PR fetch resolves (success *or* error). Lets the TUI
+    /// distinguish a never-fetched (loading) state from a fetched-but-empty one,
+    /// so it shows "Loading PRs…" on first launch instead of "No PRs". A
+    /// `#[serde(default)]` of `false` means an older peer's snapshot decodes as
+    /// already-fetched (the safe, non-spinning interpretation).
+    #[serde(default)]
+    pub loading: bool,
 }
 
-#[derive(Default)]
 pub struct DaemonState {
     pub rows: HashMap<String, WorktreeRow>,
     pub agents: HashMap<String, AgentRecord>,
@@ -86,6 +94,24 @@ pub struct DaemonState {
     pr_fetched_at: Option<u64>,
     /// Last PR fetch error, if any (mirrors `PrSnapshot::error`).
     pr_error: Option<String>,
+    /// Mirrors `PrSnapshot::loading`: true until the first PR fetch resolves.
+    /// Starts true (no fetch has happened yet) and is cleared by the first
+    /// `update_prs` or `record_pr_error`.
+    pr_loading: bool,
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self {
+            rows: HashMap::new(),
+            agents: HashMap::new(),
+            prs: HashMap::new(),
+            pr_fetched_at: None,
+            pr_error: None,
+            // No PR fetch has happened yet, so a fresh daemon reports loading.
+            pr_loading: true,
+        }
+    }
 }
 
 impl DaemonState {
@@ -96,11 +122,8 @@ impl DaemonState {
         // time any record changes (a hook ping or `set_harness`).
         let agents = load_agents(common_dir).await;
         Ok(Self {
-            rows: HashMap::new(),
             agents,
-            prs: HashMap::new(),
-            pr_fetched_at: None,
-            pr_error: None,
+            ..Default::default()
         })
     }
 
@@ -228,6 +251,8 @@ impl DaemonState {
             .ok()
             .map(|d| d.as_secs());
         self.pr_error = None;
+        // The first fetch has resolved; clear the loading state.
+        self.pr_loading = false;
     }
 
     /// Record a PR fetch failure.
@@ -239,6 +264,10 @@ impl DaemonState {
         // Intentionally does NOT clear `self.prs`.
         tracing::warn!(error = %error, "github PR fetch failed; keeping previous state");
         self.pr_error = Some(error);
+        // A fetch resolved (with an error); stop reporting loading so a repo with
+        // no `gh`/network settles into the "github unreachable" path rather than
+        // spinning "Loading…" forever.
+        self.pr_loading = false;
     }
 
     pub fn pr_snapshot(&self) -> PrSnapshot {
@@ -246,6 +275,7 @@ impl DaemonState {
             prs: self.prs.clone(),
             fetched_at: self.pr_fetched_at,
             error: self.pr_error.clone(),
+            loading: self.pr_loading,
         }
     }
 }
@@ -274,23 +304,46 @@ pub fn scan_worktrees(
     agents: &HashMap<String, AgentRecord>,
 ) -> Result<HashMap<String, WorktreeRow>> {
     let wts = worktree::list_worktrees(common_dir)?;
-    let mut new_rows = HashMap::new();
-    for wt in wts {
-        let info = worktree::git_info(&wt.path).unwrap_or_default();
-        let name = wt.name();
-        let agent = agents.get(&name).cloned().unwrap_or_default();
-        let row = build_row(&wt, &info, &agent);
-        tracing::trace!(
-            worktree = %name,
-            branch = %row.branch,
-            ahead = row.ahead,
-            behind = row.behind,
-            dirty = row.staged + row.unstaged + row.untracked,
-            "scanned worktree"
-        );
-        new_rows.insert(name, row);
+    if wts.is_empty() {
+        return Ok(HashMap::new());
     }
-    Ok(new_rows)
+
+    // Gather per-worktree git status concurrently. Each `git_info` shells out to
+    // `git status` / `git rev-list`, so a sequential loop made first-launch
+    // latency scale with worktree count. We're already on a `spawn_blocking`
+    // thread, so fanning the work across a small pool of scoped OS threads is
+    // safe; `MAX_SCAN_CONCURRENCY` caps the number of simultaneous `git`
+    // subprocesses so a repo with dozens of worktrees can't stampede the box.
+    const MAX_SCAN_CONCURRENCY: usize = 8;
+    let workers = MAX_SCAN_CONCURRENCY.min(wts.len());
+    let next = AtomicUsize::new(0);
+    let new_rows: Mutex<HashMap<String, WorktreeRow>> = Mutex::new(HashMap::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(wt) = wts.get(i) else { break };
+                    let info = worktree::git_info(&wt.path).unwrap_or_default();
+                    let name = wt.name();
+                    let agent = agents.get(&name).cloned().unwrap_or_default();
+                    let row = build_row(wt, &info, &agent);
+                    tracing::trace!(
+                        worktree = %name,
+                        branch = %row.branch,
+                        ahead = row.ahead,
+                        behind = row.behind,
+                        dirty = row.staged + row.unstaged + row.untracked,
+                        "scanned worktree"
+                    );
+                    new_rows.lock().unwrap().insert(name, row);
+                }
+            });
+        }
+    });
+
+    Ok(new_rows.into_inner().unwrap())
 }
 
 fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
@@ -615,5 +668,66 @@ mod tests {
         prs.insert("main".into(), make_pr(1));
         state.update_prs(prs);
         assert!(state.pr_error.is_none());
+    }
+
+    /// A fresh daemon (no fetch yet) reports `loading = true` so the TUI shows
+    /// "Loading PRs…" rather than "No PRs" before the first fetch resolves.
+    #[test]
+    fn pr_snapshot_loading_by_default() {
+        let state = DaemonState::default();
+        assert!(
+            state.pr_snapshot().loading,
+            "fresh state must report loading"
+        );
+    }
+
+    /// The first successful fetch clears `loading`.
+    #[test]
+    fn update_prs_clears_loading() {
+        let mut state = DaemonState::default();
+        assert!(state.pr_snapshot().loading);
+
+        let mut prs = HashMap::new();
+        prs.insert("feat".into(), make_pr(9));
+        state.update_prs(prs);
+
+        assert!(
+            !state.pr_snapshot().loading,
+            "a resolved fetch must clear loading"
+        );
+    }
+
+    /// The first fetch *error* also clears `loading` — loading means "no fetch
+    /// has resolved yet", so a repo with no `gh`/network must not spin forever.
+    #[test]
+    fn record_pr_error_clears_loading() {
+        let mut state = DaemonState::default();
+        assert!(state.pr_snapshot().loading);
+
+        state.record_pr_error("gh not found".into());
+
+        assert!(
+            !state.pr_snapshot().loading,
+            "an errored fetch must clear loading"
+        );
+    }
+
+    /// A fetch error before any success clears loading while preserving the
+    /// (empty) map — the snapshot reflects errored-and-empty, not loading.
+    #[test]
+    fn record_pr_error_clears_loading_and_keeps_map() {
+        let mut state = DaemonState::default();
+
+        // Seed a prior success so we can confirm the map is preserved on error.
+        let mut prs = HashMap::new();
+        prs.insert("feat".into(), make_pr(3));
+        state.update_prs(prs);
+        assert!(!state.pr_snapshot().loading);
+
+        state.record_pr_error("network timeout".into());
+        let snap = state.pr_snapshot();
+        assert!(!snap.loading);
+        assert_eq!(snap.prs.len(), 1, "error must preserve the previous map");
+        assert_eq!(snap.error.as_deref(), Some("network timeout"));
     }
 }
