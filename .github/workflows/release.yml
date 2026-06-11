@@ -60,6 +60,11 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - uses: cachix/cachix-action@v15
+        with:
+          name: cwill747-swamp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - name: Build static binary
         run: nix build --print-build-logs .#${{ matrix.package }}
 
