@@ -23,19 +23,30 @@ enum WorktreeTableLayout {
     Expanded,
 }
 
+struct WorktreeRowContext<'a> {
+    selected: Option<usize>,
+    now: u64,
+    current_tab: Option<&'a str>,
+    pin_current: bool,
+    layout: WorktreeTableLayout,
+}
+
 pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rect) {
     let now = now_unix();
-    let current_tab = app.current_tab.as_deref();
-    let pin_current = app.view == TuiView::Worktrees;
-    let selected = app.selected_index();
-    let layout = worktree_table_layout(area);
+    let ctx = WorktreeRowContext {
+        selected: app.selected_index(),
+        current_tab: app.current_tab.as_deref(),
+        pin_current: app.view == TuiView::Worktrees,
+        layout: worktree_table_layout(area),
+        now,
+    };
 
     let rows: Vec<Row> = app
         .snapshot
         .rows
         .iter()
         .enumerate()
-        .map(|(i, r)| build_row(i, r, app, selected, now, current_tab, pin_current, layout))
+        .map(|(i, r)| build_row(i, r, app, &ctx))
         .collect();
 
     let compact_constraints = [
@@ -63,7 +74,7 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
     ];
     let table = Table::new(
         rows,
-        match layout {
+        match ctx.layout {
             WorktreeTableLayout::Compact => compact_constraints.as_slice(),
             WorktreeTableLayout::Expanded => expanded_constraints.as_slice(),
         },
@@ -78,6 +89,7 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
 
     let inner = bordered_inner(area);
     let visible_capacity = inner.height as usize;
+    let selected = ctx.selected;
     if let Some(idx) = selected {
         if idx < app.worktree_scroll {
             app.worktree_scroll = idx;
@@ -118,15 +130,11 @@ fn build_row<'a>(
     i: usize,
     r: &'a WorktreeRow,
     app: &AppState,
-    selected: Option<usize>,
-    now: u64,
-    current_tab: Option<&str>,
-    pin_current: bool,
-    layout: WorktreeTableLayout,
+    ctx: &WorktreeRowContext<'_>,
 ) -> Row<'a> {
-    let is_current = current_tab.map(|t| t == r.name).unwrap_or(false);
-    let is_pinned = pin_current && is_current;
-    let recent = now.saturating_sub(r.agent_ts) < 300;
+    let is_current = ctx.current_tab.map(|t| t == r.name).unwrap_or(false);
+    let is_pinned = ctx.pin_current && is_current;
+    let recent = ctx.now.saturating_sub(r.agent_ts) < 300;
 
     let idx_cell = {
         let mut spans = Vec::new();
@@ -219,7 +227,7 @@ fn build_row<'a>(
 
     let mut cells = vec![idx_cell, agent_cell, pr_cell];
 
-    if layout == WorktreeTableLayout::Expanded {
+    if ctx.layout == WorktreeTableLayout::Expanded {
         if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
             cells.push(failed_builds_cell(pr));
             cells.push(comment_count_cell(pr));
@@ -233,7 +241,7 @@ fn build_row<'a>(
 
     cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
     let row = Row::new(cells);
-    if selected == Some(i) {
+    if ctx.selected == Some(i) {
         row.style(Theme::selected())
     } else if is_current {
         row.style(Theme::current())
@@ -281,7 +289,15 @@ fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
 
 fn failed_build_count(pr: &PrSummary) -> Option<u32> {
     match pr.checks {
-        Some(CheckState::Failure { passed, total }) => Some(total.saturating_sub(passed).max(1)),
+        Some(CheckState::Failure {
+            passed,
+            total,
+            failed,
+        }) => Some(if failed > 0 {
+            failed
+        } else {
+            total.saturating_sub(passed).max(1)
+        }),
         _ => None,
     }
 }
@@ -382,9 +398,18 @@ mod tests {
         assert_eq!(
             failed_build_count(&pr_with_checks(Some(CheckState::Failure {
                 passed: 3,
-                total: 5
+                total: 5,
+                failed: 2
             }))),
             Some(2)
+        );
+        assert_eq!(
+            failed_build_count(&pr_with_checks(Some(CheckState::Failure {
+                passed: 3,
+                total: 5,
+                failed: 1
+            }))),
+            Some(1)
         );
         assert_eq!(
             failed_build_count(&pr_with_checks(Some(CheckState::Pending {

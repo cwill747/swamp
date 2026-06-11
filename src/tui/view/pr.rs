@@ -81,7 +81,8 @@ pub(super) fn render_pr_status(f: &mut Frame, app: &mut AppState, area: Rect) {
             let (check_icon, check_color) = check_state_icon_color(checks, app.spinner_frame);
             let mut spans = vec![Span::styled(check_icon, Style::default().fg(check_color))];
             match checks {
-                CheckState::Failure { passed, total } | CheckState::Pending { passed, total } => {
+                CheckState::Failure { passed, total, .. }
+                | CheckState::Pending { passed, total } => {
                     spans.push(Span::styled(
                         format!(" {}/{}", passed, total),
                         Style::default().fg(check_color),

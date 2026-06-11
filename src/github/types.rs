@@ -3,8 +3,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CheckState {
     Success,
-    Failure { passed: u32, total: u32 },
-    Pending { passed: u32, total: u32 },
+    Failure {
+        passed: u32,
+        total: u32,
+        #[serde(default)]
+        failed: u32,
+    },
+    Pending {
+        passed: u32,
+        total: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

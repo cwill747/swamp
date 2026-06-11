@@ -81,7 +81,11 @@ pub(super) fn aggregate_checks(
     }
 
     let state = if failed > 0 {
-        CheckState::Failure { passed, total }
+        CheckState::Failure {
+            passed,
+            total,
+            failed,
+        }
     } else if pending > 0 {
         CheckState::Pending { passed, total }
     } else {
@@ -219,7 +223,8 @@ mod tests {
             aggregate_checks(&checks, false).0,
             Some(CheckState::Failure {
                 passed: 1,
-                total: 2
+                total: 2,
+                failed: 1
             })
         );
     }
@@ -250,7 +255,8 @@ mod tests {
             aggregate_checks(&checks, false).0,
             Some(CheckState::Failure {
                 passed: 1,
-                total: 3
+                total: 3,
+                failed: 1
             })
         );
     }
@@ -304,7 +310,8 @@ mod tests {
             state,
             Some(CheckState::Failure {
                 passed: 1,
-                total: 2
+                total: 2,
+                failed: 1
             })
         );
         assert_eq!(
