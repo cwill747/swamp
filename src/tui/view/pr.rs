@@ -184,20 +184,25 @@ pub(super) fn pr_state_icon_color(pr: &PrSummary) -> (&'static str, Color) {
 }
 
 pub(super) fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
+    review_status_span(review).map_or_else(|| Cell::from(""), Cell::from)
+}
+
+fn review_status_span(review: &Option<ReviewDecision>) -> Option<Span<'static>> {
     match review {
-        Some(ReviewDecision::Approved) => Cell::from(Span::styled(
+        Some(ReviewDecision::Approved) => Some(Span::styled(
             icons::review_approved(),
             Style::default().fg(Color::Green),
         )),
-        Some(ReviewDecision::ChangesRequested) => Cell::from(Span::styled(
+        Some(ReviewDecision::ChangesRequested) => Some(Span::styled(
             icons::review_changes(),
             Style::default().fg(Color::Red),
         )),
-        Some(ReviewDecision::Commented) => Cell::from(Span::styled(
+        Some(ReviewDecision::Commented) => Some(Span::styled(
             icons::review_commented(),
             Style::default().fg(Color::Yellow),
         )),
-        _ => Cell::from(""),
+        Some(ReviewDecision::ReviewRequired) => Some(Span::styled("?", Theme::muted())),
+        _ => None,
     }
 }
 
@@ -231,5 +236,16 @@ fn check_state_icon_color(checks: &CheckState, spinner_frame: usize) -> (String,
             let frame = icons::SPINNER_FRAMES[spinner_frame % icons::SPINNER_FRAMES.len()];
             (frame.to_string(), Color::Cyan)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_status_cell_marks_required_reviews() {
+        let span = review_status_span(&Some(ReviewDecision::ReviewRequired)).unwrap();
+        assert_eq!(span.content, "?");
     }
 }
