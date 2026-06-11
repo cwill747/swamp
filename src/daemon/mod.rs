@@ -607,18 +607,45 @@ impl Daemon {
         self.refresh_all_unlocked().await
     }
 
-    /// Remove worktree `name` and its local branch (git2, off the async thread),
-    /// then broadcast the refreshed snapshot.
-    pub async fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
-        let _repo = self.repo_ops.lock().await;
-        let common = self.common_dir.clone();
-        let name = name.to_string();
-        tokio::task::spawn_blocking(move || {
-            crate::worktree::remove_worktree(&common, &name, true, force)
-        })
-        .await
-        .context("remove worktree task")??;
-        self.refresh_all_unlocked().await
+    /// Remove worktree `name` and its local branch (git2, off the async thread).
+    ///
+    /// The reply is *not* gated on a full rescan: once the removal succeeds the
+    /// daemon optimistically drops the deleted row and broadcasts the new
+    /// snapshot, so the TUI reflects the deletion immediately. A full
+    /// `refresh_all` then reconciles the rest of the worktree set in the
+    /// background. The old behavior — `refresh_all_unlocked().await` inline —
+    /// made the client wait out a status scan of *every* remaining worktree
+    /// (which scales with worktree count) before the row could disappear.
+    pub async fn remove_worktree(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+        {
+            let _repo = self.repo_ops.lock().await;
+            let common = self.common_dir.clone();
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::worktree::remove_worktree(&common, &name, true, force)
+            })
+            .await
+            .context("remove worktree task")??;
+        }
+
+        // Optimistic removal: drop just the deleted row and broadcast now.
+        let snap = {
+            let mut s = self.state.write().await;
+            s.remove_row(name);
+            s.snapshot()
+        };
+        let _ = self.tx.send(ServerMsg::Snapshot(snap));
+
+        // Reconcile the remaining worktrees in the background. `refresh_all`
+        // coalesces with the watcher-triggered refresh that the directory
+        // removal also kicks off, so this can't stack a redundant scan.
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = daemon.refresh_all().await {
+                tracing::warn!("post-delete refresh: {e:?}");
+            }
+        });
+        Ok(())
     }
 
     pub async fn list_branches(&self) -> Result<Vec<crate::worktree::BranchInfo>> {
