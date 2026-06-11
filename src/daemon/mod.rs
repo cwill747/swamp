@@ -124,11 +124,11 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
 
     let sock = socket_path(&common)?;
     // Remove a stale socket if the previous daemon died.
-    if sock.exists() {
+    if std::fs::symlink_metadata(&sock).is_ok() {
         if probe(&sock).await.is_ok() {
             anyhow::bail!("swamp serve already running for {}", common.display());
         }
-        let _ = std::fs::remove_file(&sock);
+        remove_stale_socket(&sock)?;
     }
 
     // The daemon is the long-lived writer, so it truncates the per-repo log on
@@ -326,6 +326,7 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
 /// `serve` for why that ordering matters.
 fn bind_and_kickoff(daemon: &Arc<Daemon>, common: &Path, sock: &Path) -> Result<UnixListener> {
     let listener = UnixListener::bind(sock).context("bind socket")?;
+    set_socket_permissions(sock)?;
     let pid = pid_path(common)?;
     std::fs::write(pid, std::process::id().to_string())?;
     tracing::info!("swamp daemon listening on {}", sock.display());
@@ -337,6 +338,38 @@ fn bind_and_kickoff(daemon: &Arc<Daemon>, common: &Path, sock: &Path) -> Result<
         }
     });
     Ok(listener)
+}
+
+fn remove_stale_socket(sock: &Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let meta = std::fs::symlink_metadata(sock)
+        .with_context(|| format!("stat stale socket {}", sock.display()))?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!("refusing to remove stale socket symlink {}", sock.display());
+    }
+    if !meta.file_type().is_socket() {
+        anyhow::bail!(
+            "refusing to remove stale socket path {}: not a socket",
+            sock.display()
+        );
+    }
+    let our_uid = unsafe { libc::getuid() };
+    if meta.uid() != our_uid {
+        anyhow::bail!(
+            "refusing to remove stale socket {} owned by uid {}",
+            sock.display(),
+            meta.uid()
+        );
+    }
+    std::fs::remove_file(sock).with_context(|| format!("remove stale socket {}", sock.display()))
+}
+
+fn set_socket_permissions(sock: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set permissions on socket {}", sock.display()))
 }
 
 async fn await_shared_op(mut rx: SharedOpRx) -> Result<()> {
@@ -613,13 +646,16 @@ impl Daemon {
 
 pub(crate) async fn probe(sock: &Path) -> Result<()> {
     // Connect + send Ping; if it succeeds someone's home.
-    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
     let mut s = UnixStream::connect(sock).await?;
-    let msg = serde_json::to_vec(&ClientMsg::Ping)?;
-    s.write_all(&(msg.len() as u32).to_be_bytes()).await?;
-    s.write_all(&msg).await?;
-    Ok(())
+    socket::write_client_msg(&mut s, &ClientMsg::Ping).await?;
+    match tokio::time::timeout(Duration::from_secs(2), socket::read_server_msg(&mut s)).await {
+        Ok(Ok(Some(ServerMsg::Pong))) => Ok(()),
+        Ok(Ok(Some(other))) => anyhow::bail!("unexpected probe response: {other:?}"),
+        Ok(Ok(None)) => anyhow::bail!("daemon closed probe socket"),
+        Ok(Err(e)) => Err(e),
+        Err(_) => anyhow::bail!("daemon probe timed out"),
+    }
 }
 
 #[cfg(test)]

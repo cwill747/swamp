@@ -4,9 +4,11 @@ use super::state::{PrSnapshot, Snapshot};
 use crate::config::Harness;
 use crate::worktree::BranchInfo;
 use anyhow::Result;
+use git2::Reference;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -88,7 +90,7 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
     let mut subscription: Option<PrSubscription> = None;
     loop {
         tokio::select! {
-            res = read_msg(&mut stream) => {
+            res = read_client_msg(&mut stream, subscription.is_some()) => {
                 let Some(msg) = res? else { return Ok(()); };
                 match msg {
                     ClientMsg::Ping => write_msg(&mut stream, &ServerMsg::Pong).await?,
@@ -104,6 +106,10 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
                     ClientMsg::Hook { worktree, status, session_name, session_id } => {
+                        if let Err(e) = validate_hook(&worktree, session_name.as_deref(), session_id.as_deref()) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
                         match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref()).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
@@ -141,24 +147,40 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         }
                     }
                     ClientMsg::CreateWorktree { branch } => {
+                        if let Err(e) = validate_branch_name(&branch) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
                         match daemon.create_worktree(&branch).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
                     }
                     ClientMsg::CreateWorktreeFromBase { branch, base } => {
+                        if let Err(e) = validate_branch_name(&branch).and_then(|_| validate_refish("base", &base)) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
                         match daemon.create_worktree_from_base(&branch, &base).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
                     }
                     ClientMsg::SetHarness { worktree, harness } => {
+                        if let Err(e) = validate_worktree_name(&worktree) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
                         match daemon.set_harness(&worktree, harness).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
                     }
                     ClientMsg::RemoveWorktree { name, force } => {
+                        if let Err(e) = validate_worktree_name(&name) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
                         match daemon.remove_worktree(&name, force).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => {
@@ -207,12 +229,44 @@ impl Drop for PrSubscription {
     }
 }
 
-/// Maximum frame size for both client and server messages (16 MiB).
-/// A length prefix exceeding this cap causes the connection to be dropped rather
-/// than allocating an unbounded amount of memory.
-const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+const PROTOCOL_MAGIC: &[u8; 4] = b"SWP1";
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CLIENT_FRAME_LEN: usize = 256 * 1024;
+const MAX_SERVER_FRAME_LEN: usize = 16 * 1024 * 1024;
+const MAX_NAME_LEN: usize = 255;
+const MAX_SESSION_FIELD_LEN: usize = 512;
+
+async fn read_client_msg(stream: &mut UnixStream, subscribed: bool) -> Result<Option<ClientMsg>> {
+    if subscribed {
+        read_msg(stream).await
+    } else {
+        match tokio::time::timeout(CLIENT_READ_TIMEOUT, read_msg(stream)).await {
+            Ok(res) => res,
+            Err(_) => anyhow::bail!("timed out waiting for client message"),
+        }
+    }
+}
 
 pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
+    read_framed_json(stream, MAX_CLIENT_FRAME_LEN).await
+}
+
+pub async fn write_msg(stream: &mut UnixStream, msg: &ServerMsg) -> Result<()> {
+    write_framed_json(stream, msg).await
+}
+
+pub async fn read_server_msg(stream: &mut UnixStream) -> Result<Option<ServerMsg>> {
+    read_framed_json(stream, MAX_SERVER_FRAME_LEN).await
+}
+
+pub async fn write_client_msg(stream: &mut UnixStream, msg: &ClientMsg) -> Result<()> {
+    write_framed_json(stream, msg).await
+}
+
+async fn read_framed_json<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    max_frame_len: usize,
+) -> Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     if let Err(e) = stream.read_exact(&mut len_buf).await {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -221,52 +275,83 @@ pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
         return Err(e.into());
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > max_frame_len {
         anyhow::bail!(
-            "incoming frame length {len} exceeds maximum {MAX_FRAME_LEN}; dropping connection"
+            "incoming frame length {len} exceeds maximum {max_frame_len}; dropping connection"
         );
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(Some(serde_json::from_slice(&buf)?))
+    let payload = buf.strip_prefix(PROTOCOL_MAGIC).unwrap_or(&buf);
+    Ok(Some(serde_json::from_slice(payload)?))
 }
 
-pub async fn write_msg(stream: &mut UnixStream, msg: &ServerMsg) -> Result<()> {
-    let bytes = serde_json::to_vec(msg)?;
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(&bytes).await?;
+async fn write_framed_json<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
+    let payload = serde_json::to_vec(msg)?;
+    let len = PROTOCOL_MAGIC.len() + payload.len();
+    stream.write_all(&(len as u32).to_be_bytes()).await?;
+    stream.write_all(PROTOCOL_MAGIC).await?;
+    stream.write_all(&payload).await?;
     stream.flush().await?;
     Ok(())
 }
 
-pub async fn read_server_msg(stream: &mut UnixStream) -> Result<Option<ServerMsg>> {
-    let mut len_buf = [0u8; 4];
-    if let Err(e) = stream.read_exact(&mut len_buf).await {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Ok(None);
-        }
-        return Err(e.into());
+fn validate_branch_name(branch: &str) -> Result<()> {
+    validate_refish("branch", branch)?;
+    if branch.starts_with('-') {
+        anyhow::bail!("branch must not start with '-'");
     }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        anyhow::bail!(
-            "incoming frame length {len} exceeds maximum {MAX_FRAME_LEN}; dropping connection"
-        );
+    let refname = format!("refs/heads/{branch}");
+    if !Reference::is_valid_name(&refname) {
+        anyhow::bail!("invalid branch name: {branch}");
     }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(Some(serde_json::from_slice(&buf)?))
+    Ok(())
 }
 
-pub async fn write_client_msg(stream: &mut UnixStream, msg: &ClientMsg) -> Result<()> {
-    let bytes = serde_json::to_vec(msg)?;
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
+fn validate_hook(
+    worktree: &str,
+    session_name: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<()> {
+    validate_worktree_name(worktree)?;
+    validate_optional_field("session_name", session_name, MAX_SESSION_FIELD_LEN)?;
+    validate_optional_field("session_id", session_id, MAX_SESSION_FIELD_LEN)
+}
+
+fn validate_refish(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if value.len() > MAX_NAME_LEN {
+        anyhow::bail!("{field} exceeds {MAX_NAME_LEN} bytes");
+    }
+    if value.chars().any(|c| c.is_control()) {
+        anyhow::bail!("{field} contains a control character");
+    }
+    Ok(())
+}
+
+fn validate_worktree_name(name: &str) -> Result<()> {
+    validate_refish("worktree", name)?;
+    if name == "." || name == ".." {
+        anyhow::bail!("worktree name must not be '.' or '..'");
+    }
+    if name.contains('/') || name.contains('\\') {
+        anyhow::bail!("worktree name must not contain path separators");
+    }
+    Ok(())
+}
+
+fn validate_optional_field(field: &str, value: Option<&str>, max_len: usize) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() > max_len {
+        anyhow::bail!("{field} exceeds {max_len} bytes");
+    }
+    if value.chars().any(|c| c.is_control()) {
+        anyhow::bail!("{field} contains a control character");
+    }
     Ok(())
 }
 
@@ -432,6 +517,39 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    #[tokio::test]
+    async fn write_client_msg_prefixes_protocol_magic() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_client_msg(&mut client, &ClientMsg::Ping)
+            .await
+            .unwrap();
+
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        assert!(len > PROTOCOL_MAGIC.len());
+
+        let mut magic = [0u8; 4];
+        server.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, PROTOCOL_MAGIC);
+    }
+
+    #[tokio::test]
+    async fn read_msg_accepts_legacy_json_frame_without_magic() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let payload = serde_json::to_vec(&ClientMsg::Ping).unwrap();
+        writer
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&payload).await.unwrap();
+
+        assert!(matches!(
+            read_msg(&mut reader).await.unwrap(),
+            Some(ClientMsg::Ping)
+        ));
+    }
+
     /// A 4-byte length header of 0xFFFFFFFF (4 GiB) must be rejected by
     /// read_msg before any allocation attempt, instead of OOM-killing the
     /// daemon.
@@ -485,16 +603,15 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// A frame exactly at the cap (16 MiB) should be accepted; one byte over
-    /// must be rejected.
+    /// A client frame one byte over the cap must be rejected before allocation.
     #[tokio::test]
-    async fn read_msg_accepts_frame_at_cap_rejects_one_over() {
+    async fn read_msg_rejects_one_byte_over_client_cap() {
         // Just above cap — no socket needed, just check the arithmetic.
         let tmp_over =
             std::env::temp_dir().join(format!("swamp-test-over-cap-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&tmp_over).unwrap();
 
-        let over_len = (MAX_FRAME_LEN + 1) as u32;
+        let over_len = (MAX_CLIENT_FRAME_LEN + 1) as u32;
         let handle = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
             use tokio::io::AsyncWriteExt;
@@ -510,5 +627,31 @@ mod tests {
 
         handle.await.unwrap();
         let _ = std::fs::remove_file(&tmp_over);
+    }
+
+    #[test]
+    fn validates_branch_names_at_daemon_boundary() {
+        assert!(validate_branch_name("feature/login").is_ok());
+        assert!(validate_branch_name("").is_err());
+        assert!(validate_branch_name("-feature").is_err());
+        assert!(validate_branch_name("feature..login").is_err());
+        assert!(validate_branch_name("feature\nlogin").is_err());
+    }
+
+    #[test]
+    fn validates_worktree_names_at_daemon_boundary() {
+        assert!(validate_worktree_name("feature-login").is_ok());
+        assert!(validate_worktree_name("").is_err());
+        assert!(validate_worktree_name(".").is_err());
+        assert!(validate_worktree_name("..").is_err());
+        assert!(validate_worktree_name("feature/login").is_err());
+        assert!(validate_worktree_name("feature\\login").is_err());
+    }
+
+    #[test]
+    fn validates_session_fields_at_daemon_boundary() {
+        assert!(validate_hook("main", Some("session"), Some("id")).is_ok());
+        assert!(validate_hook("main", Some("bad\nsession"), None).is_err());
+        assert!(validate_hook("main", Some(&"x".repeat(MAX_SESSION_FIELD_LEN + 1)), None).is_err());
     }
 }
