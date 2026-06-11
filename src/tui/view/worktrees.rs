@@ -1,9 +1,9 @@
 use super::bordered_inner;
-use super::pr::pr_state_icon_color;
+use super::pr::{checks_status_cell, pr_state_icon_color, review_status_cell};
 use crate::cli::TuiView;
 use crate::config::Harness;
 use crate::daemon::state::{AgentStatus, WorktreeRow};
-use crate::github::{CheckState, PrSummary, ReviewDecision};
+use crate::github::{PrSummary, ReviewDecision};
 use crate::tui::AppState;
 use crate::tui::icons;
 use crate::tui::theme::Theme;
@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use std::time::{Duration, SystemTime};
 
-const EXPANDED_PR_COLUMNS_WIDTH: u16 = 92;
+const EXPANDED_PR_COLUMNS_WIDTH: u16 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorktreeTableLayout {
@@ -62,9 +62,9 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
     let expanded_constraints = [
         Constraint::Length(3), // # + caret
         Constraint::Length(2), // agent icon
-        Constraint::Length(1), // PR icon
-        Constraint::Length(3), // failed builds
-        Constraint::Length(4), // comments
+        Constraint::Length(2), // PR state icon
+        Constraint::Length(7), // #number
+        Constraint::Length(7), // checks
         Constraint::Length(2), // review
         Constraint::Min(8),    // worktree name
         Constraint::Min(10),   // branch
@@ -169,22 +169,6 @@ fn build_row<'a>(
         Cell::from(Span::styled(glyph, style))
     };
 
-    let pr_cell = if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
-        let (icon, color) = if pr.state == "OPEN" && !pr.is_draft {
-            match &pr.review {
-                Some(ReviewDecision::ChangesRequested) => (icons::review_changes(), Color::Red),
-                Some(ReviewDecision::Commented) => (icons::review_commented(), Color::Yellow),
-                Some(ReviewDecision::Approved) => (icons::review_approved(), Color::Green),
-                _ => pr_state_icon_color(pr),
-            }
-        } else {
-            pr_state_icon_color(pr)
-        };
-        Cell::from(Span::styled(icon, Style::default().fg(color)))
-    } else {
-        Cell::from(Span::raw(" "))
-    };
-
     let name_style = if is_pinned {
         Style::default()
             .fg(Theme::ACCENT)
@@ -225,18 +209,19 @@ fn build_row<'a>(
         None => Cell::from(Span::raw(" ")),
     };
 
-    let mut cells = vec![idx_cell, agent_cell, pr_cell];
+    let mut cells = vec![idx_cell, agent_cell];
 
     if ctx.layout == WorktreeTableLayout::Expanded {
         if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
-            cells.push(failed_builds_cell(pr));
-            cells.push(comment_count_cell(pr));
-            cells.push(review_status_cell(&pr.review));
+            cells.extend(pr_status_cells(pr, app.spinner_frame));
         } else {
             cells.push(Cell::from(""));
             cells.push(Cell::from(""));
             cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
         }
+    } else {
+        cells.push(compact_pr_cell(app.pr_snapshot.prs.get(&r.branch)));
     }
 
     cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
@@ -250,56 +235,39 @@ fn build_row<'a>(
     }
 }
 
-fn failed_builds_cell<'a>(pr: &PrSummary) -> Cell<'a> {
-    Cell::from(match failed_build_count(pr) {
-        Some(count) => Span::styled(count.to_string(), Style::default().fg(Color::Red)),
-        None => Span::raw(""),
-    })
-}
-
-fn comment_count_cell<'a>(pr: &PrSummary) -> Cell<'a> {
-    if pr.comment_count > 0 {
-        Cell::from(Span::styled(
-            pr.comment_count.to_string(),
-            Style::default().fg(Color::Yellow),
-        ))
-    } else {
-        Cell::from("")
-    }
-}
-
-fn review_status_cell<'a>(review: &Option<ReviewDecision>) -> Cell<'a> {
-    match review {
-        Some(ReviewDecision::Approved) => Cell::from(Span::styled(
-            icons::review_approved(),
-            Style::default().fg(Color::Green),
-        )),
-        Some(ReviewDecision::ChangesRequested) => Cell::from(Span::styled(
-            icons::review_changes(),
-            Style::default().fg(Color::Red),
-        )),
-        Some(ReviewDecision::Commented) => Cell::from(Span::styled(
-            icons::review_commented(),
-            Style::default().fg(Color::Yellow),
-        )),
-        Some(ReviewDecision::ReviewRequired) => Cell::from(Span::styled("?", Theme::muted())),
-        None => Cell::from(""),
-    }
-}
-
-fn failed_build_count(pr: &PrSummary) -> Option<u32> {
-    match pr.checks {
-        Some(CheckState::Failure {
-            passed,
-            total,
-            failed,
-        }) => Some(if failed > 0 {
-            failed
+fn compact_pr_cell<'a>(pr: Option<&PrSummary>) -> Cell<'a> {
+    if let Some(pr) = pr {
+        let (icon, color) = if pr.state == "OPEN" && !pr.is_draft {
+            match &pr.review {
+                Some(ReviewDecision::ChangesRequested) => (icons::review_changes(), Color::Red),
+                Some(ReviewDecision::Commented) => (icons::review_commented(), Color::Yellow),
+                Some(ReviewDecision::Approved) => (icons::review_approved(), Color::Green),
+                _ => pr_state_icon_color(pr),
+            }
         } else {
-            total.saturating_sub(passed).max(1)
-        }),
-        _ => None,
+            pr_state_icon_color(pr)
+        };
+        Cell::from(Span::styled(icon, Style::default().fg(color)))
+    } else {
+        Cell::from(Span::raw(" "))
     }
+}
+
+fn pr_status_cells<'a>(pr: &PrSummary, spinner_frame: usize) -> [Cell<'a>; 4] {
+    let (icon, color) = pr_state_icon_color(pr);
+    let state_cell = Cell::from(Span::styled(icon, Style::default().fg(color)));
+    let number_cell = Cell::from(Span::styled(
+        format!("#{}", pr.number),
+        Style::default().fg(color),
+    ));
+    let checks_cell = checks_status_cell(&pr.checks, spinner_frame);
+
+    [
+        state_cell,
+        number_cell,
+        checks_cell,
+        review_status_cell(&pr.review),
+    ]
 }
 
 pub(super) fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
@@ -365,6 +333,7 @@ pub(super) fn git_spans(r: &WorktreeRow) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::CheckState;
 
     fn pr_with_checks(checks: Option<CheckState>) -> PrSummary {
         PrSummary {
@@ -394,30 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_build_count_only_reports_failures() {
-        assert_eq!(
-            failed_build_count(&pr_with_checks(Some(CheckState::Failure {
+    fn pr_status_cells_match_pr_status_columns() {
+        let cells = pr_status_cells(
+            &pr_with_checks(Some(CheckState::Failure {
                 passed: 3,
                 total: 5,
-                failed: 2
-            }))),
-            Some(2)
+                failed: 1,
+            })),
+            0,
         );
-        assert_eq!(
-            failed_build_count(&pr_with_checks(Some(CheckState::Failure {
-                passed: 3,
-                total: 5,
-                failed: 1
-            }))),
-            Some(1)
-        );
-        assert_eq!(
-            failed_build_count(&pr_with_checks(Some(CheckState::Pending {
-                passed: 3,
-                total: 5
-            }))),
-            None
-        );
-        assert_eq!(failed_build_count(&pr_with_checks(None)), None);
+
+        assert_eq!(cells.len(), 4);
     }
 }
