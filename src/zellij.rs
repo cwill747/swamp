@@ -116,19 +116,24 @@ pub fn list_sessions() -> Result<Vec<String>> {
 }
 
 /// Switch the *calling* client to `session`. When `layout` is `Some`, the session
-/// is created from that layout if it doesn't already exist; the same call then
-/// moves the client into it. This is the nested-launch counterpart to `attach` /
-/// `new_session_with_layout`: instead of spawning a session the host client never
-/// joins, it hands the live client over to the repo session.
-pub fn switch_session(session: &str, layout: Option<&Path>) -> Result<()> {
-    let mut args = vec!["switch-session".to_string(), session.to_string()];
-    if let Some(layout) = layout {
-        args.push("--layout".to_string());
-        args.push(layout.to_string_lossy().into_owned());
-    }
+/// is created from that raw KDL layout if it doesn't already exist; the same call
+/// then moves the client into it. This is the nested-launch counterpart to
+/// `attach` / `new_session_with_layout`: instead of spawning a session the host
+/// client never joins, it hands the live client over to the repo session.
+pub fn switch_session(session: &str, layout: Option<&str>) -> Result<()> {
+    let args = switch_session_args(session, layout);
     tracing::info!(session, layout = ?layout, "switching zellij client to session");
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     action(&refs)
+}
+
+fn switch_session_args(session: &str, layout: Option<&str>) -> Vec<String> {
+    let mut args = vec!["switch-session".to_string(), session.to_string()];
+    if let Some(layout) = layout {
+        args.push("--layout-string".to_string());
+        args.push(layout.to_string());
+    }
+    args
 }
 
 /// Stable id of the currently active tab, parsed from `zellij action
@@ -223,5 +228,18 @@ mod tests {
     #[test]
     fn parse_tab_id_missing_id_is_error() {
         assert!(parse_tab_id("name: nested\nposition: 1\n").is_err());
+    }
+
+    #[test]
+    fn switch_session_with_layout_uses_inline_layout() {
+        assert_eq!(
+            switch_session_args("repo", Some("layout { tab {} }")),
+            vec![
+                "switch-session",
+                "repo",
+                "--layout-string",
+                "layout { tab {} }"
+            ]
+        );
     }
 }
