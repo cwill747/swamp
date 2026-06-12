@@ -25,11 +25,5 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
       - uses: DeterminateSystems/flakehub-cache-action@main
 
-      - uses: cachix/cachix-action@v15
-        if: github.event_name != 'pull_request'
-        with:
-          name: cwill747-swamp
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
       - name: Build fast package
         run: nix build

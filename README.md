@@ -27,7 +27,7 @@ a status sidebar.
 ### Nix
 
 ```bash
-nix profile install github:cwill747/swamp
+nix profile install "https://flakehub.com/f/cwill747/swamp/*.tar.gz"
 ```
 
 From a clone:
