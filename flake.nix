@@ -1,13 +1,6 @@
 {
   description = "Zellij-integrated git worktree dashboard";
 
-  nixConfig = {
-    extra-substituters = [ "https://cwill747-swamp.cachix.org" ];
-    extra-trusted-public-keys = [
-      "cwill747-swamp.cachix.org-1:Oa1mwV26phjG8DrTS4nMuUhfq6VfCFE66ROte3qSSWU="
-    ];
-  };
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     crane.url = "github:ipetkov/crane";
