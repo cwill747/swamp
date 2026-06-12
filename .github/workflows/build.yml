@@ -17,11 +17,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: DeterminateSystems/nix-installer-action@main
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/flakehub-cache-action@main
 
       - uses: cachix/cachix-action@v15
         if: github.event_name != 'pull_request'
@@ -31,36 +30,4 @@ jobs:
 
       - name: Build fast package
         if: github.event_name == 'pull_request'
-        run: nix build --print-build-logs .#dev
-
-      - name: Build release package
-        if: github.event_name != 'pull_request'
-        run: nix build --print-build-logs .#release
-
-  static:
-    if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            package: static
-          - os: ubuntu-latest
-            package: static-aarch64-linux
-          - os: macos-latest
-            package: static
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: DeterminateSystems/nix-installer-action@main
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - uses: cachix/cachix-action@v15
-        with:
-          name: cwill747-swamp
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - name: Build static binary
-        run: nix build --print-build-logs .#${{ matrix.package }}
+        run: nix build
