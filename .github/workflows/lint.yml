@@ -12,17 +12,15 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/determinate-nix-action@v3
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - uses: cachix/cachix-action@v15
-        with:
-          name: cwill747-swamp
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: DeterminateSystems/flakehub-cache-action@main
 
       - name: Check formatting
         run: nix develop --command cargo fmt --all --check
