@@ -35,9 +35,26 @@ pub fn go_to_tab_name(name: &str) -> Result<()> {
     action(&["go-to-tab-name", name])
 }
 
+/// Close the tab named `name`, returning focus to whatever tab was active when
+/// called. No-op when no tab named `name` is open.
+///
+/// `close-tab` always closes the *active* tab, so the named tab has to be
+/// focused first. The existence check guards the dangerous fallthrough: a
+/// `go-to-tab-name` for a missing tab silently leaves focus put (it still exits
+/// 0), so without the check the following `close-tab` tears down the active tab
+/// instead — closing the dashboard, or the whole session when it is the last
+/// tab. That fired whenever a worktree whose tab was not open got deleted.
 pub fn close_tab_by_name(name: &str) -> Result<()> {
+    if !list_tab_names()?.iter().any(|t| t == name) {
+        return Ok(());
+    }
+    let origin = current_tab_name().ok().filter(|o| o != name);
     go_to_tab_name(name)?;
-    action(&["close-tab"])
+    action(&["close-tab"])?;
+    if let Some(origin) = origin {
+        let _ = go_to_tab_name(&origin);
+    }
+    Ok(())
 }
 
 pub fn list_tab_names() -> Result<Vec<String>> {
@@ -136,11 +153,7 @@ fn switch_session_args(session: &str, layout: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Stable id of the currently active tab, parsed from `zellij action
-/// current-tab-info`. The default output is `name: <n>`/`id: <n>`/`position: <n>`
-/// lines; we want the `id:` value, which is the stable tab id accepted by
-/// `close-tab-by-id`.
-pub fn current_tab_id() -> Result<u32> {
+fn current_tab_info() -> Result<String> {
     let out = Command::new("zellij")
         .args(["action", "current-tab-info"])
         .output()
@@ -153,8 +166,21 @@ pub fn current_tab_id() -> Result<u32> {
             stderr.trim()
         );
     }
-    parse_tab_id(&String::from_utf8_lossy(&out.stdout))
-        .context("parse tab id from current-tab-info")
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Stable id of the currently active tab, parsed from `zellij action
+/// current-tab-info`. The default output is `name: <n>`/`id: <n>`/`position: <n>`
+/// lines; we want the `id:` value, which is the stable tab id accepted by
+/// `close-tab-by-id`.
+pub fn current_tab_id() -> Result<u32> {
+    parse_tab_id(&current_tab_info()?).context("parse tab id from current-tab-info")
+}
+
+/// Name of the currently active tab, parsed from the `name:` line of `zellij
+/// action current-tab-info`. Companion to [`current_tab_id`].
+pub fn current_tab_name() -> Result<String> {
+    parse_tab_name(&current_tab_info()?).context("parse tab name from current-tab-info")
 }
 
 fn parse_tab_id(stdout: &str) -> Result<u32> {
@@ -164,6 +190,16 @@ fn parse_tab_id(stdout: &str) -> Result<u32> {
         .map(str::trim)
         .and_then(|v| v.parse::<u32>().ok())
         .ok_or_else(|| anyhow::anyhow!("no parseable `id:` line in current-tab-info output"))
+}
+
+fn parse_tab_name(stdout: &str) -> Result<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("name:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("no parseable `name:` line in current-tab-info output"))
 }
 
 /// Best-effort close of tab `id` in a *named* session, targeting it explicitly so
@@ -228,6 +264,18 @@ mod tests {
     #[test]
     fn parse_tab_id_missing_id_is_error() {
         assert!(parse_tab_id("name: nested\nposition: 1\n").is_err());
+    }
+
+    #[test]
+    fn parse_tab_name_reads_name_line() {
+        let out = "name: dashboard\nid: 3\nposition: 1\n";
+        assert_eq!(parse_tab_name(out).unwrap(), "dashboard");
+    }
+
+    #[test]
+    fn parse_tab_name_missing_or_blank_is_error() {
+        assert!(parse_tab_name("id: 3\nposition: 1\n").is_err());
+        assert!(parse_tab_name("name:\nid: 3\n").is_err());
     }
 
     #[test]
