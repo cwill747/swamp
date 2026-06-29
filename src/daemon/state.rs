@@ -61,6 +61,12 @@ pub struct WorktreeRow {
     /// Effective harness override for this worktree (see [`AgentRecord::harness`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<Harness>,
+    /// Whether this row's branch is the repository default branch (trunk). The
+    /// TUI uses it to pin, mark, and suppress PR status for the default row.
+    /// `#[serde(default)]` keeps older `.swamp-status.json` snapshots loadable
+    /// (they decode as `false` and are corrected on the next scan).
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +104,11 @@ pub struct DaemonState {
     /// Starts true (no fetch has happened yet) and is cleared by the first
     /// `update_prs` or `record_pr_error`.
     pr_loading: bool,
+    /// Repository default branch name (e.g. `main`), resolved once in [`load`]
+    /// from the default remote's `HEAD`. Empty when undetectable. Not
+    /// serialized — it is re-resolved on every daemon start, so a mid-session
+    /// default-branch change is picked up on the next restart.
+    pub default_branch: String,
 }
 
 impl Default for DaemonState {
@@ -110,6 +121,7 @@ impl Default for DaemonState {
             pr_error: None,
             // No PR fetch has happened yet, so a fresh daemon reports loading.
             pr_loading: true,
+            default_branch: String::new(),
         }
     }
 }
@@ -121,8 +133,13 @@ impl DaemonState {
         // clobber other worktrees' session ids / harness overrides the first
         // time any record changes (a hook ping or `set_harness`).
         let agents = load_agents(common_dir).await;
+        // Resolve the default branch once per daemon lifetime. It is read from
+        // the default remote's HEAD and effectively never changes within a
+        // session, so re-resolving it on every scan would be wasted work.
+        let default_branch = worktree::default_branch(common_dir);
         Ok(Self {
             agents,
+            default_branch,
             ..Default::default()
         })
     }
@@ -314,6 +331,7 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
 pub fn scan_worktrees(
     common_dir: &Path,
     agents: &HashMap<String, AgentRecord>,
+    default_branch: &str,
 ) -> Result<HashMap<String, WorktreeRow>> {
     let wts = worktree::list_worktrees(common_dir)?;
     if wts.is_empty() {
@@ -340,7 +358,7 @@ pub fn scan_worktrees(
                     let info = worktree::git_info(&wt.path).unwrap_or_default();
                     let name = wt.name();
                     let agent = agents.get(&name).cloned().unwrap_or_default();
-                    let row = build_row(wt, &info, &agent);
+                    let row = build_row(wt, &info, &agent, default_branch);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -358,12 +376,18 @@ pub fn scan_worktrees(
     Ok(new_rows.into_inner().unwrap())
 }
 
-fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow {
+fn build_row(
+    wt: &Worktree,
+    info: &GitInfo,
+    agent: &AgentRecord,
+    default_branch: &str,
+) -> WorktreeRow {
     let branch = if info.branch.is_empty() || info.branch == "(detached)" {
         wt.branch.clone()
     } else {
         info.branch.clone()
     };
+    let is_default = !default_branch.is_empty() && branch == default_branch;
     WorktreeRow {
         name: wt.name(),
         path: wt.path.clone(),
@@ -382,6 +406,7 @@ fn build_row(wt: &Worktree, info: &GitInfo, agent: &AgentRecord) -> WorktreeRow 
         session_name: agent.session_name.clone(),
         head_ts: info.head_ts,
         harness: agent.harness,
+        is_default,
     }
 }
 
@@ -413,7 +438,57 @@ mod tests {
             session_name: None,
             head_ts,
             harness: None,
+            is_default: false,
         }
+    }
+
+    fn worktree(name: &str, branch: &str) -> Worktree {
+        Worktree {
+            path: PathBuf::from(format!("/repo/{name}")),
+            branch: branch.to_string(),
+        }
+    }
+
+    /// `build_row` flags only the worktree on the repo default branch, and
+    /// leaves every other row unflagged.
+    #[test]
+    fn build_row_flags_default_branch() {
+        let agent = AgentRecord::default();
+
+        let info_main = GitInfo {
+            branch: "main".into(),
+            ..Default::default()
+        };
+        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main");
+        assert!(main.is_default, "the default branch row must be flagged");
+
+        let info_feat = GitInfo {
+            branch: "feature/x".into(),
+            ..Default::default()
+        };
+        let feat = build_row(
+            &worktree("feature-x", "feature/x"),
+            &info_feat,
+            &agent,
+            "main",
+        );
+        assert!(!feat.is_default, "a non-default row must not be flagged");
+    }
+
+    /// When the default branch is undetectable (empty), no row is flagged —
+    /// even a worktree literally named/branched `main`.
+    #[test]
+    fn build_row_no_default_when_undetectable() {
+        let agent = AgentRecord::default();
+        let info = GitInfo {
+            branch: "main".into(),
+            ..Default::default()
+        };
+        let row = build_row(&worktree("main", "main"), &info, &agent, "");
+        assert!(
+            !row.is_default,
+            "no row may be flagged when the default branch is unknown"
+        );
     }
 
     /// With equal head_ts, snapshot falls back to alphabetical name order.

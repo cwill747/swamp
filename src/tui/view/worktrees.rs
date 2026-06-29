@@ -156,7 +156,14 @@ fn build_row<'a>(
         Cell::from(Line::from(spans))
     };
 
-    let agent_cell = {
+    let agent_cell = if r.is_default {
+        // The trunk row shows a star in the agent-icon slot instead of an agent
+        // status — agent activity on `main` is not a tracked workflow.
+        Cell::from(Span::styled(
+            icons::default_branch(),
+            Style::default().fg(Theme::DEFAULT_BRANCH),
+        ))
+    } else {
         let glyph = icons::agent_icon(r.agent, app.spinner_frame, recent);
         let style = match r.agent {
             AgentStatus::Working => Style::default().fg(Theme::WORKING),
@@ -169,7 +176,7 @@ fn build_row<'a>(
         Cell::from(Span::styled(glyph, style))
     };
 
-    let name_style = if is_pinned {
+    let mut name_style = if is_pinned {
         Style::default()
             .fg(Theme::ACCENT)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -178,9 +185,19 @@ fn build_row<'a>(
     } else {
         Style::default()
     };
+    // The default-branch row uses its own accent for name and branch, keeping
+    // any current/pinned emphasis (bold/underline) but overriding the color.
+    if r.is_default {
+        name_style = name_style.fg(Theme::DEFAULT_BRANCH);
+    }
     let name_cell = Cell::from(Span::styled(&r.name, name_style));
 
-    let branch_cell = Cell::from(Span::styled(&r.branch, Style::default().fg(Theme::BRANCH)));
+    let branch_color = if r.is_default {
+        Theme::DEFAULT_BRANCH
+    } else {
+        Theme::BRANCH
+    };
+    let branch_cell = Cell::from(Span::styled(&r.branch, Style::default().fg(branch_color)));
 
     let git_cell = Cell::from(Line::from(git_spans(r)));
 
@@ -212,7 +229,15 @@ fn build_row<'a>(
     let mut cells = vec![idx_cell, agent_cell];
 
     if ctx.layout == WorktreeTableLayout::Expanded {
-        if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
+        if r.is_default {
+            // The trunk row never shows PR/CI/review/comment status, and never a
+            // PR-loading indicator — push blank cells for every PR column,
+            // regardless of `pr_snapshot.loading`.
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+            cells.push(Cell::from(""));
+        } else if let Some(pr) = app.pr_snapshot.prs.get(&r.branch) {
             cells.extend(pr_status_cells(pr, app.spinner_frame));
         } else if app.pr_snapshot.loading {
             // PR data hasn't landed yet: mark the row as loading in the PR state
@@ -231,6 +256,9 @@ fn build_row<'a>(
             cells.push(Cell::from(""));
             cells.push(Cell::from(""));
         }
+    } else if r.is_default {
+        // Compact layout: blank PR cell for the trunk row, no loading glyph.
+        cells.push(Cell::from(Span::raw(" ")));
     } else {
         cells.push(compact_pr_cell(
             app.pr_snapshot.prs.get(&r.branch),

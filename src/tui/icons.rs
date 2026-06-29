@@ -41,6 +41,12 @@ pub fn current_marker() -> &'static str {
     if ascii_mode() { ">" } else { "▸" }
 }
 
+/// Marker for the repository default branch (trunk) row, shown in place of the
+/// agent icon so it reads as "this is just main" rather than a unit of work.
+pub fn default_branch() -> &'static str {
+    if ascii_mode() { "*" } else { "★" }
+}
+
 pub fn pr_icon(state: &str, is_draft: bool) -> &'static str {
     if is_draft {
         return if ascii_mode() { "d" } else { "\u{f4dd}" };

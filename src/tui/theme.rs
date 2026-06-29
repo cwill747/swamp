@@ -11,6 +11,9 @@ impl Theme {
     pub const DIRTY: Color = Color::Red;
     pub const MUTED: Color = Color::DarkGray;
     pub const BRANCH: Color = Color::Magenta;
+    /// Accent for the default-branch (trunk) row, distinct from `BRANCH`
+    /// (magenta) so the repository trunk is immediately recognizable. Gold.
+    pub const DEFAULT_BRANCH: Color = Color::Indexed(178);
     pub const SELECTED_BG: Color = Color::Indexed(236);
     pub const CURRENT_BG: Color = Color::Indexed(235);
 

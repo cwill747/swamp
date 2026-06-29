@@ -387,6 +387,7 @@ mod tests {
                     session_name: None,
                     head_ts: 0,
                     harness: None,
+                    is_default: false,
                 })
                 .collect(),
         }
