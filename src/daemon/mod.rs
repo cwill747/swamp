@@ -441,9 +441,9 @@ impl Daemon {
         // Clone out the agents map under a *read* lock so the git scan (which
         // can take seconds on large repos) runs completely off the runtime via
         // spawn_blocking, without blocking any async task or holding any lock.
-        let agents = {
+        let (agents, default_branch) = {
             let s = self.state.read().await;
-            s.agents.clone()
+            (s.agents.clone(), s.default_branch.clone())
         };
 
         // `scan_worktrees` fans the per-worktree git status out across a bounded
@@ -452,7 +452,7 @@ impl Daemon {
         // across this await — `agents` was cloned out above under a read lock.
         let common = self.common_dir.clone();
         let new_rows = tokio::task::spawn_blocking(move || {
-            crate::daemon::state::scan_worktrees(&common, &agents)
+            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)
         })
         .await
         .context("git scan task")??;

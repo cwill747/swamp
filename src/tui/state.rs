@@ -249,6 +249,21 @@ impl AppState {
             let row = self.snapshot.rows.remove(pos);
             self.snapshot.rows.insert(0, row);
         }
+        // Pin the default branch directly below the current worktree (second
+        // slot). If it is the resolved current worktree, leave it first rather
+        // than duplicating it down a row.
+        if let Some(pos) = self.snapshot.rows.iter().position(|r| r.is_default) {
+            let default_is_current = self
+                .current_tab
+                .as_ref()
+                .is_some_and(|tab| tab == &self.snapshot.rows[pos].name);
+            if default_is_current {
+                return;
+            }
+            let row = self.snapshot.rows.remove(pos);
+            let target = 1.min(self.snapshot.rows.len());
+            self.snapshot.rows.insert(target, row);
+        }
     }
 }
 
@@ -263,6 +278,113 @@ fn path_matches_worktree(dir: &std::path::Path, wt_path: &std::path::Path) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::state::{AgentStatus, WorktreeRow};
+
+    fn row(name: &str, is_default: bool) -> WorktreeRow {
+        WorktreeRow {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/repo/{name}")),
+            branch: name.to_string(),
+            upstream: None,
+            upstream_gone: false,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            conflict: false,
+            rebase: false,
+            agent: AgentStatus::Idle,
+            agent_ts: 0,
+            session_name: None,
+            head_ts: 0,
+            harness: None,
+            is_default,
+        }
+    }
+
+    /// Build a worktrees-view AppState whose active tab resolves (via
+    /// `tab_env`) to `current`, with the given rows.
+    fn app_with(rows: Vec<WorktreeRow>, current: &str) -> AppState {
+        AppState {
+            snapshot: Snapshot { rows },
+            selected: None,
+            worktree_scroll: 0,
+            spinner_frame: 0,
+            repo_name: "repo".into(),
+            view: TuiView::Worktrees,
+            refreshing: false,
+            pending_delete: None,
+            pending_create: None,
+            connected: true,
+            input: None,
+            status_msg: None,
+            toast: None,
+            resources: resources::Snapshot::default(),
+            pr_snapshot: PrSnapshot::default(),
+            resource_scroll: 0,
+            resource_viewport_height: 0,
+            current_dir: None,
+            pin_cwd: false,
+            tab_env: Some(current.to_string()),
+            current_tab: None,
+            regions: HitRegions::default(),
+            last_click: None,
+        }
+    }
+
+    /// The default-branch row is pinned to index 1, directly below the pinned
+    /// current worktree at index 0.
+    #[test]
+    fn pin_snapshot_puts_default_branch_second() {
+        let rows = vec![
+            row("feat-a", false),
+            row("main", true),
+            row("feat-b", false),
+        ];
+        let mut app = app_with(rows, "feat-a");
+        app.pin_snapshot();
+        let names: Vec<&str> = app.snapshot.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names[0], "feat-a", "current worktree stays pinned first");
+        assert_eq!(names[1], "main", "default branch is pinned second");
+    }
+
+    /// When the default branch *is* the current worktree it stays at index 0
+    /// and is not duplicated into the second slot.
+    #[test]
+    fn pin_snapshot_default_branch_is_current_stays_first() {
+        let rows = vec![
+            row("feat-a", false),
+            row("main", true),
+            row("feat-b", false),
+        ];
+        let mut app = app_with(rows, "main");
+        app.pin_snapshot();
+        let names: Vec<&str> = app.snapshot.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names[0], "main", "default+current worktree stays first");
+        assert_eq!(
+            names.iter().filter(|n| **n == "main").count(),
+            1,
+            "the default row must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn pin_snapshot_moves_default_branch_from_first_when_current_unresolved() {
+        let rows = vec![
+            row("main", true),
+            row("feat-a", false),
+            row("feat-b", false),
+        ];
+        let mut app = app_with(rows, "dashboard");
+        app.pin_snapshot();
+        let names: Vec<&str> = app.snapshot.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["feat-a", "main", "feat-b"],
+            "default branch is pinned second even when no current worktree matched"
+        );
+    }
 
     #[test]
     fn pane_cwd_matches_its_worktree() {
