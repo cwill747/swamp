@@ -92,13 +92,19 @@ async fn ensure_daemon(start: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     let me = std::env::current_exe()?;
-    std::process::Command::new(me)
+    // This intermediate `serve` process only re-spawns a detached `--foreground`
+    // daemon and then exits almost immediately. Wait for it so it gets reaped:
+    // otherwise it lingers as a `swamp <defunct>` zombie for the entire lifetime
+    // of this long-lived TUI (one per pane). The real daemon it spawned is
+    // reparented to init and continues running independently.
+    let mut child = tokio::process::Command::new(me)
         .arg("serve")
         .arg(start.display().to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
+    let _ = child.wait().await;
     // Wait for a daemon that actually answers, not just for the socket file to
     // reappear — during a stale-socket restart the old file lingers until the
     // new daemon rebinds, so existence alone would return prematurely.
