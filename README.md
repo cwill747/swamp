@@ -30,6 +30,30 @@ a status sidebar.
 nix profile install "https://flakehub.com/f/cwill747/swamp/*.tar.gz"
 ```
 
+#### Use the binary cache (skip rebuilding from source)
+
+CI publishes prebuilt outputs to [FlakeHub Cache](https://flakehub.com/cache).
+Without it configured, `nix profile install` only fetches the flake source and
+rebuilds swamp locally. FlakeHub Cache is an authenticated substituter, so a
+plain Nix install won't read from it until you log in once.
+
+[Determinate Nix](https://docs.determinate.systems/) wires up the
+`cache.flakehub.com` substituter, auth token, and trusted public keys
+automatically:
+
+```bash
+# Install Determinate Nix (skip if already installed)
+curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+
+# Authenticate to FlakeHub once
+determinate-nixd login
+
+nix profile install "https://flakehub.com/f/cwill747/swamp/*.tar.gz"
+```
+
+After logging in, the install substitutes the cached binary instead of
+compiling.
+
 From a clone:
 
 ```bash
