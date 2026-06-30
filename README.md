@@ -46,7 +46,7 @@ automatically:
 curl -fsSL https://install.determinate.systems/nix | sh -s -- install
 
 # Authenticate to FlakeHub once
-sudo determinate-nixd login
+determinate-nixd login
 
 nix profile install "https://flakehub.com/f/cwill747/swamp/*.tar.gz"
 ```
