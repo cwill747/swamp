@@ -288,15 +288,13 @@ fn nix_entry(shell: &Shell, nix: bool, in_nix: &str, direct: &str, exec: bool) -
     if shell.is_fish {
         format!(
             "if test -f flake.nix -o -f shell.nix -o -f default.nix; \
-             if test -f .git; {kw}nix develop path:. --command {in_nix}; \
-             else; {kw}nix develop --command {in_nix}; end; \
+             {kw}nix develop --command {in_nix}; \
              else; {kw}{direct}; end"
         )
     } else {
         format!(
             "if [ -f flake.nix ] || [ -f shell.nix ] || [ -f default.nix ]; then \
-             if [ -f .git ]; then {kw}nix develop path:. --command {in_nix}; \
-             else {kw}nix develop --command {in_nix}; fi; \
+             {kw}nix develop --command {in_nix}; \
              else {kw}{direct}; fi"
         )
     }

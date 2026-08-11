@@ -11,7 +11,7 @@ set -euo pipefail
 # Fall back to a bare cargo only when nix/flake aren't available.
 run() {
 	if command -v nix >/dev/null 2>&1 && [ -f flake.nix ]; then
-		nix develop path:. --command cargo "$@"
+		nix develop --command cargo "$@"
 	elif command -v cargo >/dev/null 2>&1; then
 		cargo "$@"
 	else

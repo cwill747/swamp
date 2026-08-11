@@ -57,20 +57,20 @@ compiling.
 From a clone:
 
 ```bash
-nix build path:.
+nix build
 ./result/bin/swamp --help
 ```
 
 For a faster unoptimized local build:
 
 ```bash
-nix build path:.#dev
+nix build .#dev
 ```
 
 For an optimized build matching release profile settings:
 
 ```bash
-nix build path:.#release
+nix build .#release
 ```
 
 ### Static binaries
