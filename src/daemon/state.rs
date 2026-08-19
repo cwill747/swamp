@@ -85,9 +85,19 @@ pub struct WorktreeRow {
     pub deleting: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub rows: Vec<WorktreeRow>,
+    /// Whether the daemon could resolve the repository default branch at all.
+    /// False for a repository with no default remote `HEAD` — a locally
+    /// initialized repository, or a bare clone whose remote HEAD was never
+    /// fetched. Every row then decodes as `is_default == false`, so a guard
+    /// written against `is_default` alone silently stops guarding. Consumers
+    /// that refuse a destructive action on the default worktree MUST check
+    /// this flag too and fail closed. `#[serde(default)]` decodes an older
+    /// peer's snapshot as "unknown", the safe reading.
+    #[serde(default)]
+    pub default_known: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -314,7 +324,10 @@ impl DaemonState {
             })
             .collect();
         rows.sort_by(|a, b| b.head_ts.cmp(&a.head_ts).then(a.name.cmp(&b.name)));
-        Snapshot { rows }
+        Snapshot {
+            rows,
+            default_known: !self.default_branch.is_empty(),
+        }
     }
 
     /// Record a successful PR fetch.
@@ -596,6 +609,25 @@ mod tests {
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
+        );
+    }
+
+    /// The snapshot carries whether the default branch was resolvable at all,
+    /// so a consumer can tell "this row is not trunk" apart from "no row can
+    /// be trunk because detection failed". `is_default` alone cannot: it
+    /// reads `false` in both cases.
+    #[test]
+    fn snapshot_reports_whether_the_default_branch_is_known() {
+        let mut state = DaemonState::default();
+        assert!(
+            !state.snapshot().default_known,
+            "an unresolved default branch must report as unknown"
+        );
+
+        state.default_branch = "main".to_string();
+        assert!(
+            state.snapshot().default_known,
+            "a resolved default branch must report as known"
         );
     }
 

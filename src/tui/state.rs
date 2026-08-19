@@ -316,7 +316,10 @@ mod tests {
     /// `tab_env`) to `current`, with the given rows.
     fn app_with(rows: Vec<WorktreeRow>, current: &str) -> AppState {
         AppState {
-            snapshot: Snapshot { rows },
+            snapshot: Snapshot {
+                rows,
+                default_known: true,
+            },
             selected: None,
             worktree_scroll: 0,
             spinner_frame: 0,

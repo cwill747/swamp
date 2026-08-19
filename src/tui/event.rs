@@ -109,7 +109,7 @@ where
     }
 
     let mut app = AppState {
-        snapshot: Snapshot { rows: vec![] },
+        snapshot: Snapshot::default(),
         selected: None,
         worktree_scroll: 0,
         spinner_frame: 0,

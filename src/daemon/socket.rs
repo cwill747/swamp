@@ -392,6 +392,7 @@ mod tests {
                     deleting: false,
                 })
                 .collect(),
+            default_known: true,
         }
     }
 

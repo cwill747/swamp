@@ -269,6 +269,12 @@ pub(super) fn handle_delete_key(app: &mut AppState) {
 /// worktree's default-branch flag, not on "is this the dashboard", so a
 /// worktree tab genuinely open on the default branch is guarded too; `d` on
 /// that same row still runs the normal flow deliberately.
+///
+/// The key also refuses when the daemon could not resolve the default branch
+/// at all (`Snapshot::default_known`). Every row then carries
+/// `is_default == false`, so the flag guard above would pass on trunk itself
+/// and delete it. There is nothing to fall back on that is trustworthy, so
+/// `D` fails closed and points at `d`, which still confirms per row.
 pub(super) fn handle_delete_current_tab_key(app: &mut AppState) {
     let Some(current) = app.current_tab.clone() else {
         return;
@@ -276,6 +282,11 @@ pub(super) fn handle_delete_current_tab_key(app: &mut AppState) {
     let Some(row) = app.snapshot.rows.iter().find(|r| r.name == current) else {
         return;
     };
+    if !app.snapshot.default_known {
+        app.status_msg =
+            Some("D is disabled: cannot determine the default branch. Use d instead.".to_string());
+        return;
+    }
     if row.is_default {
         app.status_msg = Some("D does nothing on the default branch worktree".to_string());
         return;
@@ -363,10 +374,9 @@ pub(super) fn handle_input_key(
 
                 // A blocked deletion inside Zellij opens a floating pane —
                 // narrow sidebars can't show the work at risk. The pane owns
-                // the rest of the flow from here (force or cancel, and the
-                // tab close when `close_tab` is set); nothing else is sent
-                // from this pane. A removable row, or a spawn failure, falls
-                // back below.
+                // the rest of the flow from here (force or cancel); nothing
+                // else is sent from this pane. A removable row, or a spawn
+                // failure, falls back below.
                 let opened_pane = force_reason.as_deref().is_some_and(|reason| {
                     zellij::in_zellij()
                         && row_path.as_ref().is_some_and(|path| {
@@ -375,6 +385,17 @@ pub(super) fn handle_input_key(
                         })
                 });
                 if opened_pane {
+                    // For `D` the pane's own detached helper closes the tab.
+                    // For `d` it does not, so arm the same snapshot-driven
+                    // tab close the unblocked `d` path uses — otherwise a
+                    // forced deletion from the pane removes the directory and
+                    // leaves that worktree's tab open on an unlinked tree.
+                    // A cancel in the pane leaves the mark set harmlessly: it
+                    // only fires once the row leaves a snapshot, and a tab
+                    // whose worktree is gone should close either way.
+                    if !close_tab {
+                        app.pending_delete = Some(name.clone());
+                    }
                     return;
                 }
 
@@ -698,7 +719,10 @@ mod tests {
     fn app_with_row(row: WorktreeRow) -> AppState {
         let name = row.name.clone();
         AppState {
-            snapshot: Snapshot { rows: vec![row] },
+            snapshot: Snapshot {
+                rows: vec![row],
+                default_known: true,
+            },
             selected: Some(name),
             worktree_scroll: 0,
             spinner_frame: 0,
@@ -840,5 +864,32 @@ mod tests {
 
         assert!(app.input.is_none());
         assert!(app.status_msg.is_none());
+    }
+
+    /// `D` fails closed when the default branch is undetectable. Every row
+    /// carries `is_default == false` in that repository, so the flag guard
+    /// alone would let `D` delete trunk from the dashboard. `d` on the same
+    /// row is unaffected — it confirms per row and names its target.
+    #[test]
+    fn delete_current_tab_key_refuses_when_default_branch_unknown() {
+        let mut app = app_with_row(row("main", None, false));
+        app.snapshot.default_known = false;
+        app.current_tab = Some("main".to_string());
+
+        handle_delete_current_tab_key(&mut app);
+        assert!(
+            app.input.is_none(),
+            "D must not open a prompt when the default branch is unknown"
+        );
+        assert!(
+            app.status_msg.is_some(),
+            "a footer message must explain why D did nothing"
+        );
+
+        handle_delete_key(&mut app);
+        assert!(
+            app.input.is_some(),
+            "d must still run the normal confirmation flow"
+        );
     }
 }

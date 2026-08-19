@@ -280,6 +280,10 @@ When a deletion is blocked and swamp is running inside Zellij, the TUI SHALL ope
 
 The pane SHALL report the blocking reason it was given when it was opened and SHALL NOT re-compute the removal verdict. The working-tree status and diff summary it shows SHALL be read from the worktree when the pane renders, so the evidence the user decides on is current even though the reason label is not re-checked.
 
+When a command that reads the work at risk fails, the pane SHALL report the failure and the command's error output. It SHALL NOT render a failed read as an empty result, because an empty result reads as "there is no work at risk" — the opposite of what a failed read means.
+
+A forced deletion driven from the pane SHALL close the target worktree's Zellij tab, exactly as an unblocked deletion of that worktree does. A tab whose worktree directory is gone SHALL NOT stay open.
+
 #### Scenario: Blocked deletion inside Zellij
 - **WHEN** the user confirms deletion of a blocked worktree inside Zellij
 - **THEN** a floating pane opens showing the blocking reason, the short status, and a diff summary
@@ -313,8 +317,18 @@ The pane SHALL report the blocking reason it was given when it was opened and SH
 - **WHEN** the floating pane renders the work at risk
 - **THEN** the short status and diff summary are read from the worktree at that moment
 
+#### Scenario: Evidence cannot be read
+- **WHEN** a command that reads the work at risk exits with a failure
+- **THEN** the pane reports the failure and the command's error output instead of an empty result
+
+#### Scenario: Tab closes after a forced deletion from the pane
+- **WHEN** the user forces the deletion of a blocked worktree from the floating pane
+- **THEN** that worktree's tab is closed once the worktree is gone
+
 ### Requirement: Delete Current Tab Worktree
 The TUI SHALL provide a key that deletes the worktree the pane itself lives in and then closes that worktree's Zellij tab. The key SHALL target the pane's own worktree regardless of which row is selected. The key SHALL do nothing when the pane's worktree resolves to the repository default branch's worktree, and SHALL say so, so that a single keystroke on the dashboard cannot delete the trunk worktree. The removal and the tab close SHALL be performed by a detached helper process whose working directory is outside the target worktree, so the work completes after the tab and its panes are gone. The helper SHALL close the tab before removing the directory, so no pane holds a working directory inside it during removal.
+
+The snapshot SHALL report whether the repository default branch was resolvable at all, separately from the per-row default-branch flag. When the default branch is unresolvable, no row can carry the flag, so the key SHALL refuse outright and SHALL say so, rather than treat every worktree as non-default. The selected-row delete key SHALL remain available in that repository.
 
 #### Scenario: Delete the current worktree
 - **WHEN** the user presses the current-tab delete key in a worktree tab's sidebar
@@ -344,3 +358,9 @@ The TUI SHALL provide a key that deletes the worktree the pane itself lives in a
 #### Scenario: Default-branch worktree is still deletable deliberately
 - **WHEN** the user selects the default branch's worktree and presses the selected-row delete key
 - **THEN** the normal delete confirmation flow runs
+
+#### Scenario: The default branch cannot be resolved
+- **WHEN** the repository has no resolvable default branch and the user presses the current-tab delete key
+- **THEN** nothing is deleted and no tab is closed
+- **AND** the TUI reports that it cannot determine the default branch
+- **AND** the selected-row delete key still runs the normal delete confirmation flow

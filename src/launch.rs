@@ -452,6 +452,13 @@ fn print_git_status(path: &Path) {
     print_git_output(path, &["diff", "--stat", "HEAD"]);
 }
 
+/// Run one `git` command in `path` and print its stdout under the current
+/// heading. A command that starts but exits nonzero — a corrupt index, an
+/// unreadable object store, no `HEAD` — still yields `Ok`, with empty stdout.
+/// Printing that as `(none)` would tell the user there is no work at risk
+/// exactly when git could not look, which is the wrong answer to act on right
+/// before a force delete. So the exit status is checked, and a failure reports
+/// the status and git's own stderr instead.
 fn print_git_output(path: &Path, args: &[&str]) {
     match std::process::Command::new("git")
         .arg("-C")
@@ -459,6 +466,13 @@ fn print_git_output(path: &Path, args: &[&str]) {
         .args(args)
         .output()
     {
+        Ok(out) if !out.status.success() => {
+            println!("  (git {} failed: {})", args.join(" "), out.status);
+            let err = String::from_utf8_lossy(&out.stderr);
+            for line in err.lines().filter(|l| !l.trim().is_empty()) {
+                println!("  {line}");
+            }
+        }
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
             if text.trim().is_empty() {
