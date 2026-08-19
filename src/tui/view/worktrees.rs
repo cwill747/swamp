@@ -190,16 +190,36 @@ fn build_row<'a>(
     if r.is_default {
         name_style = name_style.fg(Theme::DEFAULT_BRANCH);
     }
+    // A removal in flight overrides every other color: the row reads as
+    // "going away" regardless of whether it's pinned, current, or default.
+    if r.deleting {
+        name_style = name_style.fg(Theme::MUTED);
+    }
     let name_cell = Cell::from(Span::styled(&r.name, name_style));
 
-    let branch_color = if r.is_default {
+    let branch_color = if r.deleting {
+        Theme::MUTED
+    } else if r.is_default {
         Theme::DEFAULT_BRANCH
     } else {
         Theme::BRANCH
     };
     let branch_cell = Cell::from(Span::styled(&r.branch, Style::default().fg(branch_color)));
 
-    let git_cell = Cell::from(Line::from(git_spans(r)));
+    // A row being deleted replaces its git-status column with a spinner and
+    // "deleting…", shared across every subscribed TUI via `WorktreeRow::deleting`
+    // — not just the pane that pressed `d`.
+    let git_cell = if r.deleting {
+        let frame = icons::SPINNER_FRAMES[app.spinner_frame % icons::SPINNER_FRAMES.len()];
+        Cell::from(Span::styled(
+            format!("{frame} deleting…"),
+            Style::default()
+                .fg(Theme::DIRTY)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(Line::from(git_spans(r)))
+    };
 
     let age_cell = {
         let txt = if r.agent_ts == 0 {
@@ -386,6 +406,7 @@ mod tests {
             number: 1,
             title: "PR".into(),
             state: "OPEN".into(),
+            head_oid: None,
             is_draft: false,
             checks,
             check_meta: None,

@@ -106,6 +106,34 @@ pub(super) fn default_branch_name(repo: &Repository) -> Option<String> {
     default_branch_name_for_remote(repo, &remote)
 }
 
+/// Tip commit of the repository default branch: the local branch's tip when
+/// it is checked out somewhere, otherwise the default remote's tracking ref.
+/// `None` when the default branch cannot be determined or has no resolvable
+/// tip. Used by the removal verdict to bound the reachability probe.
+pub(super) fn default_branch_tip_in_repo(repo: &Repository) -> Option<git2::Oid> {
+    let name = default_branch_name(repo)?;
+    if let Ok(branch) = repo.find_branch(&name, BranchType::Local)
+        && let Ok(commit) = branch.get().peel_to_commit()
+    {
+        return Some(commit.id());
+    }
+    let remote = default_remote(repo)?;
+    let refname = format!("refs/remotes/{remote}/{name}");
+    repo.find_reference(&refname)
+        .ok()?
+        .peel_to_commit()
+        .ok()
+        .map(|c| c.id())
+}
+
+/// Path-based counterpart to [`default_branch_tip_in_repo`], for callers
+/// (the daemon's per-row scan) that don't already have a repo open.
+pub fn default_branch_tip(dir: &Path) -> Option<git2::Oid> {
+    open_lenient(dir)
+        .ok()
+        .and_then(|r| default_branch_tip_in_repo(&r))
+}
+
 /// Detect the default branch name. Returns an empty string when the default
 /// branch cannot be determined; callers that need a base must handle that
 /// explicitly instead of silently assuming `main`.
@@ -247,7 +275,7 @@ mod tests {
         assert_eq!(listed[0].name(), "feature");
         assert_eq!(listed[0].branch, "feature");
 
-        let _ = crate::worktree::remove_worktree(&bare, "feature", true, false);
+        let _ = crate::worktree::remove_worktree(&bare, "feature", true, false, None, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -229,6 +229,119 @@ fn spawn_relaunch_tab(name: &str, path: &std::path::Path) {
         .spawn();
 }
 
+/// Handle the `d` key on the worktrees pane: open the delete confirmation for
+/// the selected row, or reject with a footer message when it's already being
+/// deleted. The snapshot already carries the removal verdict computed during
+/// the scan, so the confirmation can name a blocking reason immediately —
+/// no daemon round-trip needed to learn it, and no request is sent until the
+/// user actually confirms in [`handle_input_key`]. `AppEvent::DeleteNeedsForce`
+/// remains the fallback for a stale snapshot: it reopens the same prompt with
+/// the daemon's own reason when the two disagree.
+pub(super) fn handle_delete_key(app: &mut AppState) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    if row.deleting {
+        app.status_msg = Some(format!("{} is already being deleted", row.name));
+        return;
+    }
+    let name = row.name.clone();
+    let force_reason = row
+        .removal_block
+        .as_ref()
+        .map(|reason| reason.description().to_string());
+    app.status_msg = None;
+    app.input = Some(InputMode::ConfirmDelete {
+        name,
+        force_reason,
+        close_tab: false,
+    });
+}
+
+/// Handle the `D` key: delete the worktree the pane itself lives in — not
+/// whichever row is selected — and close its Zellij tab once the removal
+/// completes. A no-op, with a footer message, when the pane's working
+/// directory doesn't resolve to a worktree, when that worktree is already
+/// being deleted, or when it's the repository default branch's worktree: the
+/// dashboard's cwd *is* the default worktree, so an unguarded `D` there would
+/// target trunk — never what the user means, and the most destructive
+/// possible misfire of a single keystroke. The guard is on the resolved
+/// worktree's default-branch flag, not on "is this the dashboard", so a
+/// worktree tab genuinely open on the default branch is guarded too; `d` on
+/// that same row still runs the normal flow deliberately.
+///
+/// The key also refuses when the daemon could not resolve the default branch
+/// at all (`Snapshot::default_known`). Every row then carries
+/// `is_default == false`, so the flag guard above would pass on trunk itself
+/// and delete it. There is nothing to fall back on that is trustworthy, so
+/// `D` fails closed and points at `d`, which still confirms per row.
+pub(super) fn handle_delete_current_tab_key(app: &mut AppState) {
+    let Some(current) = app.current_tab.clone() else {
+        return;
+    };
+    let Some(row) = app.snapshot.rows.iter().find(|r| r.name == current) else {
+        return;
+    };
+    if !app.snapshot.default_known {
+        app.status_msg =
+            Some("D is disabled: cannot determine the default branch. Use d instead.".to_string());
+        return;
+    }
+    if row.is_default {
+        app.status_msg = Some("D does nothing on the default branch worktree".to_string());
+        return;
+    }
+    if row.deleting {
+        app.status_msg = Some(format!("{} is already being deleted", row.name));
+        return;
+    }
+    let name = row.name.clone();
+    let force_reason = row
+        .removal_block
+        .as_ref()
+        .map(|reason| reason.description().to_string());
+    app.status_msg = None;
+    app.input = Some(InputMode::ConfirmDelete {
+        name,
+        force_reason,
+        close_tab: true,
+    });
+}
+
+/// Open a floating `swamp confirm-delete` pane for a blocked deletion: it
+/// renders the reason (passed in, never re-computed — the pane never
+/// acquires `repo_ops`) plus live status and diffstat, and owns force/cancel
+/// from there. `close_tab` is threaded through for the `D` key, which also
+/// wants the pane's eventual force-delete to close the originating tab.
+///
+/// `Ok` means the pane was opened and now owns the rest of the flow; `Err`
+/// means the caller should fall back to the footer force-prompt — a spawn
+/// failure (an unsupported flag on an older Zellij, or no Zellij at all)
+/// must degrade to today's behavior rather than block the delete.
+pub(super) fn spawn_confirm_delete_pane(
+    common: &std::path::Path,
+    name: &str,
+    path: &std::path::Path,
+    reason: &str,
+    close_tab: bool,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "swamp".to_string());
+    let path_arg = path.to_string_lossy().into_owned();
+    let mut cmd = vec![
+        exe.as_str(),
+        "confirm-delete",
+        name,
+        path_arg.as_str(),
+        reason,
+    ];
+    if close_tab {
+        cmd.push("--close-tab");
+    }
+    zellij::new_floating_pane(common, &format!("delete {name}"), &cmd)
+}
+
 /// Handle a keystroke while a footer prompt is active. `app.input` was already
 /// taken by the caller, so each branch re-stores it to stay open, or leaves it
 /// `None` to dismiss the prompt. (The create picker is handled separately by
@@ -246,14 +359,76 @@ pub(super) fn handle_input_key(
         InputMode::Create(picker) => {
             app.input = Some(InputMode::Create(picker));
         }
-        InputMode::ConfirmDelete { name, force_reason } => match k.code {
+        InputMode::ConfirmDelete {
+            name,
+            force_reason,
+            close_tab,
+        } => match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let row_path = app
+                    .snapshot
+                    .rows
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.path.clone());
+
+                // A blocked deletion inside Zellij opens a floating pane —
+                // narrow sidebars can't show the work at risk. The pane owns
+                // the rest of the flow from here (force or cancel); nothing
+                // else is sent from this pane. A removable row, or a spawn
+                // failure, falls back below.
+                let opened_pane = force_reason.as_deref().is_some_and(|reason| {
+                    zellij::in_zellij()
+                        && row_path.as_ref().is_some_and(|path| {
+                            spawn_confirm_delete_pane(common, &name, path, reason, close_tab)
+                                .is_ok()
+                        })
+                });
+                if opened_pane {
+                    // For `D` the pane's own detached helper closes the tab.
+                    // For `d` it does not, so arm the same snapshot-driven
+                    // tab close the unblocked `d` path uses — otherwise a
+                    // forced deletion from the pane removes the directory and
+                    // leaves that worktree's tab open on an unlinked tree.
+                    // A cancel in the pane leaves the mark set harmlessly: it
+                    // only fires once the row leaves a snapshot, and a tab
+                    // whose worktree is gone should close either way.
+                    if !close_tab {
+                        app.pending_delete = Some(name.clone());
+                    }
+                    return;
+                }
+
+                if close_tab {
+                    // Every `D` fallback must use the detached helper. It
+                    // closes the tab before removal, including when a blocked
+                    // deletion could not open its floating pane.
+                    if let Some(path) = row_path {
+                        crate::launch::spawn_delete_tab(
+                            &name,
+                            &path,
+                            common,
+                            force_reason.is_some(),
+                        );
+                    } else {
+                        app.status_msg = Some(format!("Cannot find worktree path for {name}"));
+                    }
+                    return;
+                }
+
+                // Plain removal (`d`) falls back to a direct request.
+                // `pending_delete` is
+                // kept only to close this pane's tab once the row disappears
+                // from a later snapshot (see the Snapshot handler in
+                // event.rs) — the "deleting…" status itself now comes from
+                // the shared `WorktreeRow::deleting` flag, visible in every
+                // subscribed TUI rather than just this pane.
                 app.pending_delete = Some(name.clone());
-                app.status_msg = Some(format!("Deleting {name}…"));
                 let tx = tx.clone();
                 let common = common.to_path_buf();
-                // Use force: true when the daemon already refused once and
-                // we're asking the user to confirm a force override.
+                // Use force: true when the daemon already refused once (or
+                // the snapshot verdict already predicted it) and we're
+                // asking the user to confirm a force override.
                 let force = force_reason.is_some();
                 tokio::spawn(async move {
                     if let Err(e) = send_action(
@@ -510,5 +685,211 @@ mod tests {
         assert_eq!(row_index(area, 3, 0, 6), None);
         // Outside the rect entirely.
         assert_eq!(row_index(area, 3, 0, 2), None);
+    }
+
+    use crate::daemon::resources;
+    use crate::daemon::state::{AgentStatus, PrSnapshot, Snapshot, WorktreeRow};
+    use crate::worktree::RemoveRefusedReason;
+
+    fn row(name: &str, removal_block: Option<RemoveRefusedReason>, deleting: bool) -> WorktreeRow {
+        WorktreeRow {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/repo/{name}")),
+            branch: name.to_string(),
+            upstream: None,
+            upstream_gone: false,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            conflict: false,
+            rebase: false,
+            agent: AgentStatus::Idle,
+            agent_ts: 0,
+            session_name: None,
+            head_ts: 0,
+            harness: None,
+            is_default: false,
+            removal_block,
+            deleting,
+        }
+    }
+
+    fn app_with_row(row: WorktreeRow) -> AppState {
+        let name = row.name.clone();
+        AppState {
+            snapshot: Snapshot {
+                rows: vec![row],
+                default_known: true,
+            },
+            selected: Some(name),
+            worktree_scroll: 0,
+            spinner_frame: 0,
+            repo_name: "repo".into(),
+            view: crate::cli::TuiView::Worktrees,
+            refreshing: false,
+            pending_delete: None,
+            pending_create: None,
+            connected: true,
+            input: None,
+            status_msg: None,
+            toast: None,
+            resources: resources::Snapshot::default(),
+            pr_snapshot: PrSnapshot::default(),
+            resource_scroll: 0,
+            resource_viewport_height: 0,
+            current_dir: None,
+            pin_cwd: false,
+            tab_env: None,
+            current_tab: None,
+            regions: super::super::state::HitRegions::default(),
+            last_click: None,
+        }
+    }
+
+    /// Pressing `d` on a row carrying a blocking reason opens the confirmation
+    /// pre-filled with that reason — a force prompt on the very first press,
+    /// with no daemon request sent until the user actually confirms.
+    #[test]
+    fn delete_key_opens_force_prompt_for_blocked_row() {
+        let mut app = app_with_row(row("feature", Some(RemoveRefusedReason::Dirty), false));
+
+        handle_delete_key(&mut app);
+
+        match app.input {
+            Some(InputMode::ConfirmDelete {
+                name,
+                force_reason,
+                close_tab,
+            }) => {
+                assert_eq!(name, "feature");
+                assert_eq!(
+                    force_reason.as_deref(),
+                    Some(RemoveRefusedReason::Dirty.description())
+                );
+                assert!(!close_tab, "the `d` key must never set close_tab");
+            }
+            _ => panic!("expected a ConfirmDelete prompt"),
+        }
+    }
+
+    /// A removable row's first prompt has no force reason.
+    #[test]
+    fn delete_key_opens_plain_prompt_for_removable_row() {
+        let mut app = app_with_row(row("feature", None, false));
+
+        handle_delete_key(&mut app);
+
+        match app.input {
+            Some(InputMode::ConfirmDelete { force_reason, .. }) => {
+                assert_eq!(force_reason, None);
+            }
+            _ => panic!("expected a ConfirmDelete prompt"),
+        }
+    }
+
+    /// A row already marked deleting rejects a second `d` with a footer
+    /// message instead of opening a prompt.
+    #[test]
+    fn delete_key_rejects_already_deleting_row() {
+        let mut app = app_with_row(row("feature", None, true));
+
+        handle_delete_key(&mut app);
+
+        assert!(app.input.is_none(), "no prompt should open");
+        assert!(
+            app.status_msg.is_some(),
+            "a footer message must explain why"
+        );
+    }
+
+    /// `D` no-ops on the default-branch worktree — the guard is on the
+    /// resolved row's default-branch flag, not on "is this the dashboard" —
+    /// while `d` on that same (selected) row still runs the normal
+    /// confirmation flow, which is deliberate.
+    #[test]
+    fn delete_current_tab_key_noops_on_default_branch_but_d_still_works() {
+        let mut default_row = row("main", None, false);
+        default_row.is_default = true;
+        let mut app = app_with_row(default_row);
+        app.current_tab = Some("main".to_string());
+
+        handle_delete_current_tab_key(&mut app);
+        assert!(
+            app.input.is_none(),
+            "D must not open a prompt on the default branch"
+        );
+        assert!(
+            app.status_msg.is_some(),
+            "a footer message must explain why D did nothing"
+        );
+
+        handle_delete_key(&mut app);
+        assert!(
+            app.input.is_some(),
+            "d on the same row must still run the normal confirmation flow"
+        );
+    }
+
+    /// `D` targets the pane's own worktree (`current_tab`), not whichever row
+    /// happens to be selected.
+    #[test]
+    fn delete_current_tab_key_targets_current_tab_not_selection() {
+        let mut app = app_with_row(row("selected-row", None, false));
+        app.snapshot.rows.push(row("current-worktree", None, false));
+        app.current_tab = Some("current-worktree".to_string());
+
+        handle_delete_current_tab_key(&mut app);
+
+        match app.input {
+            Some(InputMode::ConfirmDelete {
+                name, close_tab, ..
+            }) => {
+                assert_eq!(name, "current-worktree");
+                assert!(close_tab, "D must set close_tab");
+            }
+            _ => panic!("expected a ConfirmDelete prompt"),
+        }
+    }
+
+    /// `D` does nothing when the pane's working directory doesn't resolve to
+    /// any known worktree.
+    #[test]
+    fn delete_current_tab_key_noop_when_unresolved() {
+        let mut app = app_with_row(row("feature", None, false));
+        app.current_tab = None;
+
+        handle_delete_current_tab_key(&mut app);
+
+        assert!(app.input.is_none());
+        assert!(app.status_msg.is_none());
+    }
+
+    /// `D` fails closed when the default branch is undetectable. Every row
+    /// carries `is_default == false` in that repository, so the flag guard
+    /// alone would let `D` delete trunk from the dashboard. `d` on the same
+    /// row is unaffected — it confirms per row and names its target.
+    #[test]
+    fn delete_current_tab_key_refuses_when_default_branch_unknown() {
+        let mut app = app_with_row(row("main", None, false));
+        app.snapshot.default_known = false;
+        app.current_tab = Some("main".to_string());
+
+        handle_delete_current_tab_key(&mut app);
+        assert!(
+            app.input.is_none(),
+            "D must not open a prompt when the default branch is unknown"
+        );
+        assert!(
+            app.status_msg.is_some(),
+            "a footer message must explain why D did nothing"
+        );
+
+        handle_delete_key(&mut app);
+        assert!(
+            app.input.is_some(),
+            "d must still run the normal confirmation flow"
+        );
     }
 }

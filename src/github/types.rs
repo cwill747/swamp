@@ -40,6 +40,8 @@ pub struct PrSummary {
     pub number: u32,
     pub title: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
     #[serde(rename = "isDraft")]
     pub is_draft: bool,
     #[serde(default)]

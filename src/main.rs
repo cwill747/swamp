@@ -32,6 +32,12 @@ async fn main() -> Result<()> {
         })) => hook::run(status.to_string(), dir, session_name, session_id).await,
         Some(cli::Cmd::CodexNotify(args)) => codex_notify::run(args.payload).await,
         Some(cli::Cmd::RelaunchTab(args)) => launch::relaunch_worktree_tab(&args.name, &args.dir),
+        Some(cli::Cmd::ConfirmDelete(args)) => {
+            launch::confirm_delete(&args.name, &args.dir, &args.reason, args.close_tab).await
+        }
+        Some(cli::Cmd::DeleteTab(args)) => {
+            launch::delete_tab(&args.name, &args.dir, args.force).await
+        }
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
         Some(cli::Cmd::Logs(args)) => logging::show(args.dir, args.follow, args.all).await,
         Some(cli::Cmd::Init) => config::init(),

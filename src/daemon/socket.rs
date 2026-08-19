@@ -388,8 +388,11 @@ mod tests {
                     head_ts: 0,
                     harness: None,
                     is_default: false,
+                    removal_block: None,
+                    deleting: false,
                 })
                 .collect(),
+            default_known: true,
         }
     }
 

@@ -1,7 +1,8 @@
 use super::client::{request_branches, send_refresh, send_update, subscribe_loop};
 use super::ensure_daemon;
 use super::input::{
-    activate_worktree_tab, handle_create_key, handle_input_key, handle_mouse, spawn_close_tab,
+    activate_worktree_tab, handle_create_key, handle_delete_current_tab_key, handle_delete_key,
+    handle_input_key, handle_mouse, spawn_close_tab,
 };
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
@@ -108,7 +109,7 @@ where
     }
 
     let mut app = AppState {
-        snapshot: Snapshot { rows: vec![] },
+        snapshot: Snapshot::default(),
         selected: None,
         worktree_scroll: 0,
         spinner_frame: 0,
@@ -179,11 +180,9 @@ where
             AppEvent::Tick => {
                 let needs_tick = app.refreshing
                     || app.toast.is_some()
-                    || app
-                        .snapshot
-                        .rows
-                        .iter()
-                        .any(|r| matches!(r.agent, crate::daemon::state::AgentStatus::Working));
+                    || app.snapshot.rows.iter().any(|r| {
+                        r.deleting || matches!(r.agent, crate::daemon::state::AgentStatus::Working)
+                    });
                 if !needs_tick {
                     continue;
                 }
@@ -249,12 +248,17 @@ where
             }
             AppEvent::DeleteNeedsForce(name, reason) => {
                 // The daemon refused; re-prompt as a force override so the user
-                // can decide whether to proceed.
+                // can decide whether to proceed. `close_tab` is always false
+                // here: this path only fires for a direct `RemoveWorktree`
+                // request, which itself only happens for the plain `d` flow
+                // or a `D` whose floating pane failed to open — neither of
+                // which closes a tab on this retry either.
                 app.pending_delete = None;
                 app.status_msg = None;
                 app.input = Some(InputMode::ConfirmDelete {
                     name,
                     force_reason: Some(reason),
+                    close_tab: false,
                 });
             }
             AppEvent::Input(Event::Key(k)) => {
@@ -341,18 +345,8 @@ where
                             }
                         });
                     }
-                    KeyCode::Char('d') => {
-                        if let Some(name) = app.selected_row().map(|row| row.name.clone()) {
-                            app.status_msg = None;
-                            // For the initial prompt there is no force_reason;
-                            // if the daemon refuses, DeleteNeedsForce re-opens
-                            // it with a reason.
-                            app.input = Some(InputMode::ConfirmDelete {
-                                name,
-                                force_reason: None,
-                            });
-                        }
-                    }
+                    KeyCode::Char('d') => handle_delete_key(&mut app),
+                    KeyCode::Char('D') => handle_delete_current_tab_key(&mut app),
                     KeyCode::Char('h') => {
                         if let Some(name) = app.selected_row().map(|row| row.name.clone()) {
                             app.status_msg = None;

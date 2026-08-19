@@ -104,7 +104,10 @@ fn render_all(f: &mut Frame, app: &mut AppState) {
 fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
     // The delete confirmation takes over the footer. (The create picker is a
     // centered overlay drawn separately in `render`.)
-    if let Some(InputMode::ConfirmDelete { name, force_reason }) = &app.input {
+    if let Some(InputMode::ConfirmDelete {
+        name, force_reason, ..
+    }) = &app.input
+    {
         let line = if let Some(reason) = force_reason {
             Line::from(vec![
                 Span::styled("Worktree ", Style::default().fg(Theme::DIRTY)),
@@ -178,7 +181,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
 fn footer_hint(view: TuiView) -> &'static str {
     match view {
         TuiView::All | TuiView::Worktrees => {
-            "j/k move · enter jump · c create · d delete · h harness · r refresh · u update · K kill · q quit"
+            "j/k move · enter jump · c create · d delete · D delete tab · h harness · r refresh · u update · K kill · q quit"
         }
         TuiView::Resources => "j/k scroll · r refresh · q quit",
         TuiView::AiStatus => "dbl-click jump · r refresh · q quit",

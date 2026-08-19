@@ -91,6 +91,20 @@ pub enum Cmd {
     RelaunchTab(RelaunchTabArgs),
 
     #[command(
+        hide = true,
+        about = "Confirm a blocked worktree deletion",
+        long_about = "Render the reason a worktree deletion was blocked, plus its current status and diffstat, and wait for the user to force it through or cancel. The TUI spawns this as a Zellij floating pane; it is not intended for interactive use."
+    )]
+    ConfirmDelete(ConfirmDeleteArgs),
+
+    #[command(
+        hide = true,
+        about = "Delete a worktree and close its tab",
+        long_about = "Close a worktree's Zellij tab, then remove the worktree. The TUI spawns this command detached so it survives the tab it closes; it is not intended for interactive use."
+    )]
+    DeleteTab(DeleteTabArgs),
+
+    #[command(
         about = "Stop the repo session",
         long_about = "Stop the per-repo daemon, kill the matching Zellij session, and remove swamp's runtime socket and PID files."
     )]
@@ -179,6 +193,37 @@ pub struct RelaunchTabArgs {
 }
 
 #[derive(Args)]
+pub struct ConfirmDeleteArgs {
+    /// Worktree name.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Worktree path.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+    /// Human-readable reason the removal was blocked, e.g. "has uncommitted
+    /// changes". Rendered as given — never re-computed by this command.
+    #[arg(value_name = "REASON")]
+    pub reason: String,
+    /// Also close this worktree's Zellij tab once the removal is forced
+    /// through.
+    #[arg(long)]
+    pub close_tab: bool,
+}
+
+#[derive(Args)]
+pub struct DeleteTabArgs {
+    /// Worktree tab name to close.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Worktree path to remove.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+    /// Skip the removal safety checks.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args)]
 pub struct KillArgs {
     /// Path inside the repo session to stop (default: current directory).
     #[arg(value_name = "DIR")]
@@ -224,6 +269,8 @@ mod tests {
         assert!(help.contains("completions"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
+        assert!(!help.contains("confirm-delete"));
+        assert!(!help.contains("delete-tab"));
     }
 
     #[test]

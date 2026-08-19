@@ -5,21 +5,6 @@ use std::path::Path;
 
 /// Collect git status for a single worktree at `dir`.
 pub fn git_info(dir: &Path) -> Result<GitInfo> {
-    git_info_with_status_mode(dir, StatusMode::Tolerant)
-}
-
-/// Collect git status for a single worktree, returning an error if working-tree
-/// status cannot be read.
-pub(super) fn git_info_strict(dir: &Path) -> Result<GitInfo> {
-    git_info_with_status_mode(dir, StatusMode::Strict)
-}
-
-enum StatusMode {
-    Tolerant,
-    Strict,
-}
-
-fn git_info_with_status_mode(dir: &Path, status_mode: StatusMode) -> Result<GitInfo> {
     let repo = Repository::open(dir)?;
     let mut info = GitInfo::default();
 
@@ -85,40 +70,28 @@ fn git_info_with_status_mode(dir: &Path, status_mode: StatusMode) -> Result<GitI
         .recurse_untracked_dirs(false)
         .exclude_submodules(true)
         .include_ignored(false);
-    let statuses = match repo.statuses(Some(&mut opts)) {
-        Ok(statuses) => Some(statuses),
-        Err(err) if matches!(status_mode, StatusMode::Tolerant) => {
-            let _ = err;
-            None
+    let statuses = repo.statuses(Some(&mut opts))?;
+    for entry in statuses.iter() {
+        let s = entry.status();
+        if s.intersects(
+            Status::INDEX_NEW
+                | Status::INDEX_MODIFIED
+                | Status::INDEX_DELETED
+                | Status::INDEX_RENAMED
+                | Status::INDEX_TYPECHANGE,
+        ) {
+            info.staged += 1;
         }
-        Err(err) => return Err(err.into()),
-    };
-    if let Some(statuses) = statuses {
-        for entry in statuses.iter() {
-            let s = entry.status();
-            if s.intersects(
-                Status::INDEX_NEW
-                    | Status::INDEX_MODIFIED
-                    | Status::INDEX_DELETED
-                    | Status::INDEX_RENAMED
-                    | Status::INDEX_TYPECHANGE,
-            ) {
-                info.staged += 1;
-            }
-            if s.intersects(
-                Status::WT_MODIFIED
-                    | Status::WT_DELETED
-                    | Status::WT_TYPECHANGE
-                    | Status::WT_RENAMED,
-            ) {
-                info.unstaged += 1;
-            }
-            if s.contains(Status::WT_NEW) {
-                info.untracked += 1;
-            }
-            if s.contains(Status::CONFLICTED) {
-                info.conflict = true;
-            }
+        if s.intersects(
+            Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_TYPECHANGE | Status::WT_RENAMED,
+        ) {
+            info.unstaged += 1;
+        }
+        if s.contains(Status::WT_NEW) {
+            info.untracked += 1;
+        }
+        if s.contains(Status::CONFLICTED) {
+            info.conflict = true;
         }
     }
 
