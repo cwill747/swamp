@@ -1,10 +1,12 @@
 use crate::config::Harness;
 use crate::github::PrSummary;
 use crate::util::now_unix;
-use crate::worktree::{self, GitInfo, Worktree};
+use crate::worktree::{
+    self, GitInfo, RemovalVerdict, RemoveRefusedReason, VerdictContext, Worktree,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +69,20 @@ pub struct WorktreeRow {
     /// (they decode as `false` and are corrected on the next scan).
     #[serde(default)]
     pub is_default: bool,
+    /// The reason a non-forced removal of this worktree would be refused, or
+    /// `None` when it is removable. Computed during the scan (see
+    /// `scan_worktrees`) so the TUI can show the reason in the first delete
+    /// confirmation instead of waiting on a daemon round-trip.
+    /// `#[serde(default)]` keeps an older peer's snapshot loadable — it
+    /// decodes as `None`, the safe "don't know, assume removable" reading.
+    #[serde(default)]
+    pub removal_block: Option<RemoveRefusedReason>,
+    /// True while a removal of this worktree is in flight, set before
+    /// `repo_ops` is acquired so the whole wait is visible in every
+    /// subscribed TUI. `#[serde(default)]` keeps an older peer's snapshot
+    /// loadable.
+    #[serde(default)]
+    pub deleting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +125,14 @@ pub struct DaemonState {
     /// serialized — it is re-resolved on every daemon start, so a mid-session
     /// default-branch change is picked up on the next restart.
     pub default_branch: String,
+    /// Names of worktrees with a removal currently in flight. Kept separate
+    /// from `rows` (rather than a field on the row) because a delete races
+    /// with the rescan its own directory removal triggers via the fs
+    /// watcher: `apply_scanned_rows` replaces `rows` wholesale, which would
+    /// silently drop a field carried on the row but can't drop an entry in
+    /// an independent set it doesn't touch. Projected onto
+    /// `WorktreeRow::deleting` by [`Self::snapshot`].
+    deleting: HashSet<String>,
 }
 
 impl Default for DaemonState {
@@ -122,6 +146,7 @@ impl Default for DaemonState {
             // No PR fetch has happened yet, so a fresh daemon reports loading.
             pr_loading: true,
             default_branch: String::new(),
+            deleting: HashSet::new(),
         }
     }
 }
@@ -263,8 +288,31 @@ impl DaemonState {
         removed
     }
 
+    /// Mark `name` as having a removal in flight. Call **before** acquiring
+    /// `repo_ops` and broadcast the resulting snapshot immediately, so the
+    /// whole wait for the lock — a queued fetch can hold it for up to 60s —
+    /// is visible in every subscribed TUI, not just the removal itself.
+    pub fn mark_deleting(&mut self, name: &str) {
+        self.deleting.insert(name.to_string());
+    }
+
+    /// Clear the in-flight mark set by [`Self::mark_deleting`]. Idempotent —
+    /// safe to call on success, refusal, failure, or from the cleanup guard
+    /// that catches a panicked or cancelled removal task.
+    pub fn clear_deleting(&mut self, name: &str) {
+        self.deleting.remove(name);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
-        let mut rows: Vec<WorktreeRow> = self.rows.values().cloned().collect();
+        let mut rows: Vec<WorktreeRow> = self
+            .rows
+            .values()
+            .cloned()
+            .map(|mut row| {
+                row.deleting = self.deleting.contains(&row.name);
+                row
+            })
+            .collect();
         rows.sort_by(|a, b| b.head_ts.cmp(&a.head_ts).then(a.name.cmp(&b.name)));
         Snapshot { rows }
     }
@@ -307,6 +355,20 @@ impl DaemonState {
             loading: self.pr_loading,
         }
     }
+
+    /// The PR map [`scan_worktrees`] should trust for the merged-branch
+    /// removal signal: `None` while the first fetch hasn't resolved yet or
+    /// the most recent one failed, even though `self.prs` may still hold a
+    /// stale-but-valid map for display. A cached "was merged" shouldn't
+    /// unlock a destructive squash-merge deletion during an outage — see
+    /// design decision 3 in the `better-worktree-deletion` change.
+    pub fn pr_state_for_verdicts(&self) -> Option<&HashMap<String, PrSummary>> {
+        if self.pr_loading || self.pr_error.is_some() {
+            None
+        } else {
+            Some(&self.prs)
+        }
+    }
 }
 
 /// Read the persisted `name → AgentRecord` map from `.swamp-status.json`.
@@ -327,16 +389,25 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
 ///
 /// `agents` is a snapshot cloned out from `DaemonState::agents` under a read
 /// lock *before* this call; the caller swaps the result in under the write lock
-/// with [`DaemonState::apply_scanned_rows`].
+/// with [`DaemonState::apply_scanned_rows`]. `prs` is the PR map to trust for
+/// the merged-branch removal signal — pass `None` while a PR fetch is loading
+/// or has most recently failed, since a stale-but-cached map shouldn't unlock
+/// a squash-merge deletion during an outage (see
+/// [`DaemonState::pr_state_for_verdicts`]).
 pub fn scan_worktrees(
     common_dir: &Path,
     agents: &HashMap<String, AgentRecord>,
     default_branch: &str,
+    prs: Option<&HashMap<String, PrSummary>>,
 ) -> Result<HashMap<String, WorktreeRow>> {
     let wts = worktree::list_worktrees(common_dir)?;
     if wts.is_empty() {
         return Ok(HashMap::new());
     }
+
+    // Resolved once per scan (not once per worktree): it's the same tip
+    // regardless of which worktree's removal verdict is being computed.
+    let default_branch_tip = worktree::default_branch_tip(common_dir);
 
     // Gather per-worktree git status concurrently. Each `git_info` shells out to
     // `git status` / `git rev-list`, so a sequential loop made first-launch
@@ -355,10 +426,38 @@ pub fn scan_worktrees(
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(wt) = wts.get(i) else { break };
-                    let info = worktree::git_info(&wt.path).unwrap_or_default();
+                    let (info, status_error) = match worktree::git_info(&wt.path) {
+                        Ok(info) => (info, false),
+                        Err(error) => {
+                            tracing::warn!(
+                                worktree = %wt.name(),
+                                %error,
+                                "worktree status read failed"
+                            );
+                            (GitInfo::default(), true)
+                        }
+                    };
                     let name = wt.name();
                     let agent = agents.get(&name).cloned().unwrap_or_default();
-                    let row = build_row(wt, &info, &agent, default_branch);
+                    let pr = prs.and_then(|m| m.get(&info.branch));
+                    let pr_state = pr.map(|pr| pr.state.clone());
+                    let pr_head_oid = pr
+                        .and_then(|pr| pr.head_oid.as_deref())
+                        .and_then(|oid| oid.parse().ok());
+                    let ctx = VerdictContext {
+                        git_info: info.clone(),
+                        default_branch: default_branch.to_string(),
+                        default_branch_tip,
+                        pr_state,
+                        pr_head_oid,
+                    };
+                    let verdict = if status_error {
+                        RemovalVerdict::Blocked(RemoveRefusedReason::StatusUnreadable)
+                    } else {
+                        worktree::removal_verdict(common_dir, &name, &ctx)
+                    };
+                    let removal_block = verdict.blocking_reason().cloned();
+                    let row = build_row(wt, &info, &agent, default_branch, removal_block);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -381,6 +480,7 @@ fn build_row(
     info: &GitInfo,
     agent: &AgentRecord,
     default_branch: &str,
+    removal_block: Option<RemoveRefusedReason>,
 ) -> WorktreeRow {
     let branch = if info.branch.is_empty() || info.branch == "(detached)" {
         wt.branch.clone()
@@ -407,6 +507,11 @@ fn build_row(
         head_ts: info.head_ts,
         harness: agent.harness,
         is_default,
+        removal_block,
+        // Projected from `DaemonState::deleting` by `snapshot()`, not known
+        // at scan time — a scan and a delete can race, and the scan must not
+        // clobber an in-flight delete's mark.
+        deleting: false,
     }
 }
 
@@ -439,6 +544,8 @@ mod tests {
             head_ts,
             harness: None,
             is_default: false,
+            removal_block: None,
+            deleting: false,
         }
     }
 
@@ -459,7 +566,7 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main");
+        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main", None);
         assert!(main.is_default, "the default branch row must be flagged");
 
         let info_feat = GitInfo {
@@ -471,6 +578,7 @@ mod tests {
             &info_feat,
             &agent,
             "main",
+            None,
         );
         assert!(!feat.is_default, "a non-default row must not be flagged");
     }
@@ -484,11 +592,134 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let row = build_row(&worktree("main", "main"), &info, &agent, "");
+        let row = build_row(&worktree("main", "main"), &info, &agent, "", None);
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
         );
+    }
+
+    /// `scan_worktrees` computes a per-row removal verdict during the scan: a
+    /// dirty worktree's row carries the dirty blocking reason; a clean
+    /// worktree whose branch matches another branch's tip (nothing to
+    /// orphan) carries none.
+    #[test]
+    fn scan_worktrees_reports_removal_block() {
+        use crate::worktree::test_support::{git_available, setup};
+        use crate::worktree::{create_worktree, create_worktree_from_base};
+
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let dirty = create_worktree(&bare, "feature").unwrap();
+        std::fs::write(dirty.path.join("scratch.txt"), "wip").unwrap();
+        // Cut with no further commits, so its tip matches "main"'s — reachable
+        // from another branch, nothing would be orphaned by deleting it.
+        create_worktree_from_base(&bare, "clean", "main").unwrap();
+
+        let rows = scan_worktrees(&bare, &HashMap::new(), "", None).unwrap();
+
+        assert_eq!(
+            rows.get("feature").unwrap().removal_block,
+            Some(RemoveRefusedReason::Dirty),
+            "a dirty worktree's row must carry the dirty reason"
+        );
+        assert_eq!(
+            rows.get("clean").unwrap().removal_block,
+            None,
+            "a clean, already-merged worktree's row must carry no reason"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_worktrees_reports_unreadable_status() {
+        use crate::worktree::create_worktree;
+        use crate::worktree::test_support::{git_available, setup};
+        use std::process::Command;
+
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&wt.path)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let git_dir = String::from_utf8(output.stdout).unwrap();
+        std::fs::write(wt.path.join(git_dir.trim()).join("index"), "not an index").unwrap();
+
+        let rows = scan_worktrees(&bare, &HashMap::new(), "main", None).unwrap();
+        assert_eq!(
+            rows.get("feature").unwrap().removal_block,
+            Some(RemoveRefusedReason::StatusUnreadable),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A row snapshot from an older peer that omits `removal_block` and
+    /// `deleting` still decodes — the safe "not deleting, no blocking
+    /// reason" reading, not a decode failure.
+    #[test]
+    fn worktree_row_decodes_without_removal_fields() {
+        let json = serde_json::json!({
+            "name": "feature",
+            "path": "/repo/feature",
+            "branch": "feature",
+            "upstream": null,
+            "ahead": 0,
+            "behind": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "conflict": false,
+            "rebase": false,
+            "agent": "idle",
+            "agent_ts": 0,
+        });
+        let row: WorktreeRow = serde_json::from_value(json).unwrap();
+        assert_eq!(row.removal_block, None);
+        assert!(!row.deleting);
+    }
+
+    /// The deleting mark survives `apply_scanned_rows`, which replaces `rows`
+    /// wholesale — a delete races with exactly the rescan its own directory
+    /// removal triggers via the fs watcher, and the mark must not be dropped
+    /// mid-delete.
+    #[test]
+    fn deleting_mark_survives_apply_scanned_rows() {
+        let mut state = DaemonState::default();
+        state.rows.insert("feature".into(), make_row("feature"));
+        state.mark_deleting("feature");
+
+        let mut new_rows = HashMap::new();
+        new_rows.insert("feature".into(), make_row("feature"));
+        state.apply_scanned_rows(new_rows);
+
+        assert!(
+            state.snapshot().rows[0].deleting,
+            "the mark must survive a rescan that replaces the row"
+        );
+    }
+
+    /// `clear_deleting` restores a marked row to `deleting: false` on the next
+    /// snapshot — the shape of a refused or failed removal.
+    #[test]
+    fn clear_deleting_restores_the_row() {
+        let mut state = DaemonState::default();
+        state.rows.insert("feature".into(), make_row("feature"));
+        state.mark_deleting("feature");
+        assert!(state.snapshot().rows[0].deleting);
+
+        state.clear_deleting("feature");
+        assert!(!state.snapshot().rows[0].deleting);
     }
 
     /// With equal head_ts, snapshot falls back to alphabetical name order.
@@ -679,6 +910,7 @@ mod tests {
             number,
             title: format!("PR {number}"),
             state: "OPEN".into(),
+            head_oid: None,
             is_draft: false,
             checks: None,
             check_meta: None,

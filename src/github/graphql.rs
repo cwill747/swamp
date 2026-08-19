@@ -41,6 +41,8 @@ struct GraphqlPrNode {
     is_draft: bool,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
     url: String,
     #[serde(rename = "reviewDecision")]
     review_decision: Option<String>,
@@ -281,6 +283,7 @@ fn fetch_pr_chunk(
                     number: node.number,
                     title: node.title,
                     state: node.state,
+                    head_oid: Some(node.head_ref_oid),
                     is_draft: node.is_draft,
                     checks,
                     check_meta,
@@ -312,7 +315,7 @@ fn build_branch_fragment(alias: &str, branch_var: &str) -> String {
     format!(
         r#"    {alias}: pullRequests(headRefName: ${branch_var}, first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
-        number title state isDraft headRefName url reviewDecision
+        number title state isDraft headRefName headRefOid url reviewDecision
         comments {{ totalCount }}
         latestReviews(first: 10) {{ totalCount nodes {{ state }} }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{
@@ -388,6 +391,7 @@ mod tests {
     fn branch_fragment_uses_variable_and_total_counts() {
         let fragment = build_branch_fragment("br0_feature", "branch0");
         assert!(fragment.contains("headRefName: $branch0"));
+        assert!(fragment.contains("headRefOid"));
         assert!(fragment.contains("comments { totalCount }"));
         assert!(fragment.contains("latestReviews(first: 10) { totalCount"));
         assert!(fragment.contains("contexts(first: 100) {\n          totalCount"));

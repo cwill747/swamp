@@ -79,7 +79,7 @@ impl GitInfo {
 /// The reason a non-forced [`crate::worktree::remove_worktree`] call was
 /// refused. Carried inside [`RemoveRefused`] so the TUI can show an accurate
 /// reason in the force-confirmation prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoveRefusedReason {
     /// Staged/unstaged/untracked files or an in-progress conflict.
     Dirty,
@@ -108,6 +108,39 @@ impl RemoveRefusedReason {
             Self::StatusUnreadable => "has unreadable status (index error?)",
         }
     }
+}
+
+/// The outcome of [`crate::worktree::remove::removal_verdict`]: either the
+/// worktree can be removed without `force`, or a single reason blocks it. The
+/// same enum backs both the authoritative pre-mutation check in
+/// [`crate::worktree::remove_worktree`] and the preview carried on
+/// [`crate::daemon::state::WorktreeRow::removal_block`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovalVerdict {
+    Removable,
+    Blocked(RemoveRefusedReason),
+}
+
+impl RemovalVerdict {
+    pub fn blocking_reason(&self) -> Option<&RemoveRefusedReason> {
+        match self {
+            Self::Removable => None,
+            Self::Blocked(reason) => Some(reason),
+        }
+    }
+}
+
+/// Data [`crate::worktree::remove::removal_verdict`] needs but must not fetch
+/// itself, so it stays a pure function of data the caller already has: the
+/// worktree's already-computed git status, the repository default branch's
+/// name and tip, and the branch's most recent PR state and head commit.
+#[derive(Debug, Clone, Default)]
+pub struct VerdictContext {
+    pub git_info: GitInfo,
+    pub default_branch: String,
+    pub default_branch_tip: Option<git2::Oid>,
+    pub pr_state: Option<String>,
+    pub pr_head_oid: Option<git2::Oid>,
 }
 
 /// Returned by [`crate::worktree::remove_worktree`] when a non-forced removal

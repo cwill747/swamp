@@ -11,13 +11,20 @@ use std::time::Instant;
 pub enum InputMode {
     /// The git-wt-style create picker (centered modal overlay).
     Create(CreatePicker),
-    /// Confirming deletion of the named worktree. When `force_reason` is
-    /// `Some`, the daemon already refused a non-forced attempt and this prompt
-    /// asks whether to retry with `force: true`; the string is the
-    /// human-readable reason (e.g. "has uncommitted changes").
+    /// Confirming deletion of the named worktree. `force_reason` is
+    /// pre-filled from the row's `removal_block` when the prompt opens, or
+    /// set when the daemon refuses a non-forced attempt the snapshot didn't
+    /// predict; either way it's the human-readable reason (e.g. "has
+    /// uncommitted changes") and the prompt asks whether to retry with
+    /// `force: true`.
     ConfirmDelete {
         name: String,
         force_reason: Option<String>,
+        /// True when this confirmation was triggered by `D` (delete the
+        /// pane's own worktree): on confirm, the removal must also close
+        /// this worktree's Zellij tab, via the detached `delete-tab` helper
+        /// rather than a direct `RemoveWorktree` request.
+        close_tab: bool,
     },
     /// Choosing the harness (Claude/Codex) for the named worktree. Applies on
     /// the next launch of that worktree's tab; only honored when the repo's
@@ -300,6 +307,8 @@ mod tests {
             head_ts: 0,
             harness: None,
             is_default,
+            removal_block: None,
+            deleting: false,
         }
     }
 

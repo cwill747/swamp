@@ -117,6 +117,17 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Anchor the daemon's own working directory to the git common directory,
+    // instead of leaving it wherever the spawning pane happened to be. The
+    // daemon is detached, outlives the pane that started it, and its cwd was
+    // otherwise whatever `tokio::process::Command` inherited — if that pane
+    // sat inside a worktree, `worktree::remove_worktree`'s current-directory
+    // check made that one worktree permanently undeletable. The common
+    // directory always exists for the daemon's lifetime and is never itself
+    // a worktree, so it's a safe, stable anchor.
+    std::env::set_current_dir(&common)
+        .with_context(|| format!("chdir to common dir {}", common.display()))?;
+
     // ── Foreground path: serialise the check→remove→bind→pid critical section ──
     //
     // Multiple --foreground processes (e.g. a previous parent + this one) may
@@ -279,6 +290,9 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                         s.update_prs(prs);
                         let pr_snap = s.pr_snapshot();
                         drop(s);
+                        if let Err(e) = d.refresh_all_exclusive().await {
+                            tracing::warn!("refresh after PR status poll: {e:?}");
+                        }
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
                         delay = Duration::from_secs(60);
                     }
@@ -392,6 +406,70 @@ fn set_socket_permissions(sock: &Path) -> Result<()> {
         .with_context(|| format!("set permissions on socket {}", sock.display()))
 }
 
+/// Guarantees a worktree's "deleting" mark gets cleared, even when the
+/// removal task panics or the request future is dropped mid-flight (a client
+/// disconnect cancels the socket handler task that awaits it). The normal
+/// completion paths in [`Daemon::remove_worktree`] call [`Self::clear`] (which
+/// also broadcasts the row restored) or [`Self::disarm`] (when they already
+/// broadcast their own snapshot, e.g. alongside `remove_row`); `Drop` is the
+/// fallback for every path that skips both.
+struct DeletingGuard {
+    daemon: Arc<Daemon>,
+    name: String,
+    /// Set once a normal completion path has taken over clearing the mark,
+    /// so `Drop` becomes a no-op instead of clearing (and broadcasting) again.
+    cleared: bool,
+}
+
+impl DeletingGuard {
+    fn new(daemon: Arc<Daemon>, name: String) -> Self {
+        Self {
+            daemon,
+            name,
+            cleared: false,
+        }
+    }
+
+    /// Clear the mark and broadcast the row restored — the refused/failed
+    /// removal case, where nothing else already broadcasts a snapshot.
+    async fn clear(mut self) {
+        self.cleared = true;
+        let snap = {
+            let mut s = self.daemon.state.write().await;
+            s.clear_deleting(&self.name);
+            s.snapshot()
+        };
+        let _ = self.daemon.tx.send(ServerMsg::Snapshot(snap));
+    }
+
+    /// Mark cleanup as already handled by the caller, so `Drop` no-ops.
+    fn disarm(mut self) {
+        self.cleared = true;
+    }
+}
+
+impl Drop for DeletingGuard {
+    fn drop(&mut self) {
+        if self.cleared {
+            return;
+        }
+        tracing::warn!(
+            worktree = %self.name,
+            "removal task ended without clearing its deleting mark; clearing from the guard"
+        );
+        let daemon = self.daemon.clone();
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            let snap = {
+                let mut s = daemon.state.write().await;
+                s.clear_deleting(&name);
+                s.snapshot()
+            };
+            let _ = daemon.tx.send(ServerMsg::Snapshot(snap));
+        });
+    }
+}
+
 async fn await_shared_op(mut rx: SharedOpRx) -> Result<()> {
     loop {
         if let Some(res) = rx.borrow().clone() {
@@ -438,21 +516,27 @@ impl Daemon {
     }
 
     async fn refresh_all_unlocked(&self) -> Result<()> {
-        // Clone out the agents map under a *read* lock so the git scan (which
-        // can take seconds on large repos) runs completely off the runtime via
-        // spawn_blocking, without blocking any async task or holding any lock.
-        let (agents, default_branch) = {
+        // Clone out the agents map and PR data under a *read* lock so the git
+        // scan (which can take seconds on large repos) runs completely off the
+        // runtime via spawn_blocking, without blocking any async task or
+        // holding any lock.
+        let (agents, default_branch, prs) = {
             let s = self.state.read().await;
-            (s.agents.clone(), s.default_branch.clone())
+            (
+                s.agents.clone(),
+                s.default_branch.clone(),
+                s.pr_state_for_verdicts().cloned(),
+            )
         };
 
         // `scan_worktrees` fans the per-worktree git status out across a bounded
         // pool of scoped threads internally, so a single `spawn_blocking` keeps
         // the whole concurrent scan off the async runtime. No async lock is held
-        // across this await — `agents` was cloned out above under a read lock.
+        // across this await — `agents`/`prs` were cloned out above under a read
+        // lock.
         let common = self.common_dir.clone();
         let new_rows = tokio::task::spawn_blocking(move || {
-            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)
+            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch, prs.as_ref())
         })
         .await
         .context("git scan task")??;
@@ -609,6 +693,15 @@ impl Daemon {
 
     /// Remove worktree `name` and its local branch (git2, off the async thread).
     ///
+    /// The worktree is marked "deleting" and a snapshot broadcast **before**
+    /// `repo_ops` is acquired, so a removal queued behind another repository
+    /// operation (a `git fetch --all` can hold the lock for up to 60s) shows
+    /// as deleting in every subscribed TUI for the whole wait, not just once
+    /// the removal itself starts. The mark is cleared and a fresh snapshot
+    /// broadcast on every exit path — success, refusal, or failure — via
+    /// `guard`, whose `Drop` also covers a panicked or cancelled removal task
+    /// so a stranded mark can't make a row permanently undeletable.
+    ///
     /// The reply is *not* gated on a full rescan: once the removal succeeds the
     /// daemon optimistically drops the deleted row and broadcasts the new
     /// snapshot, so the TUI reflects the deletion immediately. A full
@@ -617,24 +710,54 @@ impl Daemon {
     /// made the client wait out a status scan of *every* remaining worktree
     /// (which scales with worktree count) before the row could disappear.
     pub async fn remove_worktree(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
-        {
+        let snap = {
+            let mut s = self.state.write().await;
+            s.mark_deleting(name);
+            s.snapshot()
+        };
+        let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        let guard = DeletingGuard::new(Arc::clone(self), name.to_string());
+
+        let result = {
             let _repo = self.repo_ops.lock().await;
+            let (pr_state, pr_head_oid) = {
+                let s = self.state.read().await;
+                let pr = s
+                    .rows
+                    .get(name)
+                    .and_then(|row| s.pr_state_for_verdicts()?.get(&row.branch));
+                (
+                    pr.map(|pr| pr.state.clone()),
+                    pr.and_then(|pr| pr.head_oid.as_deref())
+                        .and_then(|oid| oid.parse().ok()),
+                )
+            };
             let common = self.common_dir.clone();
             let name = name.to_string();
             tokio::task::spawn_blocking(move || {
-                crate::worktree::remove_worktree(&common, &name, true, force)
+                crate::worktree::remove_worktree(&common, &name, true, force, pr_state, pr_head_oid)
             })
             .await
-            .context("remove worktree task")??;
+            .context("remove worktree task")?
+        };
+
+        if let Err(e) = result {
+            // Refused or failed: clear the mark and broadcast the row
+            // restored, exactly as it was before the request.
+            guard.clear().await;
+            return Err(e);
         }
 
-        // Optimistic removal: drop just the deleted row and broadcast now.
+        // Optimistic removal: drop just the deleted row, clear the deleting
+        // mark, and broadcast now, in the same snapshot.
         let snap = {
             let mut s = self.state.write().await;
+            s.clear_deleting(name);
             s.remove_row(name);
             s.snapshot()
         };
         let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        guard.disarm();
 
         // Reconcile the remaining worktrees in the background. `refresh_all`
         // coalesces with the watcher-triggered refresh that the directory
@@ -783,6 +906,144 @@ mod tests {
             pr_subscribers: Arc::new(AtomicUsize::new(0)),
             pr_wake: Arc::new(Notify::new()),
         })
+    }
+
+    fn make_row(name: &str) -> crate::daemon::state::WorktreeRow {
+        crate::daemon::state::WorktreeRow {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/repo/{name}")),
+            branch: name.to_string(),
+            upstream: None,
+            upstream_gone: false,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            conflict: false,
+            rebase: false,
+            agent: crate::daemon::state::AgentStatus::Idle,
+            agent_ts: 0,
+            session_name: None,
+            head_ts: 0,
+            harness: None,
+            is_default: false,
+            removal_block: None,
+            deleting: false,
+        }
+    }
+
+    /// Dropping a `DeletingGuard` without calling `clear`/`disarm` — the shape
+    /// of a panicked or cancelled removal task — still clears the mark. The
+    /// guard's `Drop` cannot `.await` directly, so it spawns the cleanup;
+    /// this proves that spawned task actually runs and reaches the state.
+    #[tokio::test]
+    async fn deleting_guard_clears_mark_on_drop() {
+        if !git_available() {
+            eprintln!("skipping deleting_guard_clears_mark_on_drop: git not on PATH");
+            return;
+        }
+        let repo = git_init_repo();
+        let common = git_common_dir(&repo).unwrap();
+        let daemon = build_daemon(&common).await;
+        {
+            let mut s = daemon.state.write().await;
+            s.rows.insert("feature".into(), make_row("feature"));
+            s.mark_deleting("feature");
+        }
+        assert!(
+            daemon.state.read().await.snapshot().rows[0].deleting,
+            "the mark must be visible before the guard drops"
+        );
+
+        drop(DeletingGuard::new(daemon.clone(), "feature".to_string()));
+
+        let mut cleared = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !daemon.state.read().await.snapshot().rows[0].deleting {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "dropping the guard must clear the deleting mark");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn merged_pr_refreshes_verdict_and_allows_authoritative_removal() {
+        use crate::github::PrSummary;
+        use crate::worktree::test_support::{git_available, run, setup};
+        use crate::worktree::{RemoveRefusedReason, create_worktree};
+
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+        std::fs::write(wt.path.join("work.txt"), "merged").unwrap();
+        run(&wt.path, &["add", "work.txt"]);
+        run(&wt.path, &["commit", "-m", "merged work"]);
+        let head_oid = git2::Repository::open(&wt.path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+        run(&bare, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&wt.path, &["push", "--set-upstream", "origin", "feature"]);
+        run(&bare, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+
+        let daemon = build_daemon(&bare).await;
+        daemon.refresh_all().await.unwrap();
+        assert_eq!(
+            daemon
+                .state
+                .read()
+                .await
+                .rows
+                .get("feature")
+                .unwrap()
+                .removal_block,
+            Some(RemoveRefusedReason::UnmergedCommits),
+        );
+
+        let mut prs = std::collections::HashMap::new();
+        prs.insert(
+            "feature".into(),
+            PrSummary {
+                number: 1,
+                title: "Merged work".into(),
+                state: "MERGED".into(),
+                head_oid: Some(head_oid.to_string()),
+                is_draft: false,
+                checks: None,
+                check_meta: None,
+                url: None,
+                comment_count: 0,
+                review: None,
+                reviews_partial: false,
+            },
+        );
+        daemon.state.write().await.update_prs(prs);
+        daemon.refresh_all().await.unwrap();
+        assert_eq!(
+            daemon
+                .state
+                .read()
+                .await
+                .rows
+                .get("feature")
+                .unwrap()
+                .removal_block,
+            None,
+        );
+
+        daemon.remove_worktree("feature", false).await.unwrap();
+        assert!(!wt.path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The control socket must come up before the initial git scan runs, so the

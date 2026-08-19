@@ -16,27 +16,28 @@ mod repo;
 mod status;
 
 pub use branches::{
-    default_branch, default_worktree_path, find_default_worktree, list_branches, list_worktrees,
+    default_branch, default_branch_tip, default_worktree_path, find_default_worktree,
+    list_branches, list_worktrees,
 };
 pub use create::{create_worktree, create_worktree_from_base};
 pub use model::{
-    BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, Worktree,
-    worktree_name_for_branch,
+    BranchInfo, BranchKind, GitInfo, RemovalVerdict, RemoveRefused, RemoveRefusedReason,
+    VerdictContext, Worktree, worktree_name_for_branch,
 };
-pub use remove::remove_worktree;
+pub use remove::{removal_verdict, remove_worktree};
 pub use repo::{git_common_dir, resolve_git_dir};
 pub use status::git_info;
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    pub(super) fn git_available() -> bool {
+    pub(crate) fn git_available() -> bool {
         Command::new("git").arg("--version").output().is_ok()
     }
 
-    pub(super) fn run(dir: &Path, args: &[&str]) {
+    pub(crate) fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -50,7 +51,7 @@ mod test_support {
 
     /// Build a git-wt style layout: `root/.bare` (bare repo) with branch `main`
     /// committed, and `root/.git` linking to it. Returns `(root, bare_dir)`.
-    pub(super) fn setup() -> (PathBuf, PathBuf) {
+    pub(crate) fn setup() -> (PathBuf, PathBuf) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

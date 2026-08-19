@@ -171,12 +171,19 @@ Useful keys:
 | `k` / `↑` | Move selection up                   |
 | `Enter`   | Open or switch to the selected worktree tab |
 | `c`       | Create a worktree                   |
-| `d`       | Delete a worktree                   |
+| `d`       | Delete the selected worktree        |
+| `D`       | Delete the worktree this pane lives in and close its tab |
 | `h`       | Choose Claude or Codex harness      |
 | `r`       | Refresh status                      |
 | `u`       | Update branches                     |
 | `K`       | Kill the swamp session              |
 | `q`       | Quit                                |
+
+A deletion that git refuses without `--force` (uncommitted changes, unpushed
+commits, ...) opens a floating Zellij pane showing the reason plus the
+worktree's status and diffstat, so you can review what's at risk before
+forcing it through. Outside Zellij, or if the pane can't be opened, swamp
+falls back to a one-line force-confirmation prompt instead.
 
 ### `swamp hook`
 
