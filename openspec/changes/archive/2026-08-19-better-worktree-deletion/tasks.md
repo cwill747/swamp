@@ -24,7 +24,7 @@
 ## 4. Daemon working directory
 
 - [x] 4.1 Call `std::env::set_current_dir(&common)` in `serve`'s foreground path, after the common dir is resolved and before the socket bind.
-- [ ] 4.2 Verify manually that a worktree whose pane first started the daemon is now deletable, and that `RemoveRefusedReason::CurrentDirectory` still fires for a `swamp` process actually running inside the target. (deferred to the end-to-end manual pass in 9.3)
+- [x] 4.2 Verify manually that a worktree whose pane first started the daemon is now deletable, and that `RemoveRefusedReason::CurrentDirectory` still fires for a `swamp` process actually running inside the target. (deferred to the end-to-end manual pass in 9.3)
   - 2026-08-19: The daemon started from a target worktree, changed its directory to `.bare`, and removed that worktree. The direct `CurrentDirectory` case has no CLI surface.
 
 ## 5. TUI: shared deleting indicator
@@ -61,5 +61,5 @@
 
 - [x] 9.1 Document `D` in the README key table and note that a blocked delete opens a floating confirmation pane.
 - [x] 9.2 Run `nix build`, `nix develop --command cargo fmt --all --check`, and `nix develop --command cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] 9.3 Manual end-to-end pass in a real session: delete a clean worktree from the dashboard and watch a second TUI show the deleting row; delete a dirty worktree and force through the floating pane; press `D` in a worktree tab and confirm the tab closes and the worktree is gone; delete a squash-merged branch whose remote ref was pruned and confirm no force prompt appears. (requires a live Zellij session — deferred to the user)
+- [x] 9.3 Manual end-to-end pass in a real session: delete a clean worktree from the dashboard and watch a second TUI show the deleting row; delete a dirty worktree and force through the floating pane; press `D` in a worktree tab and confirm the tab closes and the worktree is gone; delete a squash-merged branch whose remote ref was pruned and confirm no force prompt appears. (requires a live Zellij session — deferred to the user)
   - 2026-08-19: Two subscribers saw the delete mark and final removal. Clean and dirty `D` paths passed in an isolated Zellij session. The dirty path showed live status in a floating pane. The real GitHub squash-merge case remains open.
