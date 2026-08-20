@@ -87,12 +87,10 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
         .map(session_name_for)
         .unwrap_or_else(|_| "swamp".into());
 
-    // When launched from inside an existing zellij session, switch the live
-    // client over to the repo session (creating it from the layout if needed)
-    // via `zellij action switch-session`, rather than spawning a session the host
-    // client never joins. The originating tab is then closed best-effort.
-    let nested = zellij::in_zellij();
-    spawn_new_session(&target, &worktrees, &session, &cfg, nested)
+    // Zellij 0.45 handles a client launched inside another Zellij session as a
+    // native nested session. Keep the foreground launch path so the repo session
+    // stays in this pane and Zellij can offer its nesting controls.
+    spawn_new_session(&target, &worktrees, &session, &cfg)
 }
 
 fn spawn_new_session(
@@ -100,7 +98,6 @@ fn spawn_new_session(
     worktrees: &[Worktree],
     session: &str,
     cfg: &ConfigPaths,
-    nested: bool,
 ) -> Result<()> {
     let git_dir = resolve_git_dir(target);
     let common = git_common_dir(&git_dir);
@@ -148,66 +145,17 @@ fn spawn_new_session(
         if do_restart {
             crate::kill::run(Some(target.to_path_buf()))?;
             // Fall through to fresh launch below.
-        } else if nested {
-            // Inside another zellij session: switch the live client over instead
-            // of exec-ing an attach that would nest the session inside a pane.
-            return nested_handover(session, None);
+        } else if std::env::var("ZELLIJ_SESSION_NAME").as_deref() == Ok(session) {
+            // The repo session is already active. Attaching it inside itself
+            // would create a recursive client instead of a useful nested session.
+            return Ok(());
         } else {
             return zellij::attach(session);
         }
     }
 
     let layout_path = write_multi_tab_layout(worktrees, session, cfg, &git_dir)?;
-    if nested {
-        // Create the repo session from the layout AND move this client into it in
-        // one `switch-session --layout-string` call, then close the tab we
-        // launched from. Passing the layout contents avoids deleting the temp
-        // layout before the zellij server has consumed the switch action.
-        let layout = std::fs::read_to_string(&layout_path)
-            .with_context(|| format!("read generated layout {}", layout_path.display()))?;
-        nested_handover(session, Some(&layout))
-    } else {
-        zellij::new_session_with_layout(&layout_path, target, session)
-    }
-}
-
-/// Hand the live zellij client over to `session` (creating it from `layout` KDL
-/// when `Some`) and best-effort close the tab swamp was launched from, so the
-/// user is dropped into the repo session rather than stranded on a stale tab.
-///
-/// The originating tab's host session and stable id are captured *before*
-/// switching — afterwards the host's "current tab" is ambiguous. Closing is
-/// skipped when the host has a single tab (closing it would tear the host session
-/// down), or when the host *is* the target session (launched from within it, so
-/// the originating tab is a live tab the user wants to keep); the user then drops
-/// back to the shell they launched from. The close is best-effort: a failure
-/// never fails the launch, since the switch already succeeded.
-fn nested_handover(session: &str, layout: Option<&str>) -> Result<()> {
-    let host = std::env::var("ZELLIJ_SESSION_NAME").ok();
-    let origin_tab = match zellij::current_tab_id() {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!("could not read originating tab id; skipping tab cleanup: {e}");
-            None
-        }
-    };
-    let host_has_multiple_tabs = zellij::list_tab_names()
-        .map(|t| t.len() > 1)
-        .unwrap_or(false);
-
-    zellij::switch_session(session, layout)?;
-
-    // Skip cleanup when launched from inside the target session itself: `host`
-    // equals `session`, the switch is a no-op, and closing the originating tab
-    // would tear down the user's current dashboard/worktree tab rather than a
-    // stale tab in a different host session.
-    if host_has_multiple_tabs
-        && let (Some(host), Some(id)) = (host, origin_tab)
-        && host != session
-    {
-        zellij::close_tab_by_id_in_session(&host, id);
-    }
-    Ok(())
+    zellij::new_session_with_layout(&layout_path, target, session)
 }
 
 fn prompt_restart(prompt: &str) -> bool {
