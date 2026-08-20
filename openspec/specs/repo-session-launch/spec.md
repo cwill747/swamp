@@ -41,8 +41,15 @@ Launch SHALL resolve the target git repository, discover its worktrees, reject r
 - **WHEN** launch cannot discover any worktrees for the target repository
 - **THEN** launch fails instead of starting an empty session
 
+### Requirement: Zellij Version Compatibility
+Swamp SHALL require Zellij 0.45 or later for repo session launch.
+
+#### Scenario: Supported Zellij version
+- **WHEN** the user launches swamp with Zellij 0.45 or later on `PATH`
+- **THEN** swamp can use Zellij's native nested-session controls
+
 ### Requirement: Existing Session Attachment
-When a matching Zellij session already exists, launch SHALL attach to it unless a stale daemon version is detected and an interactive restart is accepted. When launch is running **inside** an existing Zellij session (nested), it SHALL switch the live client to the matching session rather than spawning a process that leaves the originating client idle.
+When a matching Zellij session already exists, launch SHALL attach to it unless a stale daemon version is detected and an interactive restart is accepted. When launch is running inside an existing Zellij session, it SHALL attach to the matching repo session as a child in the current pane so Zellij can provide native nested-session controls.
 
 #### Scenario: Current session exists
 - **WHEN** a matching Zellij session exists, launch is not nested, and no accepted restart is required
@@ -50,8 +57,13 @@ When a matching Zellij session already exists, launch SHALL attach to it unless 
 
 #### Scenario: Current session exists while nested
 - **WHEN** a matching Zellij session exists and launch is running inside another Zellij session
-- **THEN** swamp switches the current client to the matching session
-- **AND** the originating client is not left idle in the host session
+- **THEN** swamp attaches to the matching session inside the current pane
+- **AND** Zellij offers its native nested-session controls
+
+#### Scenario: Repo session is already active
+- **WHEN** launch runs from inside the matching repo session
+- **THEN** swamp leaves the current session active
+- **AND** does not attach the session recursively
 
 #### Scenario: Stale daemon in interactive terminal
 - **WHEN** a matching session has a daemon version mismatch and the user accepts restart
@@ -135,31 +147,16 @@ The internal relaunch command SHALL reopen a worktree tab so harness changes can
 - **THEN** relaunch exits without changing tabs
 
 ### Requirement: Nested Session Launch
-When launch is running inside an existing Zellij session and no matching repo session exists yet, swamp SHALL create the repo session from the generated layout AND switch the current client to it in a single operation, so the user is moved into the new session rather than being left in the host session. Launch SHALL NOT spawn the new session as a blocking child that the host client never attaches to.
+When launch is running inside an existing Zellij session and no matching repo session exists, swamp SHALL start the repo session from the generated layout as a child in the current pane. Swamp SHALL preserve the outer session and originating tab so Zellij 0.45 or later can provide native nested-session zoom, focus, and navigation controls.
 
 #### Scenario: New session created while nested
 - **WHEN** launch runs inside an existing Zellij session and no matching repo session exists
-- **THEN** swamp creates the repo session using the generated layout
-- **AND** switches the current client to that new session
+- **THEN** swamp creates the repo session using the generated layout inside the current pane
+- **AND** Zellij offers its native nested-session controls
 
 #### Scenario: Not nested
 - **WHEN** launch runs outside any Zellij session and no matching repo session exists
-- **THEN** swamp starts the new session in the foreground as before, without switching an existing client
-
-### Requirement: Originating Tab Cleanup
-After a nested launch switches the client to the repo session, swamp SHALL make a best-effort attempt to close the originating tab in the host session, so the user is not left with a stale swamp tab. Swamp SHALL NOT close the originating tab when it is the host session's only tab, because doing so would tear down the host session.
-
-#### Scenario: Host has multiple tabs
-- **WHEN** a nested launch switches to the repo session and the host session has more than one tab
-- **THEN** swamp closes the originating tab in the host session
-
-#### Scenario: Host has a single tab
-- **WHEN** a nested launch switches to the repo session and the originating tab is the host session's only tab
-- **THEN** swamp leaves the originating tab in place and drops back to the shell it was in before
-
-#### Scenario: Tab close fails
-- **WHEN** the best-effort close of the originating tab fails
-- **THEN** the switch to the repo session still succeeds and launch does not error
+- **THEN** swamp starts the new session in the foreground as before
 
 ### Requirement: Daemon Working Directory
 The daemon SHALL set its own working directory to the repository git common directory at startup, rather than inheriting the working directory of whichever process started it. The daemon therefore never holds a working directory inside a worktree it may be asked to remove.

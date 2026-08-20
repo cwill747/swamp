@@ -93,7 +93,7 @@ cargo install --path .
 
 ### Requirements
 
-- [Zellij](https://zellij.dev) on `PATH`
+- [Zellij](https://zellij.dev) 0.45 or later on `PATH`
 - [lazygit](https://github.com/jesseduffield/lazygit) on `PATH`
 - A login shell (`$SHELL`, falling back to bash)
 - [Claude Code](https://github.com/anthropics/claude-code) or Codex if you want
@@ -115,8 +115,11 @@ worktree's own tab on demand (`Enter` or double-click), and swamp switches to it
 if it is already open. The tab count is no longer tied to the worktree count,
 and tabs you open stay part of the Zellij session across detach/reattach.
 
-If you are already inside Zellij, `swamp` adds tabs to the current session
-instead of starting a new one.
+If you run swamp inside an existing Zellij session, swamp opens the repo session
+as a nested session in the current pane. Zellij then offers its native nested
+session controls for zooming into the repo or controlling it when the pane has
+focus. If you run swamp from the repo session itself, swamp leaves that session
+active instead of attaching it recursively.
 
 Run the one-shot setup command to write the default config and wire agent status
 hooks:
