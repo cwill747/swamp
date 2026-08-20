@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::time::Duration;
 
 mod layout;
@@ -101,7 +102,7 @@ fn spawn_new_session(
 ) -> Result<()> {
     let git_dir = resolve_git_dir(target);
     let common = git_common_dir(&git_dir);
-    let _launch_lock = match &common {
+    let launch_lock = match &common {
         Ok(c) => Some(acquire_launch_lock(c)?),
         Err(_) => None,
     };
@@ -155,7 +156,40 @@ fn spawn_new_session(
     }
 
     let layout_path = write_multi_tab_layout(worktrees, session, cfg, &git_dir)?;
-    zellij::new_session_with_layout(&layout_path, target, session)
+    let mut child = zellij::spawn_new_session_with_layout(&layout_path, target, session)?;
+    wait_for_session_registration(&mut child, session)?;
+    drop(launch_lock);
+    zellij::wait_for_session_exit(child)
+}
+
+/// Keep the launch lock until the new session is visible to other swamp
+/// processes. Once registered, concurrent launches can acquire the lock and
+/// attach instead of timing out while this foreground client remains open.
+fn wait_for_session_registration(child: &mut Child, session: &str) -> Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const MAX_ATTEMPTS: usize = 100;
+
+    for _ in 0..MAX_ATTEMPTS {
+        if zellij::list_sessions()
+            .is_ok_and(|sessions| sessions.iter().any(|candidate| candidate == session))
+        {
+            return Ok(());
+        }
+        if child
+            .try_wait()
+            .context("check new zellij session process")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    tracing::warn!(
+        session,
+        "zellij session was not registered within 5 seconds"
+    );
+    Ok(())
 }
 
 fn prompt_restart(prompt: &str) -> bool {

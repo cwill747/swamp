@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 
 pub fn in_zellij() -> bool {
     std::env::var("ZELLIJ").is_ok()
@@ -115,13 +115,17 @@ fn parse_tab_names(stdout: &str) -> Vec<String> {
 /// Launch a brand-new Zellij session attached to `layout`, with `cwd` and `session`.
 /// Zellij 0.45 treats this foreground client as a native nested session when the
 /// command runs inside another Zellij session.
-pub fn new_session_with_layout(layout: &Path, _cwd: &Path, session: &str) -> Result<()> {
+pub fn spawn_new_session_with_layout(layout: &Path, _cwd: &Path, session: &str) -> Result<Child> {
     let layout = layout.to_string_lossy();
     tracing::info!(session, %layout, "launching zellij session from multi-tab layout");
-    let status = Command::new("zellij")
+    Command::new("zellij")
         .args(["--new-session-with-layout", &layout, "--session", session])
-        .status()
-        .context("spawn zellij --new-session-with-layout")?;
+        .spawn()
+        .context("spawn zellij --new-session-with-layout")
+}
+
+pub fn wait_for_session_exit(mut child: Child) -> Result<()> {
+    let status = child.wait().context("wait for zellij session")?;
     if !status.success() {
         anyhow::bail!("zellij session launch exited {:?}", status.code());
     }
