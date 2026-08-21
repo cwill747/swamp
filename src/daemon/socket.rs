@@ -42,6 +42,10 @@ pub enum ClientMsg {
         #[serde(default)]
         force: bool,
     },
+    /// Run non-forced removal checks without mutating the worktree.
+    CheckRemoval {
+        name: String,
+    },
     /// Set the per-worktree harness override (worktrees pane `h`); applies the
     /// next time swamp builds that worktree's tab.
     SetHarness {
@@ -192,6 +196,25 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                             Err(e) => {
                                 // Surface a refused-removal distinctly so the TUI
                                 // can offer a force override.
+                                let reply = match e.downcast_ref::<crate::worktree::RemoveRefused>() {
+                                    Some(r) => ServerMsg::ErrDirty {
+                                        name: r.name.clone(),
+                                        reason: r.reason.description().to_string(),
+                                    },
+                                    None => ServerMsg::Err { message: e.to_string() },
+                                };
+                                write_msg(&mut stream, &reply).await?
+                            }
+                        }
+                    }
+                    ClientMsg::CheckRemoval { name } => {
+                        if let Err(e) = validate_worktree_name(&name) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
+                        match daemon.check_worktree_removal(&name).await {
+                            Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
+                            Err(e) => {
                                 let reply = match e.downcast_ref::<crate::worktree::RemoveRefused>() {
                                     Some(r) => ServerMsg::ErrDirty {
                                         name: r.name.clone(),
@@ -423,6 +446,9 @@ mod tests {
             ClientMsg::RemoveWorktree {
                 name: "feature-x".into(),
                 force: false,
+            },
+            ClientMsg::CheckRemoval {
+                name: "feature-x".into(),
             },
             ClientMsg::SetHarness {
                 worktree: "feature-x".into(),

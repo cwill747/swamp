@@ -16,15 +16,14 @@ mod repo;
 mod status;
 
 pub use branches::{
-    default_branch, default_branch_tip, default_worktree_path, find_default_worktree,
-    list_branches, list_worktrees,
+    default_branch, default_worktree_path, find_default_worktree, list_branches, list_worktrees,
 };
 pub use create::{create_worktree, create_worktree_from_base};
 pub use model::{
-    BranchInfo, BranchKind, GitInfo, RemovalVerdict, RemoveRefused, RemoveRefusedReason,
-    VerdictContext, Worktree, worktree_name_for_branch,
+    BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, Worktree,
+    worktree_name_for_branch,
 };
-pub use remove::{removal_verdict, remove_worktree};
+pub use remove::{check_worktree_removal, remove_worktree};
 pub use repo::{git_common_dir, resolve_git_dir};
 pub use status::git_info;
 

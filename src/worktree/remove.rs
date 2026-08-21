@@ -67,42 +67,7 @@ pub fn remove_worktree(
     };
 
     if !force {
-        // A status error refuses removal (fail closed) instead of assuming
-        // clean: a transient libgit2 error is exactly when an automatic
-        // remove_dir_all is least wanted. This can't be folded into
-        // `removal_verdict` because it happens *while building* the
-        // `GitInfo` the verdict is handed, not while evaluating it.
-        let info = if wt_path.exists() {
-            match git_info(&wt_path) {
-                Err(_) => {
-                    return Err(RemoveRefused {
-                        name: name.to_string(),
-                        reason: RemoveRefusedReason::StatusUnreadable,
-                    }
-                    .into());
-                }
-                Ok(info) => info,
-            }
-        } else {
-            GitInfo::default()
-        };
-
-        let default_branch = branches::default_branch_name(&repo).unwrap_or_default();
-        let default_branch_tip = branches::default_branch_tip_in_repo(&repo);
-        let ctx = VerdictContext {
-            git_info: info,
-            default_branch,
-            default_branch_tip,
-            pr_state,
-            pr_head_oid,
-        };
-        if let RemovalVerdict::Blocked(reason) = removal_verdict(common_dir, name, &ctx) {
-            return Err(RemoveRefused {
-                name: name.to_string(),
-                reason,
-            }
-            .into());
-        }
+        check_worktree_removal(common_dir, name, pr_state, pr_head_oid)?;
     }
 
     if wt_path.exists() {
@@ -129,12 +94,68 @@ pub fn remove_worktree(
     Ok(())
 }
 
+/// Check whether a worktree can be removed without mutating it.
+///
+/// Routine dashboard scans don't call this function. The deletion path calls
+/// it immediately before mutation, and the current-tab deletion flow calls it
+/// on demand before closing the tab.
+pub fn check_worktree_removal(
+    common_dir: &Path,
+    name: &str,
+    pr_state: Option<String>,
+    pr_head_oid: Option<Oid>,
+) -> Result<()> {
+    let repo = Repository::open(common_dir)
+        .with_context(|| format!("open bare repo at {}", common_dir.display()))?;
+    let wt = repo
+        .find_worktree(name)
+        .with_context(|| format!("find worktree {name}"))?;
+    let wt_path = wt.path().to_path_buf();
+
+    if let Ok(cwd) = std::env::current_dir()
+        && path_contains(&wt_path, &cwd)
+    {
+        return Err(RemoveRefused {
+            name: name.to_string(),
+            reason: RemoveRefusedReason::CurrentDirectory,
+        }
+        .into());
+    }
+
+    // A status error refuses removal instead of assuming the worktree is
+    // clean. This check can't be folded into `removal_verdict` because the
+    // error occurs while building the `GitInfo` passed to it.
+    let info = if wt_path.exists() {
+        git_info(&wt_path).map_err(|_| RemoveRefused {
+            name: name.to_string(),
+            reason: RemoveRefusedReason::StatusUnreadable,
+        })?
+    } else {
+        GitInfo::default()
+    };
+
+    let ctx = VerdictContext {
+        git_info: info,
+        default_branch: branches::default_branch_name(&repo).unwrap_or_default(),
+        default_branch_tip: branches::default_branch_tip_in_repo(&repo),
+        pr_state,
+        pr_head_oid,
+    };
+    if let RemovalVerdict::Blocked(reason) = removal_verdict(common_dir, name, &ctx) {
+        return Err(RemoveRefused {
+            name: name.to_string(),
+            reason,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Compute whether `name` can be removed without `force`, and why not when it
 /// can't. Performs no mutation and no I/O beyond opening the repo and, when
 /// the branch has no live upstream, the bounded reachability probe — the
 /// caller is expected to have already read the worktree's git status into
-/// `ctx.git_info`. Used both as the authoritative pre-mutation check in
-/// [`remove_worktree`] and to fill `WorktreeRow::removal_block` during a scan.
+/// `ctx.git_info`. Used by the authoritative deletion-time check.
 pub fn removal_verdict(common_dir: &Path, name: &str, ctx: &VerdictContext) -> RemovalVerdict {
     tracing::trace!(
         worktree = name,

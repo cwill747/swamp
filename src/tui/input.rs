@@ -1,4 +1,4 @@
-use super::client::send_action;
+use super::client::{check_removal, send_action};
 use super::event::AppEvent;
 use super::state::{AppState, CreateAction, CreateEntry, CreateStep, InputMode};
 use super::view;
@@ -231,12 +231,10 @@ fn spawn_relaunch_tab(name: &str, path: &std::path::Path) {
 
 /// Handle the `d` key on the worktrees pane: open the delete confirmation for
 /// the selected row, or reject with a footer message when it's already being
-/// deleted. The snapshot already carries the removal verdict computed during
-/// the scan, so the confirmation can name a blocking reason immediately —
-/// no daemon round-trip needed to learn it, and no request is sent until the
-/// user actually confirms in [`handle_input_key`]. `AppEvent::DeleteNeedsForce`
-/// remains the fallback for a stale snapshot: it reopens the same prompt with
-/// the daemon's own reason when the two disagree.
+/// deleted. New daemon snapshots don't compute removal verdicts; after the
+/// user confirms, the authoritative removal request either succeeds or
+/// reopens the prompt with the blocking reason. The legacy row field remains
+/// readable for compatibility with version 0.7 daemons.
 pub(super) fn handle_delete_key(app: &mut AppState) {
     let Some(row) = app.selected_row() else {
         return;
@@ -400,16 +398,25 @@ pub(super) fn handle_input_key(
                 }
 
                 if close_tab {
-                    // Every `D` fallback must use the detached helper. It
-                    // closes the tab before removal, including when a blocked
-                    // deletion could not open its floating pane.
                     if let Some(path) = row_path {
-                        crate::launch::spawn_delete_tab(
-                            &name,
-                            &path,
-                            common,
-                            force_reason.is_some(),
-                        );
+                        if force_reason.is_some() {
+                            crate::launch::spawn_delete_tab(&name, &path, common, true);
+                        } else {
+                            // `D` must know whether removal is allowed before
+                            // closing its own tab. Run the expensive check only
+                            // after confirmation, then re-check during removal.
+                            app.status_msg = Some(format!("Checking {name}…"));
+                            let tx = tx.clone();
+                            let common = common.to_path_buf();
+                            tokio::spawn(async move {
+                                let result = check_removal(&common, &name)
+                                    .await
+                                    .map_err(|error| error.to_string());
+                                let _ = tx
+                                    .send(AppEvent::DeleteTabCheckDone { name, path, result })
+                                    .await;
+                            });
+                        }
                     } else {
                         app.status_msg = Some(format!("Cannot find worktree path for {name}"));
                     }
@@ -426,9 +433,8 @@ pub(super) fn handle_input_key(
                 app.pending_delete = Some(name.clone());
                 let tx = tx.clone();
                 let common = common.to_path_buf();
-                // Use force: true when the daemon already refused once (or
-                // the snapshot verdict already predicted it) and we're
-                // asking the user to confirm a force override.
+                // Use force when the daemon already refused once and the user
+                // confirms the override.
                 let force = force_reason.is_some();
                 tokio::spawn(async move {
                     if let Err(e) = send_action(

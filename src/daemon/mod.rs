@@ -290,9 +290,6 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                         s.update_prs(prs);
                         let pr_snap = s.pr_snapshot();
                         drop(s);
-                        if let Err(e) = d.refresh_all_exclusive().await {
-                            tracing::warn!("refresh after PR status poll: {e:?}");
-                        }
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
                         delay = Duration::from_secs(60);
                     }
@@ -516,27 +513,23 @@ impl Daemon {
     }
 
     async fn refresh_all_unlocked(&self) -> Result<()> {
-        // Clone out the agents map and PR data under a *read* lock so the git
+        // Clone out the agents map and default branch under a read lock so the git
         // scan (which can take seconds on large repos) runs completely off the
         // runtime via spawn_blocking, without blocking any async task or
         // holding any lock.
-        let (agents, default_branch, prs) = {
+        let (agents, default_branch) = {
             let s = self.state.read().await;
-            (
-                s.agents.clone(),
-                s.default_branch.clone(),
-                s.pr_state_for_verdicts().cloned(),
-            )
+            (s.agents.clone(), s.default_branch.clone())
         };
 
         // `scan_worktrees` fans the per-worktree git status out across a bounded
         // pool of scoped threads internally, so a single `spawn_blocking` keeps
         // the whole concurrent scan off the async runtime. No async lock is held
-        // across this await — `agents`/`prs` were cloned out above under a read
+        // across this await — `agents` was cloned out above under a read
         // lock.
         let common = self.common_dir.clone();
         let new_rows = tokio::task::spawn_blocking(move || {
-            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch, prs.as_ref())
+            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)
         })
         .await
         .context("git scan task")??;
@@ -689,6 +682,32 @@ impl Daemon {
         .await
         .context("create worktree task")??;
         self.refresh_all_unlocked().await
+    }
+
+    /// Run the authoritative non-forced removal checks without mutating the
+    /// worktree. The current-tab deletion flow uses this before closing its
+    /// own tab; ordinary deletion checks inside `remove_worktree`.
+    pub async fn check_worktree_removal(&self, name: &str) -> Result<()> {
+        let _repo = self.repo_ops.lock().await;
+        let (pr_state, pr_head_oid) = {
+            let s = self.state.read().await;
+            let pr = s
+                .rows
+                .get(name)
+                .and_then(|row| s.pr_state_for_verdicts()?.get(&row.branch));
+            (
+                pr.map(|pr| pr.state.clone()),
+                pr.and_then(|pr| pr.head_oid.as_deref())
+                    .and_then(|oid| oid.parse().ok()),
+            )
+        };
+        let common = self.common_dir.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree::check_worktree_removal(&common, &name, pr_state, pr_head_oid)
+        })
+        .await
+        .context("check worktree removal task")?
     }
 
     /// Remove worktree `name` and its local branch (git2, off the async thread).
@@ -997,16 +1016,13 @@ mod tests {
 
         let daemon = build_daemon(&bare).await;
         daemon.refresh_all().await.unwrap();
+        let error = daemon.check_worktree_removal("feature").await.unwrap_err();
         assert_eq!(
-            daemon
-                .state
-                .read()
-                .await
-                .rows
-                .get("feature")
+            error
+                .downcast_ref::<crate::worktree::RemoveRefused>()
                 .unwrap()
-                .removal_block,
-            Some(RemoveRefusedReason::UnmergedCommits),
+                .reason,
+            RemoveRefusedReason::UnmergedCommits,
         );
 
         let mut prs = std::collections::HashMap::new();
@@ -1027,18 +1043,7 @@ mod tests {
             },
         );
         daemon.state.write().await.update_prs(prs);
-        daemon.refresh_all().await.unwrap();
-        assert_eq!(
-            daemon
-                .state
-                .read()
-                .await
-                .rows
-                .get("feature")
-                .unwrap()
-                .removal_block,
-            None,
-        );
+        daemon.check_worktree_removal("feature").await.unwrap();
 
         daemon.remove_worktree("feature", false).await.unwrap();
         assert!(!wt.path.exists());

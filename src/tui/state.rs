@@ -11,12 +11,9 @@ use std::time::Instant;
 pub enum InputMode {
     /// The git-wt-style create picker (centered modal overlay).
     Create(CreatePicker),
-    /// Confirming deletion of the named worktree. `force_reason` is
-    /// pre-filled from the row's `removal_block` when the prompt opens, or
-    /// set when the daemon refuses a non-forced attempt the snapshot didn't
-    /// predict; either way it's the human-readable reason (e.g. "has
-    /// uncommitted changes") and the prompt asks whether to retry with
-    /// `force: true`.
+    /// Confirming deletion of the named worktree. `force_reason` is set when
+    /// an on-demand daemon check refuses non-forced removal; it contains the
+    /// human-readable reason and asks whether to retry with `force: true`.
     ConfirmDelete {
         name: String,
         force_reason: Option<String>,
