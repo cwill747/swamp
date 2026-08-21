@@ -60,11 +60,11 @@ Subscribers SHALL receive the current worktree snapshot, resource snapshot, and 
 - **THEN** subscribed clients receive updated messages
 
 ### Requirement: Worktree Snapshot Rows
-Daemon snapshots SHALL include worktree rows with branch, upstream, ahead/behind, dirty counts, conflict/rebase state, agent status, agent timestamp, session name, head timestamp, harness override, a flag marking whether the row's branch is the repository default branch, a flag marking whether a removal is in flight for that worktree, and the worktree's removal verdict. The default-branch flag SHALL be derived from the repository's configured default branch (the default remote's `HEAD`), and SHALL be false for every row when no default branch can be determined. The removal verdict SHALL be computed during the worktree scan and SHALL name the reason a non-forced removal would be refused, or report that removal is allowed. Both new fields SHALL decode to their inert defaults when a peer omits them.
+Daemon snapshots SHALL include worktree rows with branch, upstream, ahead/behind, dirty counts, conflict/rebase state, agent status, agent timestamp, session name, head timestamp, harness override, a flag marking whether the row's branch is the repository default branch, and a flag marking whether a removal is in flight for that worktree. The default-branch flag SHALL be derived from the repository's configured default branch (the default remote's `HEAD`), and SHALL be false for every row when no default branch can be determined. The deleting field SHALL decode to its inert default when a peer omits it. A legacy removal-verdict field MAY remain present for protocol compatibility, but routine scans SHALL leave it empty.
 
 #### Scenario: Snapshot requested
 - **WHEN** a client requests or subscribes to a snapshot
-- **THEN** each row contains git, agent, timestamp, harness, default-branch, deleting, and removal-verdict fields needed by the TUI
+- **THEN** each row contains the git, agent, timestamp, harness, default-branch, and deleting fields needed by the TUI
 
 #### Scenario: Snapshot ordering
 - **WHEN** rows are emitted
@@ -78,13 +78,13 @@ Daemon snapshots SHALL include worktree rows with branch, upstream, ahead/behind
 - **WHEN** the repository default branch cannot be determined
 - **THEN** no row is marked as the default branch
 
-#### Scenario: Removal verdict carried on the row
+#### Scenario: Removal verdict omitted from routine scan
 - **WHEN** a worktree would be refused a non-forced removal
-- **THEN** its row carries the matching blocking reason
+- **THEN** its routine snapshot does not compute or carry the blocking reason
 
 #### Scenario: Older peer snapshot
-- **WHEN** a snapshot omits the deleting flag or the removal verdict
-- **THEN** it still decodes, with the row reported as not deleting and with no blocking reason
+- **WHEN** a snapshot omits the deleting flag or includes the legacy removal-verdict field
+- **THEN** it still decodes without requiring a background removal check
 
 ### Requirement: TUI Daemon Startup
 The TUI SHALL start or probe the daemon on demand and fail if the daemon cannot answer within its startup timeout.
@@ -164,12 +164,12 @@ The TUI SHALL support keyboard and mouse workflows for selection movement, tab s
 - **THEN** the TUI provides branch-name input followed by base branch selection for new branches
 
 #### Scenario: Dirty delete workflow
-- **WHEN** the snapshot reports that a worktree is blocked from removal
-- **THEN** the first delete confirmation already states the reason and offers a force delete
+- **WHEN** the user confirms a non-forced deletion and the daemon refuses it
+- **THEN** the TUI reopens the confirmation with the reason and offers a force delete
 
-#### Scenario: Late refusal
-- **WHEN** the daemon refuses a deletion the snapshot did not predict
-- **THEN** the TUI reopens the delete confirmation as a force-delete prompt
+#### Scenario: Current-tab removal check
+- **WHEN** the user confirms current-tab deletion
+- **THEN** the daemon checks removability on demand before the TUI closes the tab
 
 #### Scenario: Current-tab delete
 - **WHEN** the user presses the current-tab delete key
@@ -259,21 +259,21 @@ The TUI SHALL render a row marked as deleting distinctly from a normal row, with
 - **WHEN** the user requests deletion of a row already marked as deleting
 - **THEN** the TUI does not send a second removal request
 
-### Requirement: Up-Front Removal Reason
-The TUI SHALL take the removal reason for the selected worktree from the daemon snapshot and SHALL present it in the first confirmation, without a preliminary request to the daemon. The daemon-side check SHALL remain authoritative: when it refuses a removal the snapshot reason did not predict, the TUI SHALL fall back to the force-confirmation flow.
+### Requirement: On-Demand Removal Reason
+The daemon SHALL compute the removal reason only after the user confirms deletion. For ordinary deletion, the authoritative removal request SHALL either remove the worktree or return the blocking reason. For current-tab deletion, the TUI SHALL request a non-mutating check before closing the tab, and the removal request SHALL check again immediately before mutation.
 
 #### Scenario: Blocked worktree confirmation
-- **WHEN** the user requests deletion of a worktree whose snapshot reports a blocking reason
-- **THEN** the first confirmation already states that reason and offers a force delete
-- **AND** no round-trip to the daemon happens before the confirmation appears
+- **WHEN** the user confirms deletion of a worktree that the daemon refuses to remove
+- **THEN** the TUI reopens the confirmation with the reason and offers a force delete
 
 #### Scenario: Removable worktree confirmation
-- **WHEN** the user requests deletion of a worktree whose snapshot reports no blocking reason
+- **WHEN** the user requests deletion of a worktree
 - **THEN** the first confirmation is a plain delete confirmation
 
-#### Scenario: Stale snapshot
-- **WHEN** the snapshot reported no blocking reason but the daemon refuses the removal
-- **THEN** the TUI reopens the confirmation as a force-delete prompt carrying the daemon's reason
+#### Scenario: Current-tab deletion
+- **WHEN** the user confirms deletion of the worktree containing the current tab
+- **THEN** the daemon checks removability before the TUI closes the tab
+- **AND** the daemon checks again immediately before removal
 
 ### Requirement: Floating Confirmation Pane
 When a deletion is blocked and swamp is running inside Zellij, the TUI SHALL open a Zellij floating pane that shows the blocking reason and the work at risk — the short working-tree status and a diff summary — and offers force delete or cancel. A deletion that is not blocked SHALL keep the existing single-line footer confirmation and SHALL NOT open a pane. When swamp is not inside Zellij, or the pane cannot be opened, the TUI SHALL fall back to the footer force-confirmation prompt.

@@ -126,14 +126,6 @@ pub(super) fn default_branch_tip_in_repo(repo: &Repository) -> Option<git2::Oid>
         .map(|c| c.id())
 }
 
-/// Path-based counterpart to [`default_branch_tip_in_repo`], for callers
-/// (the daemon's per-row scan) that don't already have a repo open.
-pub fn default_branch_tip(dir: &Path) -> Option<git2::Oid> {
-    open_lenient(dir)
-        .ok()
-        .and_then(|r| default_branch_tip_in_repo(&r))
-}
-
 /// Detect the default branch name. Returns an empty string when the default
 /// branch cannot be determined; callers that need a base must handle that
 /// explicitly instead of silently assuming `main`.

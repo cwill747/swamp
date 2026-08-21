@@ -152,7 +152,7 @@ Swamp SHALL refuse non-forced worktree removal when staged, unstaged, untracked,
 - **THEN** no directory has been removed, no metadata pruned, and no branch deleted
 
 ### Requirement: Removal Verdict
-Swamp SHALL compute a removal verdict for a worktree without mutating anything. The verdict SHALL be either "removable" or a single blocking reason drawn from the same set the removal path enforces: uncommitted changes, unpushed commits, commits on no other branch, locked, or unreadable status. The verdict SHALL be derived from one git status read per worktree, so a caller does not pay a second scan to learn why removal is blocked.
+When deletion is requested, swamp SHALL compute a removal verdict for the target worktree without mutating anything. The verdict SHALL be either "removable" or a single blocking reason drawn from the same set the removal path enforces: uncommitted changes, unpushed commits, commits on no other branch, locked, or unreadable status. Routine dashboard scans SHALL NOT compute removal verdicts.
 
 #### Scenario: Clean worktree
 - **WHEN** a verdict is requested for a clean worktree whose branch is fully merged
@@ -165,6 +165,10 @@ Swamp SHALL compute a removal verdict for a worktree without mutating anything. 
 #### Scenario: Verdict does not mutate
 - **WHEN** a verdict is computed for any worktree
 - **THEN** the worktree directory, its git metadata, and its branch are unchanged
+
+#### Scenario: Routine dashboard refresh
+- **WHEN** the daemon refreshes dashboard worktree status
+- **THEN** it does not compute removal verdicts or walk branches to determine removability
 
 ### Requirement: Merged Branch Removal
 Swamp SHALL treat a branch as safe to delete when its work is already present elsewhere, even when the branch's own commits were rewritten. A branch SHALL be treated as merged when its tip is reachable from the repository default branch, when its tip is reachable from any other local or remote branch, or when the most recent pull request for that branch is merged and its head commit matches the local branch tip.

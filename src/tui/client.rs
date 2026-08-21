@@ -19,6 +19,27 @@ pub(super) async fn request_branches(common: &std::path::Path) -> Result<Vec<Bra
     }
 }
 
+/// Run the daemon's non-mutating removal check. Returns the blocking reason,
+/// or `None` when a non-forced removal is allowed.
+pub(super) async fn check_removal(common: &std::path::Path, name: &str) -> Result<Option<String>> {
+    let sock = daemon::socket_path(common)?;
+    let mut stream = UnixStream::connect(&sock).await?;
+    write_client_msg(
+        &mut stream,
+        &ClientMsg::CheckRemoval {
+            name: name.to_string(),
+        },
+    )
+    .await?;
+    match read_server_msg(&mut stream).await? {
+        Some(ServerMsg::Ok) => Ok(None),
+        Some(ServerMsg::ErrDirty { reason, .. }) => Ok(Some(reason)),
+        Some(ServerMsg::Err { message }) => anyhow::bail!(message),
+        Some(other) => anyhow::bail!("unexpected removal-check reply: {other:?}"),
+        None => anyhow::bail!("daemon closed before removal-check reply"),
+    }
+}
+
 /// Send a create/remove request to the daemon and forward any error message
 /// back to the UI. Success is observed via the broadcast snapshot.
 pub(super) async fn send_action(

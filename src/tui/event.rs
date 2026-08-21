@@ -39,6 +39,12 @@ pub(super) enum AppEvent {
     /// A non-forced delete was refused; re-open the confirmation as a force
     /// override. Carries `(worktree_name, reason_description)`.
     DeleteNeedsForce(String, String),
+    /// Result of the on-demand check before `D` closes its own tab.
+    DeleteTabCheckDone {
+        name: String,
+        path: PathBuf,
+        result: Result<Option<String>, String>,
+    },
 }
 
 pub(super) async fn event_loop<B: ratatui::backend::Backend>(
@@ -260,6 +266,20 @@ where
                     force_reason: Some(reason),
                     close_tab: false,
                 });
+            }
+            AppEvent::DeleteTabCheckDone { name, path, result } => {
+                app.status_msg = None;
+                match result {
+                    Ok(None) => crate::launch::spawn_delete_tab(&name, &path, common, false),
+                    Ok(Some(reason)) => {
+                        app.input = Some(InputMode::ConfirmDelete {
+                            name,
+                            force_reason: Some(reason),
+                            close_tab: true,
+                        });
+                    }
+                    Err(message) => app.status_msg = Some(message),
+                }
             }
             AppEvent::Input(Event::Key(k)) => {
                 if k.kind != KeyEventKind::Press {

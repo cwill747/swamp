@@ -112,22 +112,12 @@ impl RemoveRefusedReason {
 
 /// The outcome of [`crate::worktree::remove::removal_verdict`]: either the
 /// worktree can be removed without `force`, or a single reason blocks it. The
-/// same enum backs both the authoritative pre-mutation check in
-/// [`crate::worktree::remove_worktree`] and the preview carried on
-/// [`crate::daemon::state::WorktreeRow::removal_block`].
+/// same enum backs the authoritative pre-mutation check in
+/// [`crate::worktree::remove_worktree`] and the on-demand current-tab check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemovalVerdict {
     Removable,
     Blocked(RemoveRefusedReason),
-}
-
-impl RemovalVerdict {
-    pub fn blocking_reason(&self) -> Option<&RemoveRefusedReason> {
-        match self {
-            Self::Removable => None,
-            Self::Blocked(reason) => Some(reason),
-        }
-    }
 }
 
 /// Data [`crate::worktree::remove::removal_verdict`] needs but must not fetch
