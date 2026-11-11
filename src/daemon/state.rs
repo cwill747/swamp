@@ -1,5 +1,6 @@
 use crate::config::Harness;
 use crate::github::PrSummary;
+use crate::titles::{self, TitleInputs, TitleSource};
 use crate::util::now_unix;
 use crate::worktree::slots;
 use crate::worktree::{self, GitInfo, RemoveRefusedReason, SlotState, Worktree, WorktreeKind};
@@ -157,6 +158,18 @@ pub struct WorktreeRow {
     /// The pin reason of a pinned slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+    /// What the row is doing (see [`crate::titles`]); resolved by
+    /// [`DaemonState::snapshot`]. An older peer's snapshot decodes as empty,
+    /// and the TUI then falls back to the worktree name.
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<TitleSource>,
+    /// Scan-time title inputs; not sent to clients.
+    #[serde(skip)]
+    pub head_subject: Option<String>,
+    #[serde(skip)]
+    pub openspec_change: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -224,6 +237,9 @@ pub struct DaemonState {
     /// Parent `Agent` tool descriptions that wait for their `SubagentStart`,
     /// per worktree, oldest first.
     pending_descriptions: HashMap<String, Vec<PendingDescription>>,
+    /// User titles from branch memory, keyed by branch. Reloaded on every
+    /// scan and after `SetTitle`.
+    pub branch_titles: HashMap<String, String>,
 }
 
 impl Default for DaemonState {
@@ -240,6 +256,7 @@ impl Default for DaemonState {
             deleting: HashSet::new(),
             subagents: HashMap::new(),
             pending_descriptions: HashMap::new(),
+            branch_titles: HashMap::new(),
         }
     }
 }
@@ -588,6 +605,22 @@ impl DaemonState {
                         .then(a.started_ts.cmp(&b.started_ts))
                         .then(a.id.cmp(&b.id))
                 });
+                let pr = (!row.is_default)
+                    .then(|| self.prs.get(&row.branch))
+                    .flatten()
+                    .map(|p| p.title.as_str());
+                let (title, source) = titles::resolve(TitleInputs {
+                    user: self.branch_titles.get(&row.branch).map(String::as_str),
+                    pr,
+                    session: row.session_name.as_deref(),
+                    openspec: row.openspec_change.as_deref(),
+                    commit: row.head_subject.as_deref(),
+                    branch: &row.branch,
+                    slot_state: row.slot_state,
+                    pin: row.pin.as_deref(),
+                });
+                row.title = title;
+                row.title_source = Some(source);
                 row
             })
             .collect();
@@ -697,6 +730,7 @@ pub fn scan_worktrees(
     if wts.is_empty() {
         return Ok(HashMap::new());
     }
+    let default_tip = worktree::default_branch_tip(common_dir);
 
     // Gather per-worktree git status concurrently. Each `git_info` shells out to
     // `git status` / `git rev-list`, so a sequential loop made first-launch
@@ -730,7 +764,8 @@ pub fn scan_worktrees(
                     let agent = agents.get(&name).cloned().unwrap_or_default();
                     let pin =
                         slots::slot_number(&name).and_then(|_| slots::read_pin(common_dir, &name));
-                    let row = build_row(wt, &info, &agent, default_branch, pin);
+                    let openspec = titles::openspec_change(common_dir, &wt.path, default_tip);
+                    let row = build_row(wt, &info, &agent, default_branch, pin, openspec);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -754,6 +789,7 @@ fn build_row(
     agent: &AgentRecord,
     default_branch: &str,
     pin: Option<String>,
+    openspec_change: Option<String>,
 ) -> WorktreeRow {
     let detached = info.branch == "(detached)";
     let branch = if info.branch.is_empty() || detached {
@@ -799,6 +835,10 @@ fn build_row(
         kind,
         slot_state,
         pin,
+        title: String::new(),
+        title_source: None,
+        head_subject: info.head_subject.clone(),
+        openspec_change,
     }
 }
 
@@ -850,6 +890,10 @@ mod tests {
             kind: Default::default(),
             slot_state: None,
             pin: None,
+            title: String::new(),
+            title_source: None,
+            head_subject: None,
+            openspec_change: None,
         }
     }
 
@@ -870,7 +914,14 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main", None);
+        let main = build_row(
+            &worktree("main", "main"),
+            &info_main,
+            &agent,
+            "main",
+            None,
+            None,
+        );
         assert!(main.is_default, "the default branch row must be flagged");
 
         let info_feat = GitInfo {
@@ -882,6 +933,7 @@ mod tests {
             &info_feat,
             &agent,
             "main",
+            None,
             None,
         );
         assert!(!feat.is_default, "a non-default row must not be flagged");
@@ -896,7 +948,7 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let row = build_row(&worktree("main", "main"), &info, &agent, "", None);
+        let row = build_row(&worktree("main", "main"), &info, &agent, "", None, None);
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
@@ -989,6 +1041,7 @@ mod tests {
             &agent,
             "main",
             None,
+            None,
         );
         assert_eq!(free.kind, WorktreeKind::Slot);
         assert_eq!(free.slot_state, Some(SlotState::Free));
@@ -999,6 +1052,7 @@ mod tests {
             &agent,
             "main",
             Some("review #172".into()),
+            None,
         );
         assert_eq!(pinned.slot_state, Some(SlotState::Pinned));
         assert_eq!(pinned.pin.as_deref(), Some("review #172"));
@@ -1013,6 +1067,7 @@ mod tests {
             &agent,
             "main",
             None,
+            None,
         );
         assert_eq!(busy.slot_state, Some(SlotState::Busy));
 
@@ -1022,9 +1077,47 @@ mod tests {
             &agent,
             "main",
             None,
+            None,
         );
         assert_eq!(overflow.kind, WorktreeKind::Overflow);
         assert_eq!(overflow.slot_state, None);
+    }
+
+    /// Snapshot titles combine user titles, PR titles, session names, and
+    /// commit subjects in priority order.
+    #[test]
+    fn snapshot_resolves_titles() {
+        let mut state = DaemonState::default();
+        let mut add = |name: &str, f: &dyn Fn(&mut WorktreeRow)| {
+            let mut row = make_row_with_ts(name, 1);
+            f(&mut row);
+            state.rows.insert(name.to_string(), row);
+        };
+        add("a", &|r| r.head_subject = Some("feat: a".into()));
+        add("b", &|r| r.session_name = Some("Session B".into()));
+        add("c", &|_| {});
+        add("d", &|r| r.session_name = Some("ignored".into()));
+        state.prs.insert(
+            "c".into(),
+            PrSummary {
+                title: "PR for c".into(),
+                ..make_pr(3)
+            },
+        );
+        state
+            .branch_titles
+            .insert("d".into(), "User title for d".into());
+
+        let snap = state.snapshot();
+        let title = |n: &str| {
+            let r = snap.rows.iter().find(|r| r.name == n).unwrap();
+            (r.title.clone(), r.title_source.unwrap())
+        };
+
+        assert_eq!(title("a"), ("feat: a".into(), TitleSource::Commit));
+        assert_eq!(title("b"), ("Session B".into(), TitleSource::Session));
+        assert_eq!(title("c"), ("PR for c".into(), TitleSource::Pr));
+        assert_eq!(title("d"), ("User title for d".into(), TitleSource::User));
     }
 
     /// Busy rows sort by recency; free and pinned slots follow by number.

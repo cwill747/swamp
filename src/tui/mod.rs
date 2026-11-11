@@ -4,7 +4,7 @@ mod icons;
 mod input;
 mod state;
 mod theme;
-mod view;
+pub(crate) mod view;
 
 pub(crate) use state::{
     AppState, CreateEntry, CreatePicker, CreateStep, HitRegions, InputMode, PrHit,

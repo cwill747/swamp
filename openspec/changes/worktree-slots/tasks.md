@@ -46,12 +46,12 @@ Each numbered group is one PR. Each PR passes `nix build`, `nix develop --comman
 
 ## 6. Titles and work-item dashboard (PR 6)
 
-- [ ] 6.1 Add the PR title to `PrSummary` if the query lacks it; verify a GraphQL fixture test
-- [ ] 6.2 Implement title resolution (user, PR, session, openspec, commit subject, branch, `free`, pin reason); verify unit tests for each scenario in spec Title Resolution
-- [ ] 6.3 Compute the openspec change on head change only; verify a test that it adds no work to a scan with no head change
-- [ ] 6.4 Add `swamp title <text>` / `--clear` and a TUI key to set the title; verify tests and a manual TUI run
-- [ ] 6.5 Show titles in place of the worktree name, add the label column, and dim free slots; verify view tests for compact and expanded layouts
-- [ ] 6.6 Update the README commands and keys tables; verify by review
+- [x] 6.1 Add the PR title to `PrSummary` if the query lacks it; the GraphQL query and `PrSummary` already carry `title`, so nothing changed
+- [x] 6.2 Implement title resolution (user, PR, session, openspec, commit subject, branch, `free`, pin reason); verify unit tests for each scenario in spec Title Resolution
+- [x] 6.3 Compute the openspec change cheaply: one directory read when the worktree has no `openspec/changes`, plus tree lookups otherwise. Changed from "on head change only", because a new change starts as untracked files and does not move `HEAD`; verified with a unit test for added, existing, archived, and multiple changes
+- [x] 6.4 Add `swamp title <text>` / `--clear` and the TUI `t` prompt; verified with service and key-handling tests. The prompt was not run by hand in a live TUI
+- [x] 6.5 Show titles in place of the worktree name, add the label column, and dim free slots; verified with a render test of the compact layout in a test terminal
+- [x] 6.6 Update the README commands and keys tables; verify by review
 
 ## 7. Rollout
 

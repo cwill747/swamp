@@ -360,6 +360,10 @@ mod tests {
             kind: Default::default(),
             slot_state: None,
             pin: None,
+            title: String::new(),
+            title_source: None,
+            head_subject: None,
+            openspec_change: None,
         }
     }
 

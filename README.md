@@ -157,6 +157,20 @@ Writes `$XDG_CONFIG_HOME/swamp/config.toml`, refreshes managed configs, installs
 or updates Claude Code hooks, and sets Codex `notify` to `["swamp",
 "codex-notify"]`.
 
+To send Claude Code worktrees (`claude --worktree` and subagents with
+`isolation: worktree`) through the slot pool, add `--claude-worktrees`:
+
+```bash
+swamp init --claude-worktrees
+```
+
+This installs `WorktreeCreate` and `WorktreeRemove` hooks that call
+`swamp slot alloc --hook-json` and `swamp slot release --hook-json`. The hooks
+apply to every repository on the machine. If you already have a worktree hook
+that swamp does not manage, `init` leaves it in place and prints a warning.
+Claude Code does not run `WorktreeRemove` when a subagent finishes, so a slot
+that a subagent took stays busy until you release it.
+
 ### `swamp tui`
 
 Runs the status TUI. This is normally embedded in each Zellij tab, but it can be
@@ -176,6 +190,7 @@ Useful keys:
 | `c`       | Create a worktree                   |
 | `d`       | Delete the selected worktree        |
 | `D`       | Delete the worktree this pane lives in and close its tab |
+| `t`       | Set the title of the selected branch |
 | `h`       | Choose Claude or Codex harness      |
 | `r`       | Refresh status                      |
 | `u`       | Update branches                     |
@@ -188,6 +203,54 @@ commits, ...) opens a floating Zellij pane showing the reason plus the
 worktree's status and diffstat, so you can review what's at risk before
 forcing it through. Outside Zellij, or if the pane can't be opened, swamp
 falls back to a one-line force-confirmation prompt instead.
+
+Each row shows what the worktree is doing, not its directory name. The title
+comes from the first of these that exists: your title (`t` or `swamp title`),
+the PR title, the Claude session name, the openspec change that the branch
+adds, the last commit subject, and the branch name. Slot rows also show the
+slot name (`work1`, ...), and free slots appear dimmed at the end of the list.
+
+### `swamp slot`
+
+Manages a pool of reusable worktrees named `work1`, `work2`, and so on. A slot
+keeps its directory between branches, so build caches (`target/`, bazel output
+bases) stay warm and disk use stays bounded.
+
+```bash
+cd "$(swamp slot alloc parser-fix)"   # check a branch out into a free slot
+swamp slot release                    # return the current slot to the pool
+swamp slot list                       # show slots and overflow worktrees
+swamp slot pin work3 review 172       # hold a free slot
+swamp slot unpin work3
+```
+
+- `alloc` checks out an existing local or remote branch, or creates the branch
+  from the default remote's default branch. It prints only the path on stdout.
+  If a worktree already has the branch, it prints that path. When every slot is
+  busy, it creates a dedicated branch-named worktree ("overflow"), which stays
+  until you remove it.
+- `release` detaches the slot at the branch tip. It refuses when the slot has
+  uncommitted changes, or when the branch has commits that are not on the remote
+  and its PR is not merged or closed. When the PR is merged or closed, it also
+  deletes the local branch. Use `--force` to skip the checks.
+- A slot is free when its `HEAD` is detached, its tree is clean, and no pin
+  holds it. Git state is the only record of who owns a slot.
+- In a running swamp session, `alloc` opens a tab for the slot without taking
+  focus, and `release` closes it. Pass `--no-tab` to skip that.
+- A release refuses to take a slot from another slot's working agent.
+- The Claude session, session name, and harness follow the branch: release
+  saves them, and a later `alloc` of the branch restores them in whichever slot
+  it gets.
+
+### `swamp title`
+
+Sets the dashboard title of the branch in the current worktree. The title
+follows the branch across slots.
+
+```bash
+swamp title "Bump zellij to 0.46"
+swamp title --clear
+```
 
 ### `swamp hook`
 
@@ -418,6 +481,31 @@ exits when no repo session has run for one minute.
 To keep tab names unchanged, set `[badges] enabled = false` and restart the
 session.
 
+The slot pool has its own section:
+
+```toml
+[slots]
+pool_size = 5          # most slots swamp creates; 0 turns the pool off
+
+[[slots.hooks.pre-release]]
+run = "bazel shutdown"
+
+[[slots.hooks.post-alloc]]
+run = "direnv allow"
+timeout_secs = 60
+```
+
+Hooks run with `sh -c` in the worktree and get `SWAMP_WORKTREE`, `SWAMP_NAME`,
+`SWAMP_KIND`, `SWAMP_BRANCH`, and `SWAMP_REPO_ROOT`. A failed `pre-release` hook
+stops the release unless you pass `--force`; a failed `post-alloc` hook only
+prints a warning. Each hook has a 300-second limit by default. Pass `--no-hooks`
+to skip them.
+
+A repository can set its own `pool_size` and add hooks in
+`<git-common-dir>/swamp/config.toml` (for the bare layout,
+`.bare/swamp/config.toml`). That file is not part of the repository, so a clone
+never runs commands that someone else chose. User hooks run first.
+
 ## Files
 
 | Path                                  | Purpose                              |
@@ -426,6 +514,10 @@ session.
 | `$XDG_CONFIG_HOME/swamp/lazygit.yml`  | Managed lazygit config               |
 | `<git-common-dir>/.swamp-status.json` | Per-worktree agent status            |
 | `$XDG_STATE_HOME/swamp/repos.json`    | Registry of repos swamp has launched |
+| `<git-common-dir>/swamp/config.toml`  | Per-repository slot settings         |
+| `<git-common-dir>/swamp/branches.json` | Per-branch sessions and titles      |
+| `<git-common-dir>/swamp/pins/`        | Slot pins                            |
+| `<git-common-dir>/swamp/slots.lock`   | Lock for slot operations             |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`     | Daemon PID file                      |
 | `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Single-instance lock of `swamp aggregate` |

@@ -2,7 +2,7 @@ use super::client::{request_branches, send_refresh, send_update, subscribe_loop}
 use super::ensure_daemon;
 use super::input::{
     activate_worktree_tab, handle_create_key, handle_delete_current_tab_key, handle_delete_key,
-    handle_input_key, handle_mouse, handle_open_overview_key, spawn_close_tab,
+    handle_input_key, handle_mouse, handle_open_overview_key, handle_title_key, spawn_close_tab,
 };
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
@@ -367,6 +367,7 @@ where
                     }
                     KeyCode::Char('d') => handle_delete_key(&mut app),
                     KeyCode::Char('D') => handle_delete_current_tab_key(&mut app),
+                    KeyCode::Char('t') => handle_title_key(&mut app),
                     KeyCode::Char('h') => {
                         if let Some(name) = app.selected_row().map(|row| row.name.clone()) {
                             app.status_msg = None;

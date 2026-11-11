@@ -70,6 +70,33 @@ pub fn save_branches(common: &Path, map: &HashMap<String, BranchRecord>) -> Resu
     std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))
 }
 
+/// User titles from branch memory, keyed by branch.
+pub fn user_titles(common: &Path) -> HashMap<String, String> {
+    load_branches(common)
+        .into_iter()
+        .filter_map(|(branch, rec)| rec.title.map(|t| (branch, t)))
+        .collect()
+}
+
+/// Set (or, with `None` or a blank string, clear) the user title of `branch`.
+pub fn set_title(common: &Path, branch: &str, title: Option<&str>) -> Result<()> {
+    let _guard = slots::lock(common)?;
+    let mut mem = load_branches(common);
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    match title {
+        Some(t) => mem.entry(branch.to_string()).or_default().title = Some(t.to_string()),
+        None => {
+            if let Some(rec) = mem.get_mut(branch) {
+                rec.title = None;
+                if rec.is_empty() {
+                    mem.remove(branch);
+                }
+            }
+        }
+    }
+    save_branches(common, &mem)
+}
+
 /// Edits to the per-worktree agent records that a slot operation implies.
 #[derive(Debug, Clone, Default)]
 pub struct AgentChanges {
@@ -624,6 +651,34 @@ mod tests {
             ReleaseRefusedReason::Dirty
         );
         assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn titles_follow_the_branch_and_clear_cleanly() {
+        let (root, bare) = if git_available() {
+            setup()
+        } else {
+            return;
+        };
+        set_title(&bare, "zellij-bump", Some("Bump zellij")).unwrap();
+        assert_eq!(user_titles(&bare)["zellij-bump"], "Bump zellij");
+
+        // A release that saves a session keeps the title.
+        let mut mem = load_branches(&bare);
+        mem.get_mut("zellij-bump").unwrap().session_id = Some("s".into());
+        save_branches(&bare, &mem).unwrap();
+        set_title(&bare, "zellij-bump", None).unwrap();
+        assert!(user_titles(&bare).is_empty());
+        assert_eq!(
+            load_branches(&bare)["zellij-bump"].session_id.as_deref(),
+            Some("s")
+        );
+
+        // Clearing the last field drops the record; a blank title clears too.
+        set_title(&bare, "other", Some("x")).unwrap();
+        set_title(&bare, "other", Some("   ")).unwrap();
+        assert!(!load_branches(&bare).contains_key("other"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

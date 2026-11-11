@@ -27,6 +27,8 @@ pub enum InputMode {
     /// the next launch of that worktree's tab; only honored when the repo's
     /// harness setting is `choose`.
     PickHarness { name: String },
+    /// Typing a user title for `branch`. An empty title clears it.
+    EditTitle { branch: String, text: String },
 }
 
 /// Which step of the [`CreatePicker`] is active.
@@ -312,6 +314,10 @@ mod tests {
             kind: Default::default(),
             slot_state: None,
             pin: None,
+            title: String::new(),
+            title_source: None,
+            head_subject: None,
+            openspec_change: None,
         }
     }
 
@@ -346,6 +352,52 @@ mod tests {
             regions: HitRegions::default(),
             last_click: None,
         }
+    }
+
+    /// The worktrees pane shows titles and slot labels, and a free slot reads
+    /// `free`. Rendered into a test terminal to check the real layout.
+    #[test]
+    fn worktrees_pane_shows_titles_and_slot_labels() {
+        use crate::worktree::{SlotState, WorktreeKind};
+        let mut busy = row("work1", false);
+        busy.branch = "fix-ci".into();
+        busy.kind = WorktreeKind::Slot;
+        busy.slot_state = Some(SlotState::Busy);
+        busy.title = "Fix flaky CI retry logic".into();
+        let mut free = row("work2", false);
+        free.kind = WorktreeKind::Slot;
+        free.slot_state = Some(SlotState::Free);
+        free.branch = "detached@abc1234".into();
+        free.title = "free".into();
+        let mut app = app_with(vec![busy, free], "dashboard");
+
+        let backend = ratatui::backend::TestBackend::new(90, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::render(f, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(90)
+            .map(|line| line.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+
+        let line_with = |needle: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not on screen:\n{screen}"))
+                .to_string()
+        };
+        let busy_line = line_with("Fix flaky CI");
+        assert!(
+            busy_line.contains("work1") && busy_line.contains("fix-ci"),
+            "{busy_line}"
+        );
+        let free_line = line_with("work2");
+        assert!(free_line.contains("free"), "{free_line}");
     }
 
     /// The default-branch row is pinned to index 1, directly below the pinned

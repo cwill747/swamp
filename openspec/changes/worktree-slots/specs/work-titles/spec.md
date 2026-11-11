@@ -5,7 +5,7 @@ Gives each worktree row a human title that says what the work is, because slot d
 ## ADDED Requirements
 
 ### Requirement: Title Resolution
-Swamp SHALL give each worktree row a title and the source of that title. Swamp SHALL use the first available source in this order: the user title for the branch, the title of the branch's open or most recent PR, the Claude session name, the active openspec change on the branch, the subject of the branch's last commit, and the branch name. A free slot SHALL have the title `free`. A pinned slot SHALL use its pin reason as its title.
+Swamp SHALL give each worktree row a title and the source of that title. Swamp SHALL use the first available source in this order: the user title for the branch, the title of the branch's open or most recent PR, the Claude session name, the active openspec change on the branch, the subject of the branch's last commit, and the branch name. A free slot SHALL have the title `free`. A pinned slot SHALL use its pin reason as its title. The default branch row SHALL skip the PR source, because the dashboard shows no PR for the default branch.
 
 #### Scenario: User title set
 - **WHEN** the branch has a user title and a PR title
