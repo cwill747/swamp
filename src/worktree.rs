@@ -21,7 +21,8 @@ pub use branches::{
     default_branch, default_worktree_path, find_default_worktree, list_branches, list_worktrees,
 };
 pub use clone::clone_repo;
-pub use create::{create_worktree, create_worktree_from_base};
+#[cfg(test)]
+pub use create::create_worktree;
 pub use model::{
     BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, SlotState, Worktree,
     WorktreeKind, worktree_name_for_branch,

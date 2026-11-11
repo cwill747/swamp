@@ -109,6 +109,7 @@ pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {
 /// revparse (so a tag or raw sha works too). The new branch carries no upstream
 /// - it's local-only until pushed. `common_dir` must point at the bare/common
 ///   git dir.
+#[cfg(test)]
 pub fn create_worktree_from_base(
     common_dir: &Path,
     new_branch: &str,
@@ -226,7 +227,7 @@ fn resolve_branch_reference<'repo>(
 /// The remote that a `base` (for a brand-new branch) draws its objects from:
 /// the remote a local base branch tracks, else the `<remote>/` of a matching
 /// remote-tracking branch. `None` for a tag/sha or an untracked local branch.
-fn base_remote(repo: &Repository, base: &str) -> Option<String> {
+pub(super) fn base_remote(repo: &Repository, base: &str) -> Option<String> {
     if repo.find_branch(base, BranchType::Local).is_ok()
         && let Some(remote) = branch_remote(repo, base)
     {

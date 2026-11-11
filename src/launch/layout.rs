@@ -553,10 +553,8 @@ mod tests {
 
     // Serializes tests that mutate process-global state: the $SHELL variable
     // and the shared pid-keyed layout file in the temp dir.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::util::test_env_lock()
     }
 
     #[test]
@@ -716,7 +714,7 @@ mod tests {
     fn worktree_panes_use_env_shell_not_hardcoded_fish() {
         // Force a non-fish $SHELL and confirm the generated layout follows it.
         let _guard = env_guard();
-        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
+        // SAFETY: the crate test env lock serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
         let mut s = String::new();
         push_worktree_panes(
@@ -772,7 +770,7 @@ mod tests {
     #[test]
     fn worktree_panes_resume_recorded_session() {
         let _guard = env_guard();
-        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
+        // SAFETY: the crate test env lock serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut with = String::new();
@@ -809,7 +807,7 @@ mod tests {
     #[test]
     fn worktree_panes_codex_launches_codex_fresh() {
         let _guard = env_guard();
-        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
+        // SAFETY: the crate test env lock serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut s = String::new();
@@ -842,7 +840,7 @@ mod tests {
     #[test]
     fn worktree_agent_pane_drops_to_shell_on_exit() {
         let _guard = env_guard();
-        // SAFETY: ENV_LOCK serializes the tests that touch $SHELL.
+        // SAFETY: the crate test env lock serializes the tests that touch $SHELL.
         unsafe { std::env::set_var("SHELL", "/bin/bash") };
 
         let mut s = String::new();

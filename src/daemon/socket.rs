@@ -3,6 +3,7 @@ use super::resources;
 use super::state::{PrSnapshot, Snapshot, SubagentEvent};
 use crate::config::Harness;
 use crate::worktree::BranchInfo;
+use crate::worktree::slots::{Allocation, PrFacts, Release};
 use anyhow::Result;
 use git2::Reference;
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,28 @@ pub enum ClientMsg {
         worktree: String,
         harness: Harness,
     },
+    /// `swamp slot alloc`: allocate a worktree for `branch`.
+    SlotAlloc {
+        branch: String,
+        #[serde(default)]
+        base: Option<String>,
+        #[serde(default)]
+        offline: bool,
+    },
+    /// `swamp slot release`: return a slot to the pool. `cwd` is the client's
+    /// working directory, which resolves an empty target and decides whether
+    /// the caller runs inside the slot.
+    SlotRelease {
+        #[serde(default)]
+        target: Option<String>,
+        cwd: std::path::PathBuf,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        offline: bool,
+        #[serde(default)]
+        pr: Option<PrFacts>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +123,12 @@ pub enum ServerMsg {
     },
     Branches {
         branches: Vec<BranchInfo>,
+    },
+    SlotAllocated {
+        allocation: Allocation,
+    },
+    SlotReleased {
+        release: Release,
     },
 }
 
@@ -250,6 +279,20 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                                 write_msg(&mut stream, &reply).await?
                             }
                         }
+                    }
+                    ClientMsg::SlotAlloc { branch, base, offline } => {
+                        let reply = match daemon.slot_alloc(&branch, base, offline).await {
+                            Ok(allocation) => ServerMsg::SlotAllocated { allocation },
+                            Err(e) => ServerMsg::Err { message: format!("{e:#}") },
+                        };
+                        write_msg(&mut stream, &reply).await?;
+                    }
+                    ClientMsg::SlotRelease { target, cwd, force, offline, pr } => {
+                        let reply = match daemon.slot_release(target, cwd, force, offline, pr).await {
+                            Ok(release) => ServerMsg::SlotReleased { release },
+                            Err(e) => ServerMsg::Err { message: format!("{e:#}") },
+                        };
+                        write_msg(&mut stream, &reply).await?;
                     }
                     ClientMsg::CheckRemoval { name } => {
                         if let Err(e) = validate_worktree_name(&name) {
@@ -492,6 +535,9 @@ mod tests {
                     removal_block: None,
                     deleting: false,
                     subagents: Vec::new(),
+                    kind: Default::default(),
+                    slot_state: None,
+                    pin: None,
                 })
                 .collect(),
             default_known: true,
@@ -541,12 +587,47 @@ mod tests {
                 worktree: "feature-x".into(),
                 harness: Harness::Codex,
             },
+            ClientMsg::SlotAlloc {
+                branch: "parser-fix".into(),
+                base: Some("main".into()),
+                offline: true,
+            },
+            ClientMsg::SlotRelease {
+                target: Some("work2".into()),
+                cwd: PathBuf::from("/repo/work2"),
+                force: false,
+                offline: false,
+                pr: Some(PrFacts {
+                    branch: "parser-fix".into(),
+                    state: "MERGED".into(),
+                    head_oid: Some("0123456789abcdef0123456789abcdef01234567".parse().unwrap()),
+                }),
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_vec(msg).unwrap();
             let decoded: ClientMsg = serde_json::from_slice(&json).unwrap();
             // Re-encode and compare bytes as a proxy for equality.
             assert_eq!(json, serde_json::to_vec(&decoded).unwrap());
+        }
+    }
+
+    /// A minimal `SlotRelease` (only `cwd`) decodes with inert defaults.
+    #[test]
+    fn slot_release_optional_fields_default() {
+        let msg: ClientMsg =
+            serde_json::from_str(r#"{"type":"slot_release","cwd":"/repo"}"#).unwrap();
+        match msg {
+            ClientMsg::SlotRelease {
+                target,
+                force,
+                offline,
+                pr,
+                ..
+            } => {
+                assert!(target.is_none() && !force && !offline && pr.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
