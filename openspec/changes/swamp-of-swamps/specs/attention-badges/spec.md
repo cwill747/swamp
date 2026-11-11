@@ -22,7 +22,7 @@ While the agent status of a worktree is `waiting` and that worktree has an open 
 
 #### Scenario: Tab opened while waiting
 - **WHEN** the user opens the tab of a worktree whose agent already waits
-- **THEN** the tab name carries the badge
+- **THEN** the tab name carries the badge within 30 seconds
 
 ### Requirement: Cross-Repo Count Badge
 The `dashboard` tab of each live repo session SHALL show the number of worktrees with agent status `waiting` in all other live repositories. The tab name SHALL be plain `dashboard` when that number is zero. Worktrees of the session's own repository SHALL NOT count toward its dashboard badge.
