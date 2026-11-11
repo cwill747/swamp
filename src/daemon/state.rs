@@ -37,6 +37,69 @@ pub struct AgentRecord {
     pub harness: Option<Harness>,
 }
 
+/// How long a done subagent stays visible before the daemon drops it.
+pub const SUBAGENT_DONE_GRACE_SECS: u64 = 60;
+/// How long a running subagent may go without any event before the daemon
+/// treats it as gone (for example, the parent session was killed).
+pub const SUBAGENT_STALE_SECS: u64 = 15 * 60;
+/// How long a parent `Agent` tool description waits for its `SubagentStart`.
+const PENDING_DESCRIPTION_SECS: u64 = 30;
+
+/// What a subagent-related hook reports. Sent by `swamp hook` alongside the
+/// positional status; see `crate::hook::parse_payload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentEventKind {
+    /// `SubagentStart`: a subagent began (or resumed).
+    Start,
+    /// `SubagentStop`: a subagent finished.
+    Stop,
+    /// A tool hook that fired inside a subagent.
+    Activity,
+    /// The parent's `Agent` tool call. Carries the task description, and the
+    /// exact agent id when the tool response reports one (background runs).
+    Spawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentEvent {
+    pub kind: SubagentEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentStatus {
+    Running,
+    Done,
+}
+
+/// One subagent of a worktree's agent, as carried in snapshots. The daemon
+/// keeps these in memory only; they are never written to the status file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRow {
+    pub id: String,
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: SubagentStatus,
+    pub started_ts: u64,
+    pub last_ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_ts: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDescription {
+    agent_type: String,
+    description: String,
+    ts: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeRow {
     pub name: String,
@@ -78,6 +141,11 @@ pub struct WorktreeRow {
     /// loadable.
     #[serde(default)]
     pub deleting: bool,
+    /// Subagents of this worktree's agent, running first, then by start time.
+    /// Projected from `DaemonState::subagents` by [`DaemonState::snapshot`].
+    /// `#[serde(default)]` keeps an older peer's snapshot loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRow>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +206,13 @@ pub struct DaemonState {
     /// an independent set it doesn't touch. Projected onto
     /// `WorktreeRow::deleting` by [`Self::snapshot`].
     deleting: HashSet<String>,
+    /// Subagents per worktree. In memory only: like `deleting`, it is kept
+    /// apart from `rows` so a rescan cannot drop it, and apart from `agents`
+    /// so `persist` never writes it.
+    subagents: HashMap<String, Vec<SubagentRow>>,
+    /// Parent `Agent` tool descriptions that wait for their `SubagentStart`,
+    /// per worktree, oldest first.
+    pending_descriptions: HashMap<String, Vec<PendingDescription>>,
 }
 
 impl Default for DaemonState {
@@ -152,6 +227,8 @@ impl Default for DaemonState {
             pr_loading: true,
             default_branch: String::new(),
             deleting: HashSet::new(),
+            subagents: HashMap::new(),
+            pending_descriptions: HashMap::new(),
         }
     }
 }
@@ -194,11 +271,11 @@ impl DaemonState {
             .filter(|k| !self.rows.contains_key(*k))
             .map(String::as_str)
             .collect();
-        let removed: Vec<&str> = self
+        let removed: Vec<String> = self
             .rows
             .keys()
             .filter(|k| !new_rows.contains_key(*k))
-            .map(String::as_str)
+            .cloned()
             .collect();
         if added.is_empty() && removed.is_empty() {
             tracing::debug!(worktrees = new_rows.len(), "git state refreshed");
@@ -209,6 +286,9 @@ impl DaemonState {
                 ?removed,
                 "worktree set changed"
             );
+        }
+        for name in &removed {
+            self.drop_subagents(name);
         }
         self.rows = new_rows;
     }
@@ -271,6 +351,180 @@ impl DaemonState {
         Ok(changed)
     }
 
+    /// Record a hook that may carry a subagent event. Returns `true` when subscribers can observe the change, with the
+    /// same meaning as [`Self::apply_hook`].
+    ///
+    /// A `start`, `stop`, or `activity` event updates only the subagent: the
+    /// parent record is not touched, so a background subagent cannot flip an
+    /// idle parent back to working. A `spawn` event (the parent's own `Agent`
+    /// tool call) records the description and then applies the parent status.
+    pub fn apply_hook_event(
+        &mut self,
+        wt_name: &str,
+        status: &str,
+        session_name: Option<&str>,
+        session_id: Option<&str>,
+        subagent: Option<&SubagentEvent>,
+    ) -> Result<bool> {
+        self.apply_hook_event_at(
+            wt_name,
+            status,
+            session_name,
+            session_id,
+            subagent,
+            now_unix(),
+        )
+    }
+
+    /// [`Self::apply_hook_event`] with an explicit clock for the subagent
+    /// timestamps, so tests can step time.
+    pub fn apply_hook_event_at(
+        &mut self,
+        wt_name: &str,
+        status: &str,
+        session_name: Option<&str>,
+        session_id: Option<&str>,
+        subagent: Option<&SubagentEvent>,
+        now: u64,
+    ) -> Result<bool> {
+        let mut changed = false;
+        if let Some(ev) = subagent {
+            if ev.kind != SubagentEventKind::Spawn {
+                return Ok(self.apply_subagent_event(wt_name, ev, now));
+            }
+            changed |= self.record_spawn(wt_name, ev, now);
+        }
+        changed |= self.apply_hook(wt_name, status, session_name, session_id)?;
+        Ok(changed)
+    }
+
+    /// Apply a `start`, `stop`, or `activity` event. Events without an agent
+    /// id or with an empty agent type (Claude's internal agents) are ignored.
+    fn apply_subagent_event(&mut self, wt_name: &str, ev: &SubagentEvent, now: u64) -> bool {
+        let Some(id) = ev.agent_id.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if ev.agent_type.is_empty() {
+            return false;
+        }
+        let list = self.subagents.entry(wt_name.to_string()).or_default();
+        if let Some(rec) = list.iter_mut().find(|r| r.id == id) {
+            rec.last_ts = now;
+            return match ev.kind {
+                SubagentEventKind::Start if rec.status == SubagentStatus::Done => {
+                    rec.status = SubagentStatus::Running;
+                    rec.finished_ts = None;
+                    true
+                }
+                SubagentEventKind::Stop if rec.status == SubagentStatus::Running => {
+                    rec.status = SubagentStatus::Done;
+                    rec.finished_ts = Some(now);
+                    true
+                }
+                _ => false,
+            };
+        }
+        let done = ev.kind == SubagentEventKind::Stop;
+        let description = take_pending_description(
+            self.pending_descriptions.get_mut(wt_name),
+            &ev.agent_type,
+            now,
+        );
+        let list = self.subagents.entry(wt_name.to_string()).or_default();
+        list.push(SubagentRow {
+            id: id.to_string(),
+            agent_type: ev.agent_type.clone(),
+            description,
+            status: if done {
+                SubagentStatus::Done
+            } else {
+                SubagentStatus::Running
+            },
+            started_ts: now,
+            last_ts: now,
+            finished_ts: done.then_some(now),
+        });
+        true
+    }
+
+    /// Record the description of a parent `Agent` tool call. Without an agent
+    /// id, queue it for the next `SubagentStart` of the same type. With an id
+    /// (a background run's tool response), set it on that exact subagent.
+    fn record_spawn(&mut self, wt_name: &str, ev: &SubagentEvent, now: u64) -> bool {
+        let Some(description) = ev.description.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let pending = self
+            .pending_descriptions
+            .entry(wt_name.to_string())
+            .or_default();
+        pending.retain(|p| now.saturating_sub(p.ts) <= PENDING_DESCRIPTION_SECS);
+        let Some(id) = ev.agent_id.as_deref().filter(|s| !s.is_empty()) else {
+            pending.push(PendingDescription {
+                agent_type: ev.agent_type.clone(),
+                description: description.to_string(),
+                ts: now,
+            });
+            return false;
+        };
+        // The PreToolUse for this call queued the same description. Drop it so
+        // it cannot attach to a later subagent of the same type.
+        if let Some(pos) = pending
+            .iter()
+            .position(|p| p.agent_type == ev.agent_type && p.description == description)
+        {
+            pending.remove(pos);
+        }
+        let list = self.subagents.entry(wt_name.to_string()).or_default();
+        match list.iter_mut().find(|r| r.id == id) {
+            Some(rec) if rec.description.as_deref() == Some(description) => false,
+            Some(rec) => {
+                rec.description = Some(description.to_string());
+                true
+            }
+            None => {
+                list.push(SubagentRow {
+                    id: id.to_string(),
+                    agent_type: ev.agent_type.clone(),
+                    description: Some(description.to_string()),
+                    status: SubagentStatus::Running,
+                    started_ts: now,
+                    last_ts: now,
+                    finished_ts: None,
+                });
+                true
+            }
+        }
+    }
+
+    /// Drop done subagents past their grace period and running subagents that
+    /// have gone stale. Returns whether any subagent was dropped.
+    pub fn expire_subagents(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        for list in self.subagents.values_mut() {
+            let before = list.len();
+            list.retain(|r| match r.status {
+                SubagentStatus::Done => {
+                    now.saturating_sub(r.finished_ts.unwrap_or(r.last_ts))
+                        <= SUBAGENT_DONE_GRACE_SECS
+                }
+                SubagentStatus::Running => now.saturating_sub(r.last_ts) <= SUBAGENT_STALE_SECS,
+            });
+            changed |= list.len() != before;
+        }
+        self.subagents.retain(|_, list| !list.is_empty());
+        for pending in self.pending_descriptions.values_mut() {
+            pending.retain(|p| now.saturating_sub(p.ts) <= PENDING_DESCRIPTION_SECS);
+        }
+        self.pending_descriptions.retain(|_, p| !p.is_empty());
+        changed
+    }
+
+    fn drop_subagents(&mut self, wt_name: &str) {
+        self.subagents.remove(wt_name);
+        self.pending_descriptions.remove(wt_name);
+    }
+
     /// Record the per-worktree harness override (worktrees pane `h`). Preserves
     /// the rest of the agent record so an existing session/status isn't lost.
     pub fn set_harness(&mut self, wt_name: &str, harness: Harness) {
@@ -290,6 +544,7 @@ impl DaemonState {
         // Drop the now-orphaned agent record so a later worktree reusing the
         // name can't inherit stale status.
         self.agents.remove(name);
+        self.drop_subagents(name);
         removed
     }
 
@@ -315,6 +570,13 @@ impl DaemonState {
             .cloned()
             .map(|mut row| {
                 row.deleting = self.deleting.contains(&row.name);
+                row.subagents = self.subagents.get(&row.name).cloned().unwrap_or_default();
+                row.subagents.sort_by(|a, b| {
+                    (a.status != SubagentStatus::Running)
+                        .cmp(&(b.status != SubagentStatus::Running))
+                        .then(a.started_ts.cmp(&b.started_ts))
+                        .then(a.id.cmp(&b.id))
+                });
                 row
             })
             .collect();
@@ -493,7 +755,22 @@ fn build_row(
         // at scan time — a scan and a delete can race, and the scan must not
         // clobber an in-flight delete's mark.
         deleting: false,
+        // Projected from `DaemonState::subagents` by `snapshot()`.
+        subagents: Vec::new(),
     }
+}
+
+/// Pop the oldest live pending description for `agent_type`, discarding
+/// expired entries on the way.
+fn take_pending_description(
+    pending: Option<&mut Vec<PendingDescription>>,
+    agent_type: &str,
+    now: u64,
+) -> Option<String> {
+    let pending = pending?;
+    pending.retain(|p| now.saturating_sub(p.ts) <= PENDING_DESCRIPTION_SECS);
+    let pos = pending.iter().position(|p| p.agent_type == agent_type)?;
+    Some(pending.remove(pos).description)
 }
 
 #[cfg(test)]
@@ -527,6 +804,7 @@ mod tests {
             is_default: false,
             removal_block: None,
             deleting: false,
+            subagents: Vec::new(),
         }
     }
 
@@ -1006,5 +1284,391 @@ mod tests {
         assert!(!snap.loading);
         assert_eq!(snap.prs.len(), 1, "error must preserve the previous map");
         assert_eq!(snap.error.as_deref(), Some("network timeout"));
+    }
+
+    // ── subagents ────────────────────────────────────────────────────────────
+
+    fn sub(kind: SubagentEventKind, id: Option<&str>, ty: &str) -> SubagentEvent {
+        SubagentEvent {
+            kind,
+            agent_id: id.map(str::to_string),
+            agent_type: ty.to_string(),
+            description: None,
+        }
+    }
+
+    fn spawn(ty: &str, desc: &str, id: Option<&str>) -> SubagentEvent {
+        SubagentEvent {
+            description: Some(desc.to_string()),
+            ..sub(SubagentEventKind::Spawn, id, ty)
+        }
+    }
+
+    fn apply(state: &mut DaemonState, status: &str, ev: Option<&SubagentEvent>, now: u64) -> bool {
+        state
+            .apply_hook_event_at("main", status, None, None, ev, now)
+            .unwrap()
+    }
+
+    fn subs(state: &DaemonState) -> Vec<SubagentRow> {
+        state
+            .snapshot()
+            .rows
+            .into_iter()
+            .find(|r| r.name == "main")
+            .unwrap()
+            .subagents
+    }
+
+    fn state_with_main() -> DaemonState {
+        let mut state = DaemonState::default();
+        state.rows.insert("main".into(), make_row("main"));
+        state
+    }
+
+    #[test]
+    fn subagent_start_and_stop() {
+        let mut state = state_with_main();
+        let start = sub(SubagentEventKind::Start, Some("a1"), "Explore");
+        assert!(apply(&mut state, "working", Some(&start), 100));
+        let s = subs(&state);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].status, SubagentStatus::Running);
+        assert_eq!(s[0].agent_type, "Explore");
+        assert_eq!(s[0].started_ts, 100);
+
+        let stop = sub(SubagentEventKind::Stop, Some("a1"), "Explore");
+        assert!(apply(&mut state, "idle", Some(&stop), 130));
+        let s = subs(&state);
+        assert_eq!(s[0].status, SubagentStatus::Done);
+        assert_eq!(s[0].finished_ts, Some(130));
+        // A repeated stop is not an observable change.
+        assert!(!apply(&mut state, "idle", Some(&stop), 131));
+    }
+
+    #[test]
+    fn subagent_events_leave_parent_untouched() {
+        let mut state = state_with_main();
+        state.apply_hook("main", "idle", None, None).unwrap();
+        let before = state.agents["main"].clone();
+        let start = sub(SubagentEventKind::Start, Some("a1"), "general-purpose");
+        apply(&mut state, "working", Some(&start), 100);
+        let act = sub(SubagentEventKind::Activity, Some("a1"), "general-purpose");
+        apply(&mut state, "working", Some(&act), 101);
+        let stop = sub(SubagentEventKind::Stop, Some("a1"), "general-purpose");
+        apply(&mut state, "idle", Some(&stop), 102);
+        assert_eq!(state.agents["main"].status, AgentStatus::Idle);
+        assert_eq!(state.agents["main"].ts, before.ts);
+        assert_eq!(state.snapshot().rows[0].agent, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn subagent_revive_keeps_start_time() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("a1"), "Plan")),
+            100,
+        );
+        apply(
+            &mut state,
+            "idle",
+            Some(&sub(SubagentEventKind::Stop, Some("a1"), "Plan")),
+            110,
+        );
+        assert!(apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("a1"), "Plan")),
+            120
+        ));
+        let s = subs(&state);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].status, SubagentStatus::Running);
+        assert_eq!(s[0].started_ts, 100);
+        assert_eq!(s[0].finished_ts, None);
+    }
+
+    #[test]
+    fn subagent_unknown_stop_and_activity_are_added() {
+        let mut state = state_with_main();
+        assert!(apply(
+            &mut state,
+            "idle",
+            Some(&sub(SubagentEventKind::Stop, Some("a1"), "Plan")),
+            100
+        ));
+        assert!(apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Activity, Some("a2"), "Explore")),
+            100
+        ));
+        let s = subs(&state);
+        assert_eq!(s.len(), 2);
+        // Running sorts first.
+        assert_eq!(s[0].id, "a2");
+        assert_eq!(s[0].status, SubagentStatus::Running);
+        assert_eq!(s[1].id, "a1");
+        assert_eq!(s[1].status, SubagentStatus::Done);
+        // Activity for a known subagent only moves its time: not a broadcast.
+        assert!(!apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Activity, Some("a2"), "Explore")),
+            150
+        ));
+        assert_eq!(subs(&state)[0].last_ts, 150);
+    }
+
+    #[test]
+    fn subagent_empty_type_or_missing_id_is_ignored() {
+        let mut state = state_with_main();
+        assert!(!apply(
+            &mut state,
+            "idle",
+            Some(&sub(SubagentEventKind::Stop, Some("a1"), "")),
+            100
+        ));
+        assert!(!apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, None, "Plan")),
+            100
+        ));
+        assert!(subs(&state).is_empty());
+        assert!(!state.agents.contains_key("main"));
+    }
+
+    #[test]
+    fn subagent_description_fifo_by_type() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "find hooks", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Plan", "plan it", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "find tests", None)),
+            100,
+        );
+        // The parent `Agent` tool call still applies the parent status.
+        assert_eq!(state.agents["main"].status, AgentStatus::Working);
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("p"), "Plan")),
+            101,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("e1"), "Explore")),
+            101,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("e2"), "Explore")),
+            102,
+        );
+        let by_id = |id: &str| {
+            subs(&state)
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .description
+        };
+        assert_eq!(by_id("p").as_deref(), Some("plan it"));
+        assert_eq!(by_id("e1").as_deref(), Some("find hooks"));
+        assert_eq!(by_id("e2").as_deref(), Some("find tests"));
+    }
+
+    #[test]
+    fn subagent_stale_pending_description_is_dropped() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "old", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("e1"), "Explore")),
+            100 + PENDING_DESCRIPTION_SECS + 1,
+        );
+        assert_eq!(subs(&state)[0].description, None);
+    }
+
+    #[test]
+    fn subagent_description_override_by_agent_id() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "first", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "second", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("e2"), "Explore")),
+            101,
+        );
+        // e2 took "first" by FIFO; the background tool response corrects it.
+        assert!(apply(
+            &mut state,
+            "working",
+            Some(&spawn("Explore", "second", Some("e2"))),
+            102
+        ));
+        assert_eq!(subs(&state)[0].description.as_deref(), Some("second"));
+        // The matching pending entry is gone, so the next start gets nothing.
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("e3"), "Explore")),
+            103,
+        );
+        let e3 = subs(&state).into_iter().find(|r| r.id == "e3").unwrap();
+        assert_eq!(e3.description, None);
+    }
+
+    /// A background subagent's finish starts a new parent turn, which fires
+    /// `UserPromptSubmit`. That parent hook must not cut the done grace period.
+    #[test]
+    fn parent_hook_keeps_done_subagents() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "idle",
+            Some(&sub(SubagentEventKind::Stop, Some("d"), "Plan")),
+            100,
+        );
+        apply(&mut state, "working", None, 101);
+        let s2 = subs(&state);
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].status, SubagentStatus::Done);
+    }
+
+    #[test]
+    fn expire_subagents_at_boundaries() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "idle",
+            Some(&sub(SubagentEventKind::Stop, Some("d"), "Plan")),
+            1000,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("r"), "Plan")),
+            1000,
+        );
+        assert!(!state.expire_subagents(1000 + SUBAGENT_DONE_GRACE_SECS));
+        assert_eq!(subs(&state).len(), 2);
+        assert!(state.expire_subagents(1000 + SUBAGENT_DONE_GRACE_SECS + 1));
+        assert_eq!(subs(&state).len(), 1);
+        assert!(!state.expire_subagents(1000 + SUBAGENT_STALE_SECS));
+        assert!(state.expire_subagents(1000 + SUBAGENT_STALE_SECS + 1));
+        assert!(subs(&state).is_empty());
+    }
+
+    #[test]
+    fn remove_row_drops_subagents() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("r"), "Plan")),
+            100,
+        );
+        state.remove_row("main");
+        state.rows.insert("main".into(), make_row("main"));
+        assert!(subs(&state).is_empty());
+    }
+
+    #[test]
+    fn scan_removal_drops_subagents() {
+        let mut state = state_with_main();
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("r"), "Plan")),
+            100,
+        );
+        state.apply_scanned_rows(HashMap::new());
+        state.apply_scanned_rows(HashMap::from([("main".to_string(), make_row("main"))]));
+        assert!(subs(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_never_writes_subagents() {
+        let dir =
+            std::env::temp_dir().join(format!("swamp-subagent-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = state_with_main();
+        state.apply_hook("main", "working", None, None).unwrap();
+        apply(
+            &mut state,
+            "working",
+            Some(&spawn("Plan", "secret plan", None)),
+            100,
+        );
+        apply(
+            &mut state,
+            "working",
+            Some(&sub(SubagentEventKind::Start, Some("agent-xyz"), "Plan")),
+            100,
+        );
+        state.persist(&dir).await.unwrap();
+        let text = std::fs::read_to_string(dir.join(".swamp-status.json")).unwrap();
+        assert!(!text.contains("agent-xyz"));
+        assert!(!text.contains("secret plan"));
+        assert!(!text.contains("subagent"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_row_subagents_serde() {
+        // An older peer's row without the field still decodes.
+        let mut v = serde_json::to_value(make_row("main")).unwrap();
+        assert!(v.get("subagents").is_none(), "empty list is skipped");
+        v.as_object_mut().unwrap().remove("subagents");
+        let row: WorktreeRow = serde_json::from_value(v).unwrap();
+        assert!(row.subagents.is_empty());
+
+        let mut row = make_row("main");
+        row.subagents.push(SubagentRow {
+            id: "a1".into(),
+            agent_type: "Explore".into(),
+            description: Some("look".into()),
+            status: SubagentStatus::Done,
+            started_ts: 1,
+            last_ts: 2,
+            finished_ts: Some(2),
+        });
+        let back: WorktreeRow =
+            serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back.subagents, row.subagents);
     }
 }

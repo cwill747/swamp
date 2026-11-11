@@ -306,6 +306,7 @@ mod tests {
             is_default,
             removal_block: None,
             deleting: false,
+            subagents: Vec::new(),
         }
     }
 

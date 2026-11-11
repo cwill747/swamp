@@ -40,7 +40,14 @@ pub async fn run(payload: Vec<String>) -> Result<()> {
     // UUID and break resuming that conversation after switching back to Claude.
     //
     // Best-effort: never let a notify failure surface to Codex.
-    let _ = crate::hook::run("idle".to_string(), dir, None, None).await;
+    let _ = crate::hook::run(
+        "idle".to_string(),
+        dir,
+        None,
+        None,
+        crate::hook::HookPayload::default(),
+    )
+    .await;
     Ok(())
 }
 

@@ -16,6 +16,11 @@ const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
         Some("permission_prompt|elicitation_dialog"),
     ),
     ("Stop", "idle", None),
+    // Subagent lifecycle. The daemon reads the stdin payload and applies these
+    // to the subagent only; the positional status is a fallback for an older
+    // daemon.
+    ("SubagentStart", "working", None),
+    ("SubagentStop", "idle", None),
 ];
 
 /// Path to Claude Code's user `settings.json` (honors `CLAUDE_CONFIG_DIR`).

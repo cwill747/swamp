@@ -1,6 +1,6 @@
 use super::Daemon;
 use super::resources;
-use super::state::{PrSnapshot, Snapshot};
+use super::state::{PrSnapshot, Snapshot, SubagentEvent};
 use crate::config::Harness;
 use crate::worktree::BranchInfo;
 use anyhow::Result;
@@ -23,6 +23,10 @@ pub enum ClientMsg {
         session_name: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+        /// Subagent detail from the hook's stdin payload. An older daemon
+        /// ignores this field and applies only the status.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentEvent>,
     },
     GetVersion,
     Refresh,
@@ -115,12 +119,12 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         }
                         write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
-                    ClientMsg::Hook { worktree, status, session_name, session_id } => {
-                        if let Err(e) = validate_hook(&worktree, session_name.as_deref(), session_id.as_deref()) {
+                    ClientMsg::Hook { worktree, status, session_name, session_id, subagent } => {
+                        if let Err(e) = validate_hook(&worktree, session_name.as_deref(), session_id.as_deref(), subagent.as_ref()) {
                             write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
                             continue;
                         }
-                        match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref()).await {
+                        match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref(), subagent.as_ref()).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
@@ -338,10 +342,21 @@ fn validate_hook(
     worktree: &str,
     session_name: Option<&str>,
     session_id: Option<&str>,
+    subagent: Option<&SubagentEvent>,
 ) -> Result<()> {
     validate_worktree_name(worktree)?;
     validate_optional_field("session_name", session_name, MAX_SESSION_FIELD_LEN)?;
-    validate_optional_field("session_id", session_id, MAX_SESSION_FIELD_LEN)
+    validate_optional_field("session_id", session_id, MAX_SESSION_FIELD_LEN)?;
+    if let Some(ev) = subagent {
+        validate_optional_field("agent_id", ev.agent_id.as_deref(), MAX_SESSION_FIELD_LEN)?;
+        validate_optional_field("agent_type", Some(&ev.agent_type), MAX_SESSION_FIELD_LEN)?;
+        validate_optional_field(
+            "description",
+            ev.description.as_deref(),
+            MAX_SESSION_FIELD_LEN,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_refish(field: &str, value: &str) -> Result<()> {
@@ -384,7 +399,7 @@ fn validate_optional_field(field: &str, value: Option<&str>, max_len: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::state::{AgentStatus, WorktreeRow};
+    use crate::daemon::state::{AgentStatus, SubagentEventKind, WorktreeRow};
     use std::path::PathBuf;
     use tokio::net::UnixListener;
 
@@ -413,6 +428,7 @@ mod tests {
                     is_default: false,
                     removal_block: None,
                     deleting: false,
+                    subagents: Vec::new(),
                 })
                 .collect(),
             default_known: true,
@@ -431,6 +447,12 @@ mod tests {
                 status: "working".into(),
                 session_name: None,
                 session_id: None,
+                subagent: Some(SubagentEvent {
+                    kind: SubagentEventKind::Start,
+                    agent_id: Some("agent-1".into()),
+                    agent_type: "Explore".into(),
+                    description: None,
+                }),
             },
             ClientMsg::GetVersion,
             ClientMsg::Refresh,
@@ -683,8 +705,73 @@ mod tests {
 
     #[test]
     fn validates_session_fields_at_daemon_boundary() {
-        assert!(validate_hook("main", Some("session"), Some("id")).is_ok());
-        assert!(validate_hook("main", Some("bad\nsession"), None).is_err());
-        assert!(validate_hook("main", Some(&"x".repeat(MAX_SESSION_FIELD_LEN + 1)), None).is_err());
+        assert!(validate_hook("main", Some("session"), Some("id"), None).is_ok());
+        assert!(validate_hook("main", Some("bad\nsession"), None, None).is_err());
+        assert!(
+            validate_hook(
+                "main",
+                Some(&"x".repeat(MAX_SESSION_FIELD_LEN + 1)),
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_subagent_fields_at_daemon_boundary() {
+        let long = "x".repeat(MAX_SESSION_FIELD_LEN + 1);
+        let ev = |id: &str, desc: &str| SubagentEvent {
+            kind: SubagentEventKind::Spawn,
+            agent_id: Some(id.into()),
+            agent_type: "Explore".into(),
+            description: Some(desc.into()),
+        };
+        assert!(validate_hook("main", None, None, Some(&ev("a", "d"))).is_ok());
+        assert!(validate_hook("main", None, None, Some(&ev(&long, "d"))).is_err());
+        assert!(validate_hook("main", None, None, Some(&ev("a", &long))).is_err());
+        assert!(validate_hook("main", None, None, Some(&ev("a", "bad\ndesc"))).is_err());
+    }
+
+    /// A hook from an older `swamp hook` (no subagent fields) decodes on a new
+    /// daemon, and a new hook decodes on a daemon that only knows the old shape.
+    #[test]
+    fn hook_message_is_compatible_both_ways() {
+        let old = r#"{"type":"hook","worktree":"main","status":"working","session_name":null}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::Hook { subagent, .. } => {
+                assert!(subagent.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientMsg {
+            Hook {
+                worktree: String,
+                status: String,
+                #[allow(dead_code)]
+                session_name: Option<String>,
+            },
+        }
+        let new = serde_json::to_string(&ClientMsg::Hook {
+            worktree: "main".into(),
+            status: "idle".into(),
+            session_name: None,
+            session_id: None,
+            subagent: Some(SubagentEvent {
+                kind: SubagentEventKind::Stop,
+                agent_id: Some("a1".into()),
+                agent_type: "Plan".into(),
+                description: None,
+            }),
+        })
+        .unwrap();
+        let OldClientMsg::Hook {
+            worktree, status, ..
+        } = serde_json::from_str(&new).unwrap();
+        assert_eq!(worktree, "main");
+        assert_eq!(status, "idle");
     }
 }

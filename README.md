@@ -202,6 +202,45 @@ swamp hook working --session-name "Fix auth bug"
 swamp hook working --session-id "3f9c1e2a-7b40-4d8e-9a1f-2c3d4e5f6a7b"
 ```
 
+When Claude Code runs `swamp hook`, it writes the hook payload as JSON to stdin.
+Swamp reads the payload to track subagents. The AI status pane shows each
+subagent as an indented row under its worktree. Tool calls inside a subagent
+update only that subagent, so the parent row keeps its own status.
+
+#### Claude Code hooks
+
+`swamp init` adds these hooks to `~/.claude/settings.json` and keeps hooks that
+swamp does not manage. If the file is read-only, for example under nix or
+home-manager, add the hooks yourself:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }] }
+    ],
+    "Notification": [
+      { "matcher": "permission_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": "swamp hook waiting >/dev/null 2>&1 || true" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "swamp hook idle >/dev/null 2>&1 || true" }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "swamp hook working >/dev/null 2>&1 || true" }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "swamp hook idle >/dev/null 2>&1 || true" }] }
+    ]
+  }
+}
+```
+
 ### `swamp serve`
 
 Runs the per-repo daemon explicitly:
