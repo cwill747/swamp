@@ -12,7 +12,8 @@
 
 use super::branches::{default_branch_name, default_remote, list_worktrees};
 use super::create::{
-    add_worktree_named, branch_remote, find_remote_tracking_branch, inflate_lfs, workon_root,
+    add_worktree_named, base_remote, branch_remote, find_remote_tracking_branch, inflate_lfs,
+    workon_root,
 };
 use super::model::{
     GitInfo, RemovalVerdict, RemoveRefusedReason, SlotState, VerdictContext, Worktree,
@@ -23,7 +24,7 @@ use super::status::git_info;
 use anyhow::{Context, Result, bail};
 use git2::build::CheckoutBuilder;
 use git2::{BranchType, Oid, Repository, RepositoryState};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -151,8 +152,20 @@ pub fn classify(common: &Path, name: &str, path: &Path) -> (SlotState, Option<St
         return (SlotState::Busy, pin);
     }
     match git_info(path) {
-        Ok(info) if !info.is_dirty() && !info.rebase => {}
-        _ => return (SlotState::Busy, pin),
+        Ok(info) => slot_state_from(true, &info, pin),
+        Err(_) => (SlotState::Busy, pin),
+    }
+}
+
+/// Slot state from data a status scan already has: whether `HEAD` is
+/// detached, the worktree's git status, and its pin.
+pub fn slot_state_from(
+    detached: bool,
+    info: &GitInfo,
+    pin: Option<String>,
+) -> (SlotState, Option<String>) {
+    if !detached || info.is_dirty() || info.rebase {
+        return (SlotState::Busy, pin);
     }
     match pin {
         Some(reason) => (SlotState::Pinned, Some(reason)),
@@ -230,14 +243,26 @@ pub fn list_pool(common: &Path, pool_size: u32) -> Result<Vec<PoolEntry>> {
 // ---------------------------------------------------------------------------
 // Alloc
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct AllocOptions {
     pub pool_size: u32,
     /// Fetch the default remote before allocating (best effort).
     pub fetch: bool,
+    /// Create the branch from this base (a branch, `origin/<base>`, tag, or
+    /// SHA) instead of the default branch. The branch must not exist yet.
+    pub base: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl AllocOptions {
+    pub fn pool(pool_size: u32) -> Self {
+        Self {
+            pool_size,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Allocation {
     pub name: String,
     pub path: PathBuf,
@@ -248,14 +273,26 @@ pub struct Allocation {
     /// True when swamp created the branch.
     pub created_branch: bool,
     /// Non-fatal problems (for example, a failed fetch) for the caller to show.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
 /// Give the caller a worktree for branch `requested`. See the module docs.
-pub fn alloc(common: &Path, requested: &str, opts: AllocOptions) -> Result<Allocation> {
+/// Production callers go through [`crate::slot_service::alloc`].
+#[cfg(test)]
+pub fn alloc(common: &Path, requested: &str, opts: &AllocOptions) -> Result<Allocation> {
+    let guard = lock(common)?;
+    alloc_locked(&guard, common, requested, opts)
+}
+
+/// [`alloc`] for a caller that already holds the slot lock.
+pub fn alloc_locked(
+    _lock: &SlotLock,
+    common: &Path,
+    requested: &str,
+    opts: &AllocOptions,
+) -> Result<Allocation> {
     let branch = sanitize_branch_name(requested)?;
-    let _lock = lock(common)?;
     let mut warnings = Vec::new();
 
     let repo =
@@ -285,7 +322,10 @@ pub fn alloc(common: &Path, requested: &str, opts: AllocOptions) -> Result<Alloc
         });
     }
 
-    let (remote, created_branch) = ensure_local_branch(&repo, &branch, &default)?;
+    let (remote, created_branch) = match opts.base.as_deref() {
+        Some(base) => (create_branch_from_base(&repo, &branch, base)?, true),
+        None => ensure_local_branch(&repo, &branch, &default)?,
+    };
     match place(&repo, common, &worktrees, &branch, remote.as_deref(), opts) {
         Ok((name, path, kind)) => Ok(Allocation {
             name,
@@ -303,6 +343,35 @@ pub fn alloc(common: &Path, requested: &str, opts: AllocOptions) -> Result<Alloc
             Err(e)
         }
     }
+}
+
+/// Create a new local `branch` from `base`: a local branch, the default
+/// remote's `<base>`, or any revision (a tag or SHA). Returns the remote the
+/// base tracks, for LFS content.
+fn create_branch_from_base(repo: &Repository, branch: &str, base: &str) -> Result<Option<String>> {
+    if repo.find_branch(branch, BranchType::Local).is_ok() {
+        bail!("branch {branch} already exists");
+    }
+    let local = repo
+        .find_branch(base, BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().peel_to_commit().ok());
+    let remote = default_remote(repo).and_then(|r| {
+        repo.find_reference(&format!("refs/remotes/{r}/{base}"))
+            .ok()?
+            .peel_to_commit()
+            .ok()
+    });
+    let commit = match local.or(remote) {
+        Some(c) => c,
+        None => repo
+            .revparse_single(base)
+            .and_then(|o| o.peel_to_commit())
+            .with_context(|| format!("resolve base {base}"))?,
+    };
+    repo.branch(branch, &commit, false)
+        .with_context(|| format!("create branch {branch} from {base}"))?;
+    Ok(base_remote(repo, base))
 }
 
 /// Make sure local branch `branch` exists. Returns the remote to pull LFS
@@ -359,7 +428,7 @@ fn place(
     worktrees: &[Worktree],
     branch: &str,
     remote: Option<&str>,
-    opts: AllocOptions,
+    opts: &AllocOptions,
 ) -> Result<(String, PathBuf, WorktreeKind)> {
     let mut slots: Vec<(u32, &Worktree)> = worktrees
         .iter()
@@ -424,13 +493,31 @@ fn checkout_branch_in(path: &Path, branch: &str) -> Result<()> {
 // Release
 
 /// PR facts for the branch a release targets, gathered by the caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrFacts {
     /// The branch the facts describe. Release ignores facts for another branch.
     pub branch: String,
     /// GitHub PR state: `OPEN`, `MERGED`, or `CLOSED`.
     pub state: String,
+    #[serde(default, with = "oid_opt")]
     pub head_oid: Option<Oid>,
+}
+
+mod oid_opt {
+    use git2::Oid;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(oid: &Option<Oid>, s: S) -> Result<S::Ok, S::Error> {
+        match oid {
+            Some(o) => s.serialize_some(&o.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Oid>, D::Error> {
+        let s: Option<String> = Option::deserialize(d)?;
+        Ok(s.and_then(|s| s.parse().ok()))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -441,7 +528,7 @@ pub struct ReleaseOptions {
     pub pr: Option<PrFacts>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseOutcome {
     /// Swamp detached the slot. `branch_deleted` is true when the branch's PR
@@ -454,7 +541,7 @@ pub enum ReleaseOutcome {
     KeptOverflow,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
     pub name: String,
     pub path: PathBuf,
@@ -473,6 +560,8 @@ pub enum ReleaseRefusedReason {
     NotOnRemote,
     DefaultBranchWorktree,
     StatusUnreadable,
+    /// Another slot's agent is working; the caller does not run in that slot.
+    AgentWorking,
 }
 
 #[derive(Debug)]
@@ -504,6 +593,9 @@ impl std::fmt::Display for ReleaseRefused {
                 "holds the default branch and is not a slot".to_string()
             }
             ReleaseRefusedReason::StatusUnreadable => "has unreadable git status".to_string(),
+            ReleaseRefusedReason::AgentWorking => {
+                "has a working agent and you do not run inside it".to_string()
+            }
         };
         write!(f, "{}{on} {why}; leaving it in place", self.name)
     }
@@ -549,14 +641,27 @@ pub fn resolve_target(common: &Path, target: Option<&str>, cwd: &Path) -> Result
 }
 
 /// Return a slot to the pool. See the module docs and [`ReleaseRefusedReason`].
+/// Production callers go through [`crate::slot_service::release`].
+#[cfg(test)]
 pub fn release(
     common: &Path,
     target: Option<&str>,
     cwd: &Path,
     opts: &ReleaseOptions,
 ) -> Result<Release> {
-    let _lock = lock(common)?;
+    let guard = lock(common)?;
     let wt = resolve_target(common, target, cwd)?;
+    release_locked(&guard, common, &wt, opts)
+}
+
+/// [`release`] for a caller that holds the slot lock and has resolved the
+/// target worktree.
+pub fn release_locked(
+    _lock: &SlotLock,
+    common: &Path,
+    wt: &Worktree,
+    opts: &ReleaseOptions,
+) -> Result<Release> {
     let name = wt.name();
     let common_repo =
         Repository::open(common).with_context(|| format!("open repo at {}", common.display()))?;
@@ -726,10 +831,9 @@ mod tests {
     use crate::worktree::clone_repo;
     use crate::worktree::test_support::{git_available, run, setup};
 
-    const OPTS: AllocOptions = AllocOptions {
-        pool_size: 5,
-        fetch: false,
-    };
+    fn opts() -> AllocOptions {
+        AllocOptions::pool(5)
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -842,7 +946,7 @@ mod tests {
         }
         let (root, bare) = setup();
 
-        let a = alloc(&bare, "parser-fix", OPTS).unwrap();
+        let a = alloc(&bare, "parser-fix", &opts()).unwrap();
 
         assert_eq!(a.name, "work1");
         assert_eq!(a.kind, WorktreeKind::Slot);
@@ -857,14 +961,11 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let opts = AllocOptions {
-            pool_size: 2,
-            fetch: false,
-        };
+        let opts = AllocOptions::pool(2);
 
-        assert_eq!(alloc(&bare, "a", opts).unwrap().name, "work1");
-        assert_eq!(alloc(&bare, "b", opts).unwrap().name, "work2");
-        let c = alloc(&bare, "c", opts).unwrap();
+        assert_eq!(alloc(&bare, "a", &opts).unwrap().name, "work1");
+        assert_eq!(alloc(&bare, "b", &opts).unwrap().name, "work2");
+        let c = alloc(&bare, "c", &opts).unwrap();
 
         assert_eq!(c.name, "c");
         assert_eq!(c.kind, WorktreeKind::Overflow);
@@ -878,12 +979,9 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let opts = AllocOptions {
-            pool_size: 0,
-            fetch: false,
-        };
+        let opts = AllocOptions::pool(0);
 
-        let a = alloc(&bare, "a", opts).unwrap();
+        let a = alloc(&bare, "a", &opts).unwrap();
 
         assert_eq!(a.kind, WorktreeKind::Overflow);
         assert_eq!(a.name, "a");
@@ -896,9 +994,9 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let first = alloc(&bare, "fix-ci", OPTS).unwrap();
+        let first = alloc(&bare, "fix-ci", &opts()).unwrap();
 
-        let again = alloc(&bare, "fix-ci", OPTS).unwrap();
+        let again = alloc(&bare, "fix-ci", &opts()).unwrap();
 
         assert!(again.existing);
         assert_eq!(again.path, first.path);
@@ -912,13 +1010,13 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "one", OPTS).unwrap();
+        let a = alloc(&common, "one", &opts()).unwrap();
         std::fs::create_dir_all(a.path.join("target")).unwrap();
         std::fs::write(a.path.join("target/cache.bin"), "warm").unwrap();
         // Make `one` safe to release: it equals origin/main.
         release_slot(&common, "work1", &ReleaseOptions::default()).unwrap();
 
-        let b = alloc(&common, "two", OPTS).unwrap();
+        let b = alloc(&common, "two", &opts()).unwrap();
 
         assert_eq!(b.name, "work1");
         assert_eq!(checked_out_branch(&b.path).as_deref(), Some("two"));
@@ -935,7 +1033,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "tracked", OPTS).unwrap();
+        let a = alloc(&common, "tracked", &opts()).unwrap();
         std::fs::create_dir_all(a.path.join("target")).unwrap();
         std::fs::write(a.path.join("target/x"), "branch").unwrap();
         run(&a.path, &["add", "-f", "target/x"]);
@@ -945,7 +1043,7 @@ mod tests {
         std::fs::create_dir_all(a.path.join("target")).unwrap();
         std::fs::write(a.path.join("target/x"), "local").unwrap();
 
-        let b = alloc(&common, "tracked", OPTS).unwrap();
+        let b = alloc(&common, "tracked", &opts()).unwrap();
 
         assert_eq!(b.name, "work2");
         assert_eq!(
@@ -962,7 +1060,7 @@ mod tests {
         }
         let (scratch, _origin, common) = cloned();
 
-        let a = alloc(&common, "feature", OPTS).unwrap();
+        let a = alloc(&common, "feature", &opts()).unwrap();
 
         assert!(a.created_branch);
         let repo = Repository::open(&common).unwrap();
@@ -984,7 +1082,7 @@ mod tests {
         let main = common.parent().unwrap().join("main");
         commit(&main, "local-only.txt");
 
-        let a = alloc(&common, "fresh", OPTS).unwrap();
+        let a = alloc(&common, "fresh", &opts()).unwrap();
 
         let repo = Repository::open(&common).unwrap();
         let origin_main = repo
@@ -1012,7 +1110,7 @@ mod tests {
             .into_iter()
             .map(|b| {
                 let bare = bare.clone();
-                std::thread::spawn(move || alloc(&bare, b, OPTS).unwrap().path)
+                std::thread::spawn(move || alloc(&bare, b, &opts()).unwrap().path)
             })
             .collect();
 
@@ -1030,7 +1128,7 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let a = alloc(&bare, "a", OPTS).unwrap();
+        let a = alloc(&bare, "a", &opts()).unwrap();
         assert_eq!(classify(&bare, "work1", &a.path).0, SlotState::Busy);
 
         let repo = Repository::open(&a.path).unwrap();
@@ -1055,17 +1153,17 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let a = alloc(&bare, "a", OPTS).unwrap();
+        let a = alloc(&bare, "a", &opts()).unwrap();
         Repository::open(&a.path)
             .unwrap()
             .set_head_detached(head_oid(&a.path))
             .unwrap();
         pin(&bare, "work1", "review").unwrap();
 
-        assert_eq!(alloc(&bare, "b", OPTS).unwrap().name, "work2");
+        assert_eq!(alloc(&bare, "b", &opts()).unwrap().name, "work2");
 
         assert!(unpin(&bare, "work1").unwrap());
-        assert_eq!(alloc(&bare, "c", OPTS).unwrap().name, "work1");
+        assert_eq!(alloc(&bare, "c", &opts()).unwrap().name, "work1");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1075,7 +1173,7 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        alloc(&bare, "a", OPTS).unwrap();
+        alloc(&bare, "a", &opts()).unwrap();
 
         let err = pin(&bare, "work1", "x").unwrap_err();
 
@@ -1089,7 +1187,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "fix-ci", OPTS).unwrap();
+        let a = alloc(&common, "fix-ci", &opts()).unwrap();
         commit(&a.path, "fix.txt");
         run(&a.path, &["push", "-q", "origin", "fix-ci"]);
 
@@ -1112,7 +1210,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "wip", OPTS).unwrap();
+        let a = alloc(&common, "wip", &opts()).unwrap();
         std::fs::write(a.path.join("scratch.txt"), "x").unwrap();
 
         let err = release_slot(&common, "work1", &ReleaseOptions::default()).unwrap_err();
@@ -1128,7 +1226,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "feature", OPTS).unwrap();
+        let a = alloc(&common, "feature", &opts()).unwrap();
         commit(&a.path, "one.txt");
         commit(&a.path, "two.txt");
 
@@ -1144,7 +1242,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "local", OPTS).unwrap();
+        let a = alloc(&common, "local", &opts()).unwrap();
         commit(&a.path, "one.txt");
 
         let err = release_slot(&common, "work1", &ReleaseOptions::default()).unwrap_err();
@@ -1159,7 +1257,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "squashed", OPTS).unwrap();
+        let a = alloc(&common, "squashed", &opts()).unwrap();
         commit(&a.path, "one.txt");
         let tip = head_oid(&a.path);
         let opts = ReleaseOptions {
@@ -1189,7 +1287,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "more", OPTS).unwrap();
+        let a = alloc(&common, "more", &opts()).unwrap();
         commit(&a.path, "one.txt");
         let pr_head = head_oid(&a.path);
         commit(&a.path, "two.txt");
@@ -1213,7 +1311,7 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let a = alloc(&bare, "a", OPTS).unwrap();
+        let a = alloc(&bare, "a", &opts()).unwrap();
         Repository::open(&a.path)
             .unwrap()
             .set_head_detached(head_oid(&a.path))
@@ -1233,11 +1331,8 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let opts = AllocOptions {
-            pool_size: 0,
-            fetch: false,
-        };
-        let a = alloc(&bare, "spike", opts).unwrap();
+        let opts = AllocOptions::pool(0);
+        let a = alloc(&bare, "spike", &opts).unwrap();
 
         let r = release(
             &bare,
@@ -1258,7 +1353,7 @@ mod tests {
             return;
         }
         let (scratch, _origin, common) = cloned();
-        let a = alloc(&common, "by-branch", OPTS).unwrap();
+        let a = alloc(&common, "by-branch", &opts()).unwrap();
 
         let by_cwd = resolve_target(&common, None, &a.path.join("sub")).ok();
         let by_branch = resolve_target(&common, Some("by-branch"), Path::new("/")).unwrap();
@@ -1297,13 +1392,10 @@ mod tests {
         }
         let (root, bare) = setup();
         for b in ["a", "b", "c"] {
-            alloc(&bare, b, OPTS).unwrap();
+            alloc(&bare, b, &opts()).unwrap();
         }
-        let overflow = AllocOptions {
-            pool_size: 0,
-            fetch: false,
-        };
-        alloc(&bare, "spike", overflow).unwrap();
+        let overflow = AllocOptions::pool(0);
+        alloc(&bare, "spike", &overflow).unwrap();
 
         let entries = list_pool(&bare, 2).unwrap();
 
@@ -1324,7 +1416,7 @@ mod tests {
         }
         let (root, bare) = setup();
         for b in ["a", "b", "c"] {
-            alloc(&bare, b, OPTS).unwrap();
+            alloc(&bare, b, &opts()).unwrap();
         }
         // Free work3, then shrink the pool to 2: work3 must not be reused.
         let w3 = root.join("work3");
@@ -1332,12 +1424,9 @@ mod tests {
             .unwrap()
             .set_head_detached(head_oid(&w3))
             .unwrap();
-        let small = AllocOptions {
-            pool_size: 2,
-            fetch: false,
-        };
+        let small = AllocOptions::pool(2);
 
-        let d = alloc(&bare, "d", small).unwrap();
+        let d = alloc(&bare, "d", &small).unwrap();
 
         assert_eq!(d.kind, WorktreeKind::Overflow);
         let _ = std::fs::remove_dir_all(&root);

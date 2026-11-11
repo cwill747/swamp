@@ -237,9 +237,7 @@ mod tests {
 
     #[test]
     fn log_path_is_under_runtime_dir() {
-        let _g = crate::util::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::util::test_env_lock();
 
         // Point XDG_RUNTIME_DIR at a real temp dir so runtime_base_dir() can
         // verify ownership and create the directory.

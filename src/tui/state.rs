@@ -307,6 +307,9 @@ mod tests {
             removal_block: None,
             deleting: false,
             subagents: Vec::new(),
+            kind: Default::default(),
+            slot_state: None,
+            pin: None,
         }
     }
 

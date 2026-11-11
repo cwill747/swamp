@@ -703,31 +703,102 @@ impl Daemon {
         self.refresh_all_unlocked().await
     }
 
-    /// Create a worktree for `branch` (git2, off the async thread) and
-    /// broadcast the refreshed snapshot.
+    /// The TUI create action: put `branch` into a free slot, or an overflow
+    /// worktree when the pool is full.
     pub async fn create_worktree(&self, branch: &str) -> Result<()> {
-        let _repo = self.repo_ops.lock().await;
-        let common = self.common_dir.clone();
-        let branch = branch.to_string();
-        tokio::task::spawn_blocking(move || crate::worktree::create_worktree(&common, &branch))
-            .await
-            .context("create worktree task")??;
-        self.refresh_all_unlocked().await
+        self.slot_alloc(branch, None, false).await.map(|_| ())
     }
 
-    /// Create a worktree for a new `branch` cut from `base` (git2, off the
-    /// async thread) and broadcast the refreshed snapshot.
+    /// The TUI create action for a new `branch` cut from `base`.
     pub async fn create_worktree_from_base(&self, branch: &str, base: &str) -> Result<()> {
+        self.slot_alloc(branch, Some(base.to_string()), false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Allocate a worktree for `branch` (see [`crate::slot_service::alloc`]),
+    /// apply the agent-record changes, and broadcast the refreshed snapshot.
+    pub async fn slot_alloc(
+        &self,
+        branch: &str,
+        base: Option<String>,
+        offline: bool,
+    ) -> Result<crate::worktree::slots::Allocation> {
         let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let branch = branch.to_string();
-        let base = base.to_string();
-        tokio::task::spawn_blocking(move || {
-            crate::worktree::create_worktree_from_base(&common, &branch, &base)
+        let (allocation, changes) = tokio::task::spawn_blocking(move || {
+            let opts = crate::worktree::slots::AllocOptions {
+                pool_size: crate::config::slots_config(&common)?.pool_size,
+                fetch: !offline,
+                base,
+            };
+            crate::slot_service::alloc(&common, &branch, &opts)
         })
         .await
-        .context("create worktree task")??;
-        self.refresh_all_unlocked().await
+        .context("slot alloc task")??;
+        tracing::info!(
+            worktree = %allocation.name,
+            branch = %allocation.branch,
+            existing = allocation.existing,
+            "allocated worktree"
+        );
+        self.apply_agent_changes(&changes).await?;
+        self.refresh_all_unlocked().await?;
+        Ok(allocation)
+    }
+
+    /// Release a slot (see [`crate::slot_service::release`]). When the client
+    /// sent no PR facts, the daemon uses its own PR map.
+    pub async fn slot_release(
+        &self,
+        target: Option<String>,
+        cwd: PathBuf,
+        force: bool,
+        offline: bool,
+        pr: Option<crate::worktree::slots::PrFacts>,
+    ) -> Result<crate::worktree::slots::Release> {
+        let _repo = self.repo_ops.lock().await;
+        let (agents, prs) = {
+            let s = self.state.read().await;
+            (s.agents.clone(), s.pr_state_for_verdicts().cloned())
+        };
+        let common = self.common_dir.clone();
+        let (release, changes) = tokio::task::spawn_blocking(move || {
+            let pr = pr.or_else(|| {
+                let wt = crate::worktree::slots::resolve_target(&common, target.as_deref(), &cwd)
+                    .ok()?;
+                let branch = crate::worktree::slots::checked_out_branch(&wt.path)?;
+                let summary = prs?.remove(&branch)?;
+                Some(crate::worktree::slots::PrFacts {
+                    branch,
+                    state: summary.state,
+                    head_oid: summary.head_oid.and_then(|o| o.parse().ok()),
+                })
+            });
+            let opts = crate::worktree::slots::ReleaseOptions {
+                force,
+                fetch: !offline,
+                pr,
+            };
+            crate::slot_service::release(&common, target.as_deref(), &cwd, &opts, &agents)
+        })
+        .await
+        .context("slot release task")??;
+        tracing::info!(worktree = %release.name, outcome = ?release.outcome, "released worktree");
+        self.apply_agent_changes(&changes).await?;
+        self.refresh_all_unlocked().await?;
+        Ok(release)
+    }
+
+    /// Apply agent-record edits from a slot operation and persist them.
+    async fn apply_agent_changes(&self, changes: &crate::slot_service::AgentChanges) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut s = self.state.write().await;
+        changes.apply(&mut s.agents);
+        s.persist(&self.common_dir).await
     }
 
     /// Run the authoritative non-forced removal checks without mutating the
@@ -800,6 +871,8 @@ impl Daemon {
             let common = self.common_dir.clone();
             let name = name.to_string();
             tokio::task::spawn_blocking(move || {
+                // Serialize with slot operations from the CLI and other clients.
+                let _slots = crate::worktree::slots::lock(&common)?;
                 crate::worktree::remove_worktree(&common, &name, true, force, pr_state, pr_head_oid)
             })
             .await
@@ -988,6 +1061,81 @@ mod tests {
         })
     }
 
+    /// A TUI create (through the daemon) and a CLI alloc (in-process) race for
+    /// the same free slot; the shared slot lock gives them different ones.
+    // Holds the env lock across awaits: `slot_alloc` reads the user config,
+    // which the config tests point at temporary files.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn daemon_create_and_cli_alloc_get_different_worktrees() {
+        let _env = crate::util::test_env_lock();
+        // Other tests leave XDG_CONFIG_HOME pointing at their own (sometimes
+        // malformed) config; read defaults from an empty dir instead.
+        let xdg = std::env::temp_dir().join(format!("swamp-daemon-xdg-{}", std::process::id()));
+        // SAFETY: the crate test env lock serializes env changes.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        if !crate::worktree::test_support::git_available() {
+            return;
+        }
+        let (root, bare) = crate::worktree::test_support::setup();
+        let daemon = build_daemon(&bare).await;
+        let cli_common = bare.clone();
+
+        let cli = tokio::task::spawn_blocking(move || {
+            let opts = crate::worktree::slots::AllocOptions::pool(5);
+            crate::slot_service::alloc(&cli_common, "from-cli", &opts)
+                .unwrap()
+                .0
+                .path
+        });
+        daemon.create_worktree("from-tui").await.unwrap();
+        let cli_path = cli.await.unwrap();
+
+        let tui_path = crate::worktree::list_worktrees(&bare)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.branch == "from-tui")
+            .unwrap()
+            .path;
+        assert_ne!(cli_path, tui_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Releasing through the daemon clears the slot's agent record in memory
+    /// and remembers its session for the branch.
+    // Holds the env lock across awaits: `slot_alloc` reads the user config,
+    // which the config tests point at temporary files.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn daemon_release_moves_session_to_branch_memory() {
+        let _env = crate::util::test_env_lock();
+        // Other tests leave XDG_CONFIG_HOME pointing at their own (sometimes
+        // malformed) config; read defaults from an empty dir instead.
+        let xdg = std::env::temp_dir().join(format!("swamp-daemon-xdg-{}", std::process::id()));
+        // SAFETY: the crate test env lock serializes env changes.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        if !crate::worktree::test_support::git_available() {
+            return;
+        }
+        let (root, bare) = crate::worktree::test_support::setup();
+        let daemon = build_daemon(&bare).await;
+        let a = daemon.slot_alloc("remember-me", None, true).await.unwrap();
+        daemon
+            .apply_hook(&a.name, "idle", Some("Remember me"), Some("sess-1"), None)
+            .await
+            .unwrap();
+
+        daemon
+            .slot_release(Some(a.name.clone()), "/".into(), false, true, None)
+            .await
+            .unwrap();
+
+        assert!(!daemon.state.read().await.agents.contains_key(&a.name));
+        let mem = crate::slot_service::load_branches(&bare);
+        assert_eq!(mem["remember-me"].session_id.as_deref(), Some("sess-1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn make_row(name: &str) -> crate::daemon::state::WorktreeRow {
         crate::daemon::state::WorktreeRow {
             name: name.to_string(),
@@ -1011,6 +1159,9 @@ mod tests {
             removal_block: None,
             deleting: false,
             subagents: Vec::new(),
+            kind: Default::default(),
+            slot_state: None,
+            pin: None,
         }
     }
 

@@ -1,7 +1,8 @@
 use crate::config::Harness;
 use crate::github::PrSummary;
 use crate::util::now_unix;
-use crate::worktree::{self, GitInfo, RemoveRefusedReason, Worktree};
+use crate::worktree::slots;
+use crate::worktree::{self, GitInfo, RemoveRefusedReason, SlotState, Worktree, WorktreeKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -146,6 +147,16 @@ pub struct WorktreeRow {
     /// `#[serde(default)]` keeps an older peer's snapshot loadable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentRow>,
+    /// The worktree's role in the slot pool. An older peer's snapshot decodes
+    /// as `overflow`, which is how every worktree behaved before slots.
+    #[serde(default)]
+    pub kind: WorktreeKind,
+    /// Free, busy, or pinned, for slot rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_state: Option<SlotState>,
+    /// The pin reason of a pinned slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -580,7 +591,12 @@ impl DaemonState {
                 row
             })
             .collect();
-        rows.sort_by(|a, b| b.head_ts.cmp(&a.head_ts).then(a.name.cmp(&b.name)));
+        rows.sort_by(|a, b| {
+            idle_slot_key(a)
+                .cmp(&idle_slot_key(b))
+                .then(b.head_ts.cmp(&a.head_ts))
+                .then(a.name.cmp(&b.name))
+        });
         Snapshot {
             rows,
             default_known: !self.default_branch.is_empty(),
@@ -635,6 +651,17 @@ impl DaemonState {
         } else {
             Some(&self.prs)
         }
+    }
+}
+
+/// Sort key that moves free and pinned slots after every other row, in slot
+/// number order. Busy slots and other worktrees share the first group.
+fn idle_slot_key(row: &WorktreeRow) -> (bool, u32) {
+    match row.slot_state {
+        Some(SlotState::Free | SlotState::Pinned) => {
+            (true, slots::slot_number(&row.name).unwrap_or(u32::MAX))
+        }
+        _ => (false, 0),
     }
 }
 
@@ -701,7 +728,9 @@ pub fn scan_worktrees(
                     };
                     let name = wt.name();
                     let agent = agents.get(&name).cloned().unwrap_or_default();
-                    let row = build_row(wt, &info, &agent, default_branch);
+                    let pin =
+                        slots::slot_number(&name).and_then(|_| slots::read_pin(common_dir, &name));
+                    let row = build_row(wt, &info, &agent, default_branch, pin);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -724,13 +753,23 @@ fn build_row(
     info: &GitInfo,
     agent: &AgentRecord,
     default_branch: &str,
+    pin: Option<String>,
 ) -> WorktreeRow {
-    let branch = if info.branch.is_empty() || info.branch == "(detached)" {
+    let detached = info.branch == "(detached)";
+    let branch = if info.branch.is_empty() || detached {
         wt.branch.clone()
     } else {
         info.branch.clone()
     };
     let is_default = !default_branch.is_empty() && branch == default_branch;
+    let name = wt.name();
+    let kind = slots::worktree_kind(&name, &branch, default_branch);
+    let (slot_state, pin) = if kind == WorktreeKind::Slot {
+        let (state, pin) = slots::slot_state_from(detached, info, pin);
+        (Some(state), pin)
+    } else {
+        (None, None)
+    };
     WorktreeRow {
         name: wt.name(),
         path: wt.path.clone(),
@@ -757,6 +796,9 @@ fn build_row(
         deleting: false,
         // Projected from `DaemonState::subagents` by `snapshot()`.
         subagents: Vec::new(),
+        kind,
+        slot_state,
+        pin,
     }
 }
 
@@ -805,6 +847,9 @@ mod tests {
             removal_block: None,
             deleting: false,
             subagents: Vec::new(),
+            kind: Default::default(),
+            slot_state: None,
+            pin: None,
         }
     }
 
@@ -825,7 +870,7 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main");
+        let main = build_row(&worktree("main", "main"), &info_main, &agent, "main", None);
         assert!(main.is_default, "the default branch row must be flagged");
 
         let info_feat = GitInfo {
@@ -837,6 +882,7 @@ mod tests {
             &info_feat,
             &agent,
             "main",
+            None,
         );
         assert!(!feat.is_default, "a non-default row must not be flagged");
     }
@@ -850,7 +896,7 @@ mod tests {
             branch: "main".into(),
             ..Default::default()
         };
-        let row = build_row(&worktree("main", "main"), &info, &agent, "");
+        let row = build_row(&worktree("main", "main"), &info, &agent, "", None);
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
@@ -923,6 +969,81 @@ mod tests {
         let row: WorktreeRow = serde_json::from_value(json).unwrap();
         assert_eq!(row.removal_block, None);
         assert!(!row.deleting);
+        // Pre-slot peers decode as overflow worktrees with no slot state.
+        assert_eq!(row.kind, WorktreeKind::Overflow);
+        assert_eq!(row.slot_state, None);
+        assert_eq!(row.pin, None);
+    }
+
+    /// Slot rows carry their kind and state; a pin turns a free slot pinned.
+    #[test]
+    fn build_row_reports_slot_state() {
+        let agent = AgentRecord::default();
+        let detached = GitInfo {
+            branch: "(detached)".into(),
+            ..Default::default()
+        };
+        let free = build_row(
+            &worktree("work2", "detached@abc1234"),
+            &detached,
+            &agent,
+            "main",
+            None,
+        );
+        assert_eq!(free.kind, WorktreeKind::Slot);
+        assert_eq!(free.slot_state, Some(SlotState::Free));
+
+        let pinned = build_row(
+            &worktree("work3", "detached@abc1234"),
+            &detached,
+            &agent,
+            "main",
+            Some("review #172".into()),
+        );
+        assert_eq!(pinned.slot_state, Some(SlotState::Pinned));
+        assert_eq!(pinned.pin.as_deref(), Some("review #172"));
+
+        let on_branch = GitInfo {
+            branch: "fix-ci".into(),
+            ..Default::default()
+        };
+        let busy = build_row(
+            &worktree("work1", "fix-ci"),
+            &on_branch,
+            &agent,
+            "main",
+            None,
+        );
+        assert_eq!(busy.slot_state, Some(SlotState::Busy));
+
+        let overflow = build_row(
+            &worktree("spike", "spike"),
+            &on_branch,
+            &agent,
+            "main",
+            None,
+        );
+        assert_eq!(overflow.kind, WorktreeKind::Overflow);
+        assert_eq!(overflow.slot_state, None);
+    }
+
+    /// Busy rows sort by recency; free and pinned slots follow by number.
+    #[test]
+    fn snapshot_puts_idle_slots_last_by_number() {
+        let mut state = DaemonState::default();
+        let mut add = |name: &str, ts: u64, slot_state: Option<SlotState>| {
+            let mut row = make_row_with_ts(name, ts);
+            row.slot_state = slot_state;
+            state.rows.insert(name.to_string(), row);
+        };
+        add("work3", 50, Some(SlotState::Free));
+        add("work1", 10, Some(SlotState::Pinned));
+        add("work2", 30, Some(SlotState::Busy));
+        add("spike", 40, None);
+
+        let names: Vec<String> = state.snapshot().rows.into_iter().map(|r| r.name).collect();
+
+        assert_eq!(names, ["spike", "work2", "work1", "work3"]);
     }
 
     /// The deleting mark survives `apply_scanned_rows`, which replaces `rows`

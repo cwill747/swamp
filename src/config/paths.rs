@@ -138,10 +138,7 @@ pub(super) fn is_read_only(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_dir() -> PathBuf {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn ensure_configs_returns_expected_paths() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         // Point XDG_CONFIG_HOME at a temp dir so we don't pollute the real one.
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
@@ -192,7 +189,7 @@ mod tests {
 
     #[test]
     fn ensure_configs_idempotent() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         ensure_configs().unwrap();
@@ -203,7 +200,7 @@ mod tests {
 
     #[test]
     fn malformed_config_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let path = base.join("swamp").join("config.toml");
@@ -217,7 +214,7 @@ mod tests {
 
     #[test]
     fn invalid_logging_filter_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let path = base.join("swamp").join("config.toml");
@@ -231,7 +228,7 @@ mod tests {
 
     #[test]
     fn slots_pool_size_defaults_to_five() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let common = base.join("repo.git");
@@ -242,7 +239,7 @@ mod tests {
 
     #[test]
     fn repo_config_overrides_user_pool_size() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let user = base.join("swamp").join("config.toml");
@@ -257,7 +254,7 @@ mod tests {
 
     #[test]
     fn pool_size_zero_is_allowed() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let user = base.join("swamp").join("config.toml");
@@ -271,7 +268,7 @@ mod tests {
 
     #[test]
     fn malformed_repo_config_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::util::test_env_lock();
         let base = tmp_dir();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
         let common = base.join("repo.git");

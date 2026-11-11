@@ -36,7 +36,7 @@ Swamp already creates, removes, and updates worktrees with `git2`. It only borro
 ## Impact
 
 - Code: `src/worktree/*` (new slot module, overflow creation, clone), `src/daemon/*` (slot ops through the socket, a shared lock, snapshot fields), `src/hook.rs`, `src/config/*` (slot config, Claude worktree hooks), `src/tui/*` (titles, slot rows, tab lifecycle), `src/cli.rs`, `src/launch/layout.rs`.
-- State files: `.swamp-status.json` gains a per-branch memory map. New `<git-common-dir>/swamp/` holds pins, the lock file, and the per-repo config.
+- State files: new `<git-common-dir>/swamp/` holds branch memory (`branches.json`), pins, the lock file, and the per-repo config. `.swamp-status.json` keeps its format.
 - Compatibility: Existing branch-named worktrees keep working and show as overflow worktrees. Older swamp versions see slots as ordinary worktrees named `work<N>`.
 - External: The user's agent rules that tell agents to use `git wt` must change to `swamp slot`. That file is outside this repo.
 - No new dependencies.

@@ -49,8 +49,12 @@ Branch deletion uses a force delete, because a squash merge leaves the branch un
 ### D5: The TUI create path uses alloc
 The `c` picker keeps its UI. Its result goes to the slot allocator, not `create_worktree`. `create_worktree` and `create_worktree_from_base` become the overflow path and a "check out into an existing dir" variant for slots. The slot variant runs `checkout` in the existing worktree with `git2` (`set_head` plus `checkout_head`, with safe checkout), so ignored build output stays in place.
 
-### D6: Branch memory in the status file
-`.swamp-status.json` gains a top-level `branches` map: branch → `{session_id, session_name, harness, title}`. Release moves the fields from the slot record into this map. Alloc moves them back. The user title lives only in the branch map, because it always belongs to a branch. The hook keeps keying live status by worktree name, which stays correct: the live agent process belongs to the slot.
+### D6: Branch memory in its own file
+Branch memory lives in `<git-common-dir>/swamp/branches.json`: branch → `{session_id, session_name, harness, title}`. Release moves the fields from the slot's agent record into this map, and alloc moves them back. The user title lives only in the branch map, because it always belongs to a branch. The hook keeps keying live status by worktree name, which stays correct: the live agent process belongs to the slot.
+
+A top-level `branches` key in `.swamp-status.json` was rejected. That file is a flat map from worktree name to agent record, so an older swamp would read `branches` as a worktree, fail to parse the file, and start with no agent records.
+
+Slot operations return the agent-record edits instead of writing them. The daemon applies them to its in-memory map and persists. The CLI applies them to the status file when no daemon runs.
 
 ### D7: Lifecycle hooks are not in the repo
 Hooks come from `[slots.hooks]` in the user config and from the per-repo config in the common dir. A checked-in `.swamp.toml` (rift's model) was rejected for v1: a clone would then run commands that the repo author chose, which needs a trust prompt like direnv. Hooks run through `$SHELL -c` with stdout redirected to stderr, and with a timeout (default 5 minutes, configurable).

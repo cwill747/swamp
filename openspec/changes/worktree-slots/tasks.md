@@ -23,13 +23,13 @@ Each numbered group is one PR. Each PR passes `nix build`, `nix develop --comman
 
 ## 3. Daemon integration and branch memory (PR 3)
 
-- [ ] 3.1 Add slot operations to the daemon socket protocol, and take `flock` inside `repo_ops` for slot, create, and remove operations; verify a test that a CLI alloc and a daemon create do not get the same slot
-- [ ] 3.2 Make the CLI forward to the daemon when it answers, and fall back to in-process otherwise; verify tests for both paths
-- [ ] 3.3 Add the `branches` map to `.swamp-status.json` with serde defaults; verify that an old status file still decodes
-- [ ] 3.4 Move the session fields to branch memory on release and restore them on alloc; verify tests for the scenarios in spec Branch Memory
-- [ ] 3.5 Add agent safety on release (refuse when another slot's agent is working); verify a test
-- [ ] 3.6 Add the kind, slot state, and pin reason to `WorktreeRow` with serde defaults, and the new sort order; verify snapshot tests
-- [ ] 3.7 Route the TUI `c` picker through alloc; verify by a manual run in a scratch repo where `c` fills `work1`
+- [x] 3.1 Add slot operations to the daemon socket protocol, and take `flock` inside `repo_ops` for slot, create, and remove operations; verify a test that a CLI alloc and a daemon create do not get the same slot
+- [x] 3.2 Make the CLI forward to the daemon when it answers, and fall back to in-process otherwise; verify tests for both paths
+- [x] 3.3 Add branch memory in `<common>/swamp/branches.json` (not in `.swamp-status.json`, see design D6); verify that the status file stays a flat agent map and a missing or malformed branch file is empty
+- [x] 3.4 Move the session fields to branch memory on release and restore them on alloc; verify tests for the scenarios in spec Branch Memory
+- [x] 3.5 Add agent safety on release (refuse when another slot's agent is working); verify a test
+- [x] 3.6 Add the kind, slot state, and pin reason to `WorktreeRow` with serde defaults, and the new sort order; verify snapshot tests
+- [x] 3.7 Route the TUI `c` picker through alloc; verified with a daemon test (`create_worktree` fills a slot and races a CLI alloc safely) and a live scratch daemon. The `c` keypress itself was not run by hand
 
 ## 4. Lifecycle hooks (PR 4)
 

@@ -14,6 +14,7 @@ mod logging;
 mod overview;
 mod registry;
 mod slot_cmd;
+mod slot_service;
 mod tui;
 mod util;
 mod worktree;
@@ -55,7 +56,7 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::Forget(args)) => registry::run_forget(args.dir),
         Some(cli::Cmd::Logs(args)) => logging::show(args.dir, args.follow, args.all).await,
         Some(cli::Cmd::Init) => config::init(),
-        Some(cli::Cmd::Slot(args)) => slot_cmd::run(args),
+        Some(cli::Cmd::Slot(args)) => slot_cmd::run(args).await,
         Some(cli::Cmd::Clone(args)) => {
             let path = worktree::clone_repo(&args.url, args.dir.as_deref())?;
             println!("{}", path.display());

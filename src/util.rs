@@ -208,11 +208,18 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Serializes tests that change the `XDG_RUNTIME_DIR`, `XDG_CACHE_HOME`, or
-/// `HOME` environment variables. Every test module that changes them must
-/// hold this lock, because tests in one binary run in parallel.
+/// Serializes every test that changes or depends on process environment
+/// variables (`XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `HOME`, `SHELL`, ...).
+/// Every test module that changes them must hold this lock, because tests in
+/// one binary run in parallel.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`], ignoring poison from a failed test.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(test)]
 mod tests {
@@ -221,7 +228,7 @@ mod tests {
 
     #[test]
     fn runtime_base_dir_uses_xdg_runtime_dir() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_env_lock();
         let tmp = std::env::temp_dir().join(format!(
             "swamp-rbd-test-xdg-{}-{}",
             std::process::id(),
@@ -254,7 +261,7 @@ mod tests {
 
     #[test]
     fn runtime_base_dir_falls_back_to_xdg_cache_home() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_env_lock();
         let tmp = std::env::temp_dir().join(format!(
             "swamp-rbd-test-cache-{}-{}",
             std::process::id(),
@@ -282,7 +289,7 @@ mod tests {
 
     #[test]
     fn runtime_base_dir_falls_back_to_home() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_env_lock();
         let tmp = std::env::temp_dir().join(format!(
             "swamp-rbd-test-home-{}-{}",
             std::process::id(),
@@ -312,7 +319,7 @@ mod tests {
 
     #[test]
     fn runtime_base_dir_rejects_symlink() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_env_lock();
         let tmp = std::env::temp_dir().join(format!(
             "swamp-rbd-test-sym-{}-{}",
             std::process::id(),
