@@ -575,8 +575,9 @@ impl Daemon {
         // across this await — `agents` was cloned out above under a read
         // lock.
         let common = self.common_dir.clone();
-        let new_rows = tokio::task::spawn_blocking(move || {
-            crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)
+        let (new_rows, titles) = tokio::task::spawn_blocking(move || {
+            let rows = crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)?;
+            anyhow::Ok((rows, crate::slot_service::user_titles(&common)))
         })
         .await
         .context("git scan task")??;
@@ -585,6 +586,7 @@ impl Daemon {
         let snap = {
             let mut s = self.state.write().await;
             s.apply_scanned_rows(new_rows);
+            s.branch_titles = titles;
             s.snapshot()
         };
         let _ = self.tx.send(ServerMsg::Snapshot(snap));
@@ -811,6 +813,26 @@ impl Daemon {
         self.apply_agent_changes(&changes).await?;
         self.refresh_all_unlocked().await?;
         Ok(release)
+    }
+
+    /// Set or clear the user title of `branch` and broadcast the new snapshot.
+    pub async fn set_title(&self, branch: &str, title: Option<String>) -> Result<()> {
+        let common = self.common_dir.clone();
+        let b = branch.to_string();
+        let titles = tokio::task::spawn_blocking(move || {
+            crate::slot_service::set_title(&common, &b, title.as_deref())?;
+            anyhow::Ok(crate::slot_service::user_titles(&common))
+        })
+        .await
+        .context("set title task")??;
+        let snap = {
+            let mut s = self.state.write().await;
+            s.branch_titles = titles;
+            s.snapshot()
+        };
+        let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        tracing::info!(%branch, "set work title");
+        Ok(())
     }
 
     /// Apply agent-record edits from a slot operation and persist them.
@@ -1187,6 +1209,10 @@ mod tests {
             kind: Default::default(),
             slot_state: None,
             pin: None,
+            title: String::new(),
+            title_source: None,
+            head_subject: None,
+            openspec_change: None,
         }
     }
 

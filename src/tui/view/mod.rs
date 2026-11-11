@@ -137,6 +137,18 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
+    if let Some(InputMode::EditTitle { branch, text }) = &app.input {
+        let line = Line::from(vec![
+            Span::styled("Title for ", Theme::accent_bold()),
+            Span::styled(format!("'{branch}'"), Theme::accent_bold()),
+            Span::raw(": "),
+            Span::raw(text.clone()),
+            Span::styled("▏", Theme::accent_bold()),
+            Span::styled("  enter save · empty clears · esc cancel", Theme::muted()),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if let Some(msg) = &app.status_msg {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -181,7 +193,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
 fn footer_hint(view: TuiView) -> &'static str {
     match view {
         TuiView::All | TuiView::Worktrees => {
-            "j/k move · enter jump · c create · d delete · D delete tab · h harness · r refresh · u update · O overview · K kill · q quit"
+            "j/k move · enter jump · c create · d delete · D delete tab · t title · h harness · r refresh · u update · O overview · K kill · q quit"
         }
         TuiView::Resources => "j/k scroll · r refresh · q quit",
         TuiView::AiStatus => "dbl-click jump · r refresh · q quit",

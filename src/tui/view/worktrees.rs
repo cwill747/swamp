@@ -8,6 +8,7 @@ use crate::tui::AppState;
 use crate::tui::icons;
 use crate::tui::theme::Theme;
 use crate::util::{format_compact_age, now_unix, unix_to_systemtime};
+use crate::worktree::{SlotState, WorktreeKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -50,27 +51,29 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
         .collect();
 
     let compact_constraints = [
-        Constraint::Length(3), // # + caret
-        Constraint::Length(2), // agent icon
-        Constraint::Length(1), // PR icon
-        Constraint::Min(8),    // worktree name
-        Constraint::Min(10),   // branch
-        Constraint::Min(12),   // git
-        Constraint::Length(5), // age
-        Constraint::Length(1), // harness override (C/X)
+        Constraint::Length(3),  // # + caret
+        Constraint::Length(2),  // agent icon
+        Constraint::Length(1),  // PR icon
+        Constraint::Length(6),  // slot label (work<N>)
+        Constraint::Fill(3),    // work title: most of the spare width
+        Constraint::Fill(2),    // branch
+        Constraint::Length(12), // git
+        Constraint::Length(5),  // age
+        Constraint::Length(1),  // harness override (C/X)
     ];
     let expanded_constraints = [
-        Constraint::Length(3), // # + caret
-        Constraint::Length(2), // agent icon
-        Constraint::Length(2), // PR state icon
-        Constraint::Length(7), // #number
-        Constraint::Length(7), // checks
-        Constraint::Length(2), // review
-        Constraint::Min(8),    // worktree name
-        Constraint::Min(10),   // branch
-        Constraint::Min(10),   // git
-        Constraint::Length(5), // age
-        Constraint::Length(1), // harness override (C/X)
+        Constraint::Length(3),  // # + caret
+        Constraint::Length(2),  // agent icon
+        Constraint::Length(2),  // PR state icon
+        Constraint::Length(7),  // #number
+        Constraint::Length(7),  // checks
+        Constraint::Length(2),  // review
+        Constraint::Length(6),  // slot label (work<N>)
+        Constraint::Fill(3),    // work title: most of the spare width
+        Constraint::Fill(2),    // branch
+        Constraint::Length(10), // git
+        Constraint::Length(5),  // age
+        Constraint::Length(1),  // harness override (C/X)
     ];
     let table = Table::new(
         rows,
@@ -195,7 +198,13 @@ fn build_row<'a>(
     if r.deleting {
         name_style = name_style.fg(Theme::MUTED);
     }
-    let name_cell = Cell::from(Span::styled(&r.name, name_style));
+    // A free or pinned slot holds no work: mute its title and label.
+    let idle_slot = matches!(r.slot_state, Some(SlotState::Free | SlotState::Pinned));
+    if idle_slot {
+        name_style = name_style.fg(Theme::MUTED);
+    }
+    let name_cell = Cell::from(Span::styled(row_title(r), name_style));
+    let label_cell = Cell::from(Span::styled(row_label(r), Theme::muted()));
 
     let branch_color = if r.deleting {
         Theme::MUTED
@@ -204,7 +213,9 @@ fn build_row<'a>(
     } else {
         Theme::BRANCH
     };
-    let branch_cell = Cell::from(Span::styled(&r.branch, Style::default().fg(branch_color)));
+    // A free slot's `detached@<sha>` label is noise: it holds no branch.
+    let branch_text = if idle_slot { "" } else { r.branch.as_str() };
+    let branch_cell = Cell::from(Span::styled(branch_text, Style::default().fg(branch_color)));
 
     // A row being deleted replaces its git-status column with a spinner and
     // "deleting…", shared across every subscribed TUI via `WorktreeRow::deleting`
@@ -286,7 +297,14 @@ fn build_row<'a>(
         ));
     }
 
-    cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
+    cells.extend([
+        label_cell,
+        name_cell,
+        branch_cell,
+        git_cell,
+        age_cell,
+        harness_cell,
+    ]);
     let row = Row::new(cells);
     if ctx.selected == Some(i) {
         row.style(Theme::selected())
@@ -294,6 +312,26 @@ fn build_row<'a>(
         row.style(Theme::current())
     } else {
         row
+    }
+}
+
+/// The row's work title, or its worktree name when the daemon sent no title
+/// (an older daemon).
+fn row_title(r: &WorktreeRow) -> &str {
+    if r.title.is_empty() {
+        &r.name
+    } else {
+        &r.title
+    }
+}
+
+/// The short label column: the slot name for a slot, blank otherwise (an
+/// overflow worktree's name repeats its branch).
+fn row_label(r: &WorktreeRow) -> &str {
+    if r.kind == WorktreeKind::Slot {
+        &r.name
+    } else {
+        ""
     }
 }
 
@@ -415,6 +453,30 @@ mod tests {
             review: None,
             reviews_partial: false,
         }
+    }
+
+    fn row(name: &str, kind: WorktreeKind, title: &str) -> WorktreeRow {
+        let json = serde_json::json!({
+            "name": name, "path": format!("/r/{name}"), "branch": "b", "upstream": null,
+            "ahead": 0, "behind": 0, "staged": 0, "unstaged": 0, "untracked": 0,
+            "conflict": false, "rebase": false, "agent": "idle", "agent_ts": 0,
+            "kind": kind, "title": title,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn title_and_label_cells() {
+        let slot = row("work3", WorktreeKind::Slot, "Fix flaky CI retry logic");
+        assert_eq!(row_title(&slot), "Fix flaky CI retry logic");
+        assert_eq!(row_label(&slot), "work3");
+
+        let overflow = row("spike-x", WorktreeKind::Overflow, "Spike");
+        assert_eq!(row_label(&overflow), "");
+
+        // An older daemon sends no title: fall back to the worktree name.
+        let old = row("feature", WorktreeKind::Overflow, "");
+        assert_eq!(row_title(&old), "feature");
     }
 
     #[test]

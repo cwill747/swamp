@@ -161,6 +161,12 @@ pub enum Cmd {
     Slot(SlotArgs),
 
     #[command(
+        about = "Set the title of the current branch",
+        long_about = "Set the title that the dashboard shows for the branch checked out in the current worktree. The title follows the branch across slots. Without a user title, the dashboard uses the PR title, the Claude session name, the branch's openspec change, the last commit subject, or the branch name."
+    )]
+    Title(TitleArgs),
+
+    #[command(
         about = "Clone a repo into swamp's bare layout",
         long_about = "Clone a repository into swamp's bare layout: the git data in `.bare`, a `.git` file that points to it, and a worktree for the default branch. Prints the default branch worktree path on stdout."
     )]
@@ -171,6 +177,23 @@ pub enum Cmd {
         long_about = "Generate shell completions for swamp. Packagers should use this command to install completions from the exact binary they ship."
     )]
     Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+pub struct TitleArgs {
+    /// The title text.
+    #[arg(
+        value_name = "TEXT",
+        required_unless_present = "clear",
+        conflicts_with = "clear"
+    )]
+    pub text: Vec<String>,
+    /// Remove the user title.
+    #[arg(long)]
+    pub clear: bool,
+    /// Path inside the worktree (default: current directory).
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -456,6 +479,7 @@ mod tests {
         assert!(help.contains("register"));
         assert!(help.contains("forget"));
         assert!(!help.contains("aggregate"));
+        assert!(help.contains("title"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));

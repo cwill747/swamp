@@ -24,6 +24,7 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
 
     if let Some(commit) = head.as_ref().and_then(|h| h.peel_to_commit().ok()) {
         info.head_ts = commit.time().seconds().max(0) as u64;
+        info.head_subject = commit.summary().ok().flatten().map(String::from);
     }
 
     // Upstream tracking + ahead/behind.

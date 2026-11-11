@@ -67,6 +67,15 @@ pub enum ClientMsg {
         worktree: String,
         harness: Harness,
     },
+    /// Rescan worktrees without a fetch (for example, after a pin change that
+    /// the file watcher cannot see).
+    Rescan,
+    /// Set the user title of `branch`; `None` clears it.
+    SetTitle {
+        branch: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
     /// `swamp slot alloc`: allocate a worktree for `branch`.
     SlotAlloc {
         branch: String,
@@ -283,6 +292,26 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                                 write_msg(&mut stream, &reply).await?
                             }
                         }
+                    }
+                    ClientMsg::Rescan => {
+                        let reply = match daemon.refresh_all().await {
+                            Ok(()) => ServerMsg::Ok,
+                            Err(e) => ServerMsg::Err { message: format!("{e:#}") },
+                        };
+                        write_msg(&mut stream, &reply).await?;
+                    }
+                    ClientMsg::SetTitle { branch, title } => {
+                        if let Err(e) = validate_branch_name(&branch)
+                            .and_then(|_| validate_optional_field("title", title.as_deref(), 200))
+                        {
+                            write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
+                            continue;
+                        }
+                        let reply = match daemon.set_title(&branch, title).await {
+                            Ok(()) => ServerMsg::Ok,
+                            Err(e) => ServerMsg::Err { message: format!("{e:#}") },
+                        };
+                        write_msg(&mut stream, &reply).await?;
                     }
                     ClientMsg::SlotAlloc { branch, base, offline, no_hooks } => {
                         let reply = match daemon.slot_alloc(&branch, base, offline, no_hooks).await {
@@ -542,6 +571,10 @@ mod tests {
                     kind: Default::default(),
                     slot_state: None,
                     pin: None,
+                    title: String::new(),
+                    title_source: None,
+                    head_subject: None,
+                    openspec_change: None,
                 })
                 .collect(),
             default_known: true,
@@ -590,6 +623,11 @@ mod tests {
             ClientMsg::SetHarness {
                 worktree: "feature-x".into(),
                 harness: Harness::Codex,
+            },
+            ClientMsg::Rescan,
+            ClientMsg::SetTitle {
+                branch: "parser-fix".into(),
+                title: Some("Parser fix".into()),
             },
             ClientMsg::SlotAlloc {
                 branch: "parser-fix".into(),

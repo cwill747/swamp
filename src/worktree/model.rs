@@ -91,6 +91,8 @@ pub struct GitInfo {
     pub conflict: bool,
     pub rebase: bool,
     pub head_ts: u64,
+    /// First line of the `HEAD` commit message.
+    pub head_subject: Option<String>,
 }
 
 impl GitInfo {

@@ -129,6 +129,39 @@ pub async fn run(args: SlotArgs) -> Result<()> {
     }
 }
 
+/// `swamp title`: set or clear the user title of the branch checked out in the
+/// worktree that contains `dir` (default: the current directory).
+pub async fn title(dir: Option<PathBuf>, text: Vec<String>, clear: bool) -> Result<()> {
+    let cwd = dir.unwrap_or(std::env::current_dir()?);
+    let common = git_common_dir(&cwd).context("not inside a git repo")?;
+    let wt = slots::resolve_target(&common, None, &cwd)?;
+    let branch = slots::checked_out_branch(&wt.path)
+        .with_context(|| format!("{} has no branch checked out (detached HEAD)", wt.name()))?;
+    let title = (!clear)
+        .then(|| text.join(" "))
+        .filter(|t| !t.trim().is_empty());
+    if title.is_none() && !clear {
+        anyhow::bail!("give a title, or pass --clear");
+    }
+    if let Some(mut stream) = connect_daemon(&common).await {
+        let msg = ClientMsg::SetTitle {
+            branch: branch.clone(),
+            title: title.clone(),
+        };
+        match request(&mut stream, &msg, BASE_REPLY_TIMEOUT).await? {
+            ServerMsg::Ok => {}
+            other => return Err(reply_error(other)),
+        }
+    } else {
+        slot_service::set_title(&common, &branch, title.as_deref())?;
+    }
+    match title {
+        Some(t) => eprintln!("swamp: {branch} is now titled \"{t}\""),
+        None => eprintln!("swamp: cleared the title of {branch}"),
+    }
+    Ok(())
+}
+
 /// Allocate through the daemon when one answers, so it updates its agent
 /// records and broadcasts the change; otherwise allocate in-process and edit
 /// the status file.
@@ -284,7 +317,7 @@ fn reply_error(reply: ServerMsg) -> anyhow::Error {
 /// effort: without a daemon there is nothing to refresh.
 async fn refresh_daemon(common: &Path) {
     if let Some(mut stream) = connect_daemon(common).await
-        && let Err(e) = request(&mut stream, &ClientMsg::Refresh, BASE_REPLY_TIMEOUT).await
+        && let Err(e) = request(&mut stream, &ClientMsg::Rescan, BASE_REPLY_TIMEOUT).await
     {
         tracing::debug!("daemon refresh after pin change failed: {e:#}");
     }

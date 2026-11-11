@@ -135,7 +135,11 @@ pub(super) fn handle_mouse(
     }
     if matches!(
         app.input,
-        Some(InputMode::ConfirmDelete { .. } | InputMode::PickHarness { .. })
+        Some(
+            InputMode::ConfirmDelete { .. }
+                | InputMode::PickHarness { .. }
+                | InputMode::EditTitle { .. }
+        )
     ) {
         // Swallow all mouse input while a footer prompt is open, but only a real
         // click dismisses it. Mouse capture enables motion reporting (xterm mode
@@ -253,6 +257,32 @@ fn spawn_relaunch_tab(name: &str, path: &std::path::Path) {
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn();
+}
+
+/// Handle the `t` key on the worktrees pane: open the title prompt for the
+/// selected row's branch, prefilled with its current title. A row with no
+/// branch (a free or pinned slot, or a detached worktree) has nothing to title.
+pub(super) fn handle_title_key(app: &mut AppState) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let detached = row.branch.starts_with("detached@")
+        || matches!(
+            row.slot_state,
+            Some(crate::worktree::SlotState::Free | crate::worktree::SlotState::Pinned)
+        );
+    if detached {
+        app.status_msg = Some(format!("{} has no branch to title", row.name));
+        return;
+    }
+    let text = if row.title == row.branch {
+        String::new()
+    } else {
+        row.title.clone()
+    };
+    let branch = row.branch.clone();
+    app.status_msg = None;
+    app.input = Some(InputMode::EditTitle { branch, text });
 }
 
 /// Handle the `d` key on the worktrees pane: open the delete confirmation for
@@ -475,6 +505,42 @@ pub(super) fn handle_input_key(
                 });
             }
             _ => {} // n / Esc / anything else cancels
+        },
+        InputMode::EditTitle { branch, mut text } => match k.code {
+            KeyCode::Enter => {
+                let title = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+                app.status_msg = Some(match &title {
+                    Some(t) => format!("{branch} → \"{t}\""),
+                    None => format!("cleared the title of {branch}"),
+                });
+                let tx = tx.clone();
+                let common = common.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        send_action(&common, ClientMsg::SetTitle { branch, title }, tx.clone())
+                            .await
+                    {
+                        let _ = tx.send(AppEvent::ActionError(e.to_string())).await;
+                    }
+                });
+            }
+            KeyCode::Esc => {}
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input = Some(InputMode::EditTitle {
+                    branch,
+                    text: String::new(),
+                });
+            }
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Backspace => {
+                text.pop();
+                app.input = Some(InputMode::EditTitle { branch, text });
+            }
+            KeyCode::Char(c) if text.chars().count() < 200 => {
+                text.push(c);
+                app.input = Some(InputMode::EditTitle { branch, text });
+            }
+            _ => app.input = Some(InputMode::EditTitle { branch, text }),
         },
         InputMode::PickHarness { name } => {
             let harness = match k.code {
@@ -752,6 +818,10 @@ mod tests {
             kind: Default::default(),
             slot_state: None,
             pin: None,
+            title: String::new(),
+            title_source: None,
+            head_subject: None,
+            openspec_change: None,
         }
     }
 
@@ -799,6 +869,57 @@ mod tests {
         assert_eq!(app.status_msg.as_deref(), Some(OVERVIEW_NEEDS_ZELLIJ));
         drop(tx);
         assert!(rx.recv().await.is_none(), "no background work was started");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// `t` opens the title prompt for the row's branch; typing edits it,
+    /// Ctrl-U clears it, and Esc cancels without a request.
+    #[test]
+    fn title_prompt_edits_text_and_cancels() {
+        let mut r = row("work1", None, false);
+        r.branch = "fix-ci".into();
+        r.title = "Fix CI".into();
+        let mut app = app_with_row(r);
+        let (tx, _rx) = mpsc::channel(4);
+        let common = std::path::Path::new("/nonexistent");
+
+        handle_title_key(&mut app);
+        let press = |app: &mut AppState, k: KeyEvent| {
+            let mode = app.input.take().expect("prompt open");
+            handle_input_key(app, mode, k, &tx, common);
+        };
+        press(&mut app, key(KeyCode::Char('!')));
+        press(&mut app, key(KeyCode::Backspace));
+        press(&mut app, key(KeyCode::Char('s')));
+        match &app.input {
+            Some(InputMode::EditTitle { branch, text }) => {
+                assert_eq!((branch.as_str(), text.as_str()), ("fix-ci", "Fix CIs"));
+            }
+            _ => panic!("title prompt should stay open"),
+        }
+        press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(&app.input, Some(InputMode::EditTitle { text, .. }) if text.is_empty()));
+        press(&mut app, key(KeyCode::Esc));
+        assert!(app.input.is_none());
+    }
+
+    /// A free slot has no branch, so `t` reports that instead of prompting.
+    #[test]
+    fn title_key_refuses_free_slot() {
+        let mut r = row("work2", None, false);
+        r.slot_state = Some(crate::worktree::SlotState::Free);
+        let mut app = app_with_row(r);
+
+        handle_title_key(&mut app);
+
+        assert!(app.input.is_none());
+        assert!(app.status_msg.as_deref().unwrap().contains("no branch"));
     }
 
     /// Pressing `d` on a row carrying a blocking reason opens the confirmation
