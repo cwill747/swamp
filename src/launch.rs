@@ -82,6 +82,9 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
     let common = git_common_dir(&git_dir);
     if let Ok(ref c) = common {
         crate::logging::init(c, false, false, &cfg.logging);
+        // Record the repo before the session starts or attaches, so that it
+        // stays listed after `swamp kill`.
+        crate::registry::record_launch(c);
     }
     let session = common
         .as_deref()

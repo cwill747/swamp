@@ -63,14 +63,14 @@ fn acquire_startup_lock(common_dir: &Path) -> Result<std::fs::File> {
 
 /// Open (or create) `path` and take an exclusive `flock(2)` on it, retrying
 /// briefly on contention. The returned `File` holds the lock until dropped.
-fn flock_exclusive(path: &Path) -> Result<std::fs::File> {
+pub(crate) fn flock_exclusive(path: &Path) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
-        .with_context(|| format!("open startup lock {}", path.display()))?;
+        .with_context(|| format!("open lock file {}", path.display()))?;
     // LOCK_EX | LOCK_NB: fail immediately if another process holds it, then
     // retry in a short loop so we tolerate brief contention without spinning.
     // We cap retries so a truly stuck holder doesn't park us forever.
@@ -84,7 +84,7 @@ fn flock_exclusive(path: &Path) -> Result<std::fs::File> {
         }
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::WouldBlock || waited_ms >= 5_000 {
-            return Err(err).context("flock startup lock");
+            return Err(err).context("flock lock file");
         }
         std::thread::sleep(Duration::from_millis(50));
         waited_ms += 50;
@@ -964,6 +964,113 @@ mod tests {
             deleting: false,
             subagents: Vec::new(),
         }
+    }
+
+    /// Write one protocol frame with an arbitrary JSON payload, so a test can
+    /// send a request type that `ClientMsg` does not define.
+    async fn write_raw_request(stream: &mut tokio::net::UnixStream, json: &str) {
+        use tokio::io::AsyncWriteExt;
+        let len = (4 + json.len()) as u32;
+        stream.write_all(&len.to_be_bytes()).await.unwrap();
+        stream.write_all(b"SWP1").await.unwrap();
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// `GetInfo` needs no subscription, and a later `Subscribe` on the same
+    /// connection still delivers the three initial snapshots.
+    #[tokio::test]
+    async fn get_info_then_subscribe_on_one_connection() {
+        use crate::daemon::socket::{ClientMsg, read_server_msg, write_client_msg};
+
+        if !git_available() {
+            return;
+        }
+        let repo = git_init_repo();
+        let common = repo.join(".git");
+        let daemon = build_daemon(&common).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(socket::handle_client(daemon.clone(), server));
+
+        write_client_msg(&mut client, &ClientMsg::GetInfo)
+            .await
+            .unwrap();
+        match read_server_msg(&mut client).await.unwrap().unwrap() {
+            ServerMsg::Info {
+                common_dir,
+                session_name,
+                version,
+            } => {
+                assert_eq!(common_dir, common);
+                assert_eq!(session_name, "test");
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+
+        write_client_msg(&mut client, &ClientMsg::Subscribe)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut client).await.unwrap().unwrap(),
+            ServerMsg::Snapshot(_)
+        ));
+        assert!(matches!(
+            read_server_msg(&mut client).await.unwrap().unwrap(),
+            ServerMsg::Resources(_)
+        ));
+        assert!(matches!(
+            read_server_msg(&mut client).await.unwrap().unwrap(),
+            ServerMsg::PrStatus(_)
+        ));
+
+        drop(client);
+        task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A request type from a newer client gets an error reply. The connection
+    /// stays usable, and a second client is not affected.
+    #[tokio::test]
+    async fn unknown_request_gets_error_and_daemon_keeps_serving() {
+        use crate::daemon::socket::{ClientMsg, read_server_msg, write_client_msg};
+
+        if !git_available() {
+            return;
+        }
+        let repo = git_init_repo();
+        let daemon = build_daemon(&repo.join(".git")).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(socket::handle_client(daemon.clone(), server));
+
+        write_raw_request(&mut client, r#"{"type":"from_the_future","x":1}"#).await;
+        assert!(matches!(
+            read_server_msg(&mut client).await.unwrap().unwrap(),
+            ServerMsg::Err { .. }
+        ));
+        write_client_msg(&mut client, &ClientMsg::Ping)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut client).await.unwrap().unwrap(),
+            ServerMsg::Pong
+        ));
+
+        let (mut second, server2) = tokio::net::UnixStream::pair().unwrap();
+        let task2 = tokio::spawn(socket::handle_client(daemon.clone(), server2));
+        write_client_msg(&mut second, &ClientMsg::Ping)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_server_msg(&mut second).await.unwrap().unwrap(),
+            ServerMsg::Pong
+        ));
+
+        drop(client);
+        drop(second);
+        task.await.unwrap().unwrap();
+        task2.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// Dropping a `DeletingGuard` without calling `clear`/`disarm` — the shape

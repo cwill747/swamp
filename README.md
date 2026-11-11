@@ -287,6 +287,34 @@ app/
 swamp creates and removes worktrees in this layout itself. You do not need
 another worktree tool.
 
+### `swamp register`
+
+Records a repo in swamp's registry without a launch. `swamp launch` records the
+repo automatically, so you need this command only for a repo that swamp has not
+launched since the registry was added:
+
+```bash
+swamp register
+swamp register ~/code/myproject
+swamp register --all-live
+```
+
+`--all-live` records every repo that has a running daemon, including a daemon
+from an older swamp version. The command does not start, stop, or restart a
+daemon or a session.
+
+### `swamp forget`
+
+Removes a repo from the registry. The repo's daemon and Zellij session keep
+running:
+
+```bash
+swamp forget
+swamp forget ~/code/myproject
+```
+
+`swamp kill` stops a session but keeps the repo registered.
+
 ### `swamp completions`
 
 Prints shell completions:
@@ -326,6 +354,7 @@ TUI with `h`.
 | `$XDG_CONFIG_HOME/swamp/config.toml`  | User settings                        |
 | `$XDG_CONFIG_HOME/swamp/lazygit.yml`  | Managed lazygit config               |
 | `<git-common-dir>/.swamp-status.json` | Per-worktree agent status            |
+| `$XDG_STATE_HOME/swamp/repos.json`    | Registry of repos swamp has launched |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`     | Daemon PID file                      |
 
