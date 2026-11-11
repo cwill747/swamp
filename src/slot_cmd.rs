@@ -24,8 +24,13 @@ pub async fn run(args: SlotArgs) -> Result<()> {
     let common = git_common_dir(&start).context("not inside a git repo")?;
 
     match args.command {
-        SlotCmd::Alloc { branch, offline } => {
-            let a = alloc(&common, branch, offline).await?;
+        SlotCmd::Alloc {
+            branch,
+            offline,
+            no_hooks,
+        } => {
+            let a = alloc(&common, branch, offline, no_hooks).await?;
+            crate::slot_hooks::print_runs("post-alloc", &a.hooks);
             for w in &a.warnings {
                 eprintln!("swamp: {w}");
             }
@@ -41,8 +46,10 @@ pub async fn run(args: SlotArgs) -> Result<()> {
             target,
             force,
             offline,
+            no_hooks,
         } => {
-            let r = release(&common, target, start, force, offline).await?;
+            let r = release(&common, target, start, force, offline, no_hooks).await?;
+            crate::slot_hooks::print_runs("pre-release", &r.hooks);
             if args.json {
                 println!("{}", serde_json::to_string(&r)?);
             } else {
@@ -82,12 +89,18 @@ pub async fn run(args: SlotArgs) -> Result<()> {
 /// Allocate through the daemon when one answers, so it updates its agent
 /// records and broadcasts the change; otherwise allocate in-process and edit
 /// the status file.
-pub async fn alloc(common: &Path, branch: String, offline: bool) -> Result<Allocation> {
+pub async fn alloc(
+    common: &Path,
+    branch: String,
+    offline: bool,
+    no_hooks: bool,
+) -> Result<Allocation> {
     if let Some(mut stream) = connect_daemon(common).await {
         let msg = ClientMsg::SlotAlloc {
             branch,
             base: None,
             offline,
+            no_hooks,
         };
         return match request(&mut stream, &msg).await? {
             ServerMsg::SlotAllocated { allocation } => Ok(allocation),
@@ -96,11 +109,17 @@ pub async fn alloc(common: &Path, branch: String, offline: bool) -> Result<Alloc
     }
     let common = common.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        let cfg = config::slots_config(&common)?;
         let opts = AllocOptions {
             fetch: !offline,
-            ..AllocOptions::pool(config::slots_config(&common)?.pool_size)
+            ..AllocOptions::pool(cfg.pool_size)
         };
-        slot_service::alloc_with_status_file(&common, &branch, &opts)
+        let hooks = if no_hooks {
+            &[][..]
+        } else {
+            &cfg.hooks.post_alloc[..]
+        };
+        slot_service::alloc_with_status_file(&common, &branch, &opts, hooks)
     })
     .await?
 }
@@ -114,6 +133,7 @@ pub async fn release(
     cwd: PathBuf,
     force: bool,
     offline: bool,
+    no_hooks: bool,
 ) -> Result<Release> {
     let pr = if offline {
         None
@@ -130,6 +150,7 @@ pub async fn release(
             cwd,
             force,
             offline,
+            no_hooks,
             pr,
         };
         return match request(&mut stream, &msg).await? {
@@ -144,7 +165,13 @@ pub async fn release(
             fetch: !offline,
             pr,
         };
-        slot_service::release_with_status_file(&common, target.as_deref(), &cwd, &opts)
+        let cfg = config::slots_config(&common)?;
+        let hooks = if no_hooks {
+            &[][..]
+        } else {
+            &cfg.hooks.pre_release[..]
+        };
+        slot_service::release_with_status_file(&common, target.as_deref(), &cwd, &opts, hooks)
     })
     .await?
 }

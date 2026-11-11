@@ -14,6 +14,7 @@ mod logging;
 mod overview;
 mod registry;
 mod slot_cmd;
+mod slot_hooks;
 mod slot_service;
 mod tui;
 mod util;

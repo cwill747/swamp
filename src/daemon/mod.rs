@@ -706,12 +706,14 @@ impl Daemon {
     /// The TUI create action: put `branch` into a free slot, or an overflow
     /// worktree when the pool is full.
     pub async fn create_worktree(&self, branch: &str) -> Result<()> {
-        self.slot_alloc(branch, None, false).await.map(|_| ())
+        self.slot_alloc(branch, None, false, false)
+            .await
+            .map(|_| ())
     }
 
     /// The TUI create action for a new `branch` cut from `base`.
     pub async fn create_worktree_from_base(&self, branch: &str, base: &str) -> Result<()> {
-        self.slot_alloc(branch, Some(base.to_string()), false)
+        self.slot_alloc(branch, Some(base.to_string()), false, false)
             .await
             .map(|_| ())
     }
@@ -723,17 +725,24 @@ impl Daemon {
         branch: &str,
         base: Option<String>,
         offline: bool,
+        no_hooks: bool,
     ) -> Result<crate::worktree::slots::Allocation> {
         let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let branch = branch.to_string();
         let (allocation, changes) = tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::slots_config(&common)?;
             let opts = crate::worktree::slots::AllocOptions {
-                pool_size: crate::config::slots_config(&common)?.pool_size,
+                pool_size: cfg.pool_size,
                 fetch: !offline,
                 base,
             };
-            crate::slot_service::alloc(&common, &branch, &opts)
+            let hooks = if no_hooks {
+                &[][..]
+            } else {
+                &cfg.hooks.post_alloc[..]
+            };
+            crate::slot_service::alloc(&common, &branch, &opts, hooks)
         })
         .await
         .context("slot alloc task")??;
@@ -758,6 +767,7 @@ impl Daemon {
         cwd: PathBuf,
         force: bool,
         offline: bool,
+        no_hooks: bool,
         pr: Option<crate::worktree::slots::PrFacts>,
     ) -> Result<crate::worktree::slots::Release> {
         let _repo = self.repo_ops.lock().await;
@@ -787,7 +797,13 @@ impl Daemon {
                 fetch: !offline,
                 pr,
             };
-            crate::slot_service::release(&common, target.as_deref(), &cwd, &opts, &agents)
+            let cfg = crate::config::slots_config(&common)?;
+            let hooks = if no_hooks {
+                &[][..]
+            } else {
+                &cfg.hooks.pre_release[..]
+            };
+            crate::slot_service::release(&common, target.as_deref(), &cwd, &opts, &agents, hooks)
         })
         .await
         .context("slot release task")??;
@@ -1089,7 +1105,7 @@ mod tests {
 
         let cli = tokio::task::spawn_blocking(move || {
             let opts = crate::worktree::slots::AllocOptions::pool(5);
-            crate::slot_service::alloc(&cli_common, "from-cli", &opts)
+            crate::slot_service::alloc(&cli_common, "from-cli", &opts, &[])
                 .unwrap()
                 .0
                 .path
@@ -1125,14 +1141,17 @@ mod tests {
         }
         let (root, bare) = crate::worktree::test_support::setup();
         let daemon = build_daemon(&bare).await;
-        let a = daemon.slot_alloc("remember-me", None, true).await.unwrap();
+        let a = daemon
+            .slot_alloc("remember-me", None, true, false)
+            .await
+            .unwrap();
         daemon
             .apply_hook(&a.name, "idle", Some("Remember me"), Some("sess-1"), None)
             .await
             .unwrap();
 
         daemon
-            .slot_release(Some(a.name.clone()), "/".into(), false, true, None)
+            .slot_release(Some(a.name.clone()), "/".into(), false, true, false, None)
             .await
             .unwrap();
 

@@ -191,6 +191,9 @@ pub enum SlotCmd {
         /// Skip the fetch of the default remote.
         #[arg(long)]
         offline: bool,
+        /// Skip the `post-alloc` hooks.
+        #[arg(long)]
+        no_hooks: bool,
     },
     /// Detach a slot so it returns to the pool.
     #[command(
@@ -206,6 +209,9 @@ pub enum SlotCmd {
         /// Skip the fetch and the PR lookup.
         #[arg(long)]
         offline: bool,
+        /// Skip the `pre-release` hooks.
+        #[arg(long)]
+        no_hooks: bool,
     },
     /// Hold a free slot so allocation skips it.
     Pin {

@@ -57,7 +57,11 @@ A top-level `branches` key in `.swamp-status.json` was rejected. That file is a 
 Slot operations return the agent-record edits instead of writing them. The daemon applies them to its in-memory map and persists. The CLI applies them to the status file when no daemon runs.
 
 ### D7: Lifecycle hooks are not in the repo
-Hooks come from `[slots.hooks]` in the user config and from the per-repo config in the common dir. A checked-in `.swamp.toml` (rift's model) was rejected for v1: a clone would then run commands that the repo author chose, which needs a trust prompt like direnv. Hooks run through `$SHELL -c` with stdout redirected to stderr, and with a timeout (default 5 minutes, configurable).
+Hooks come from `[slots.hooks]` in the user config and from the per-repo config in the common dir. A checked-in `.swamp.toml` (rift's model) was rejected for v1: a clone would then run commands that the repo author chose, which needs a trust prompt like direnv. Hooks run through `sh -c`, not `$SHELL -c`: a hook line then means the same thing for a fish user and a bash user. Each hook has a time limit (default 300 seconds, `timeout_secs` per hook). Each hook runs in its own process group, so a timeout kills everything the hook started.
+
+Swamp captures a hook's stdout and stderr together and returns them in the alloc or release result, instead of printing them. A hook can run inside the daemon, whose stderr is the diagnostic log. The CLI prints the captured output on its stderr, so stdout keeps only the path. The cost is that output appears when the hook ends, not while it runs.
+
+Hooks stop at the first failure. `post-alloc` hooks run after the slot lock is released, so a slow setup command does not block other allocations. `pre-release` hooks run under the lock, after every release check passes and right before the detach. A refused release therefore never runs them.
 
 ```toml
 [[slots.hooks.pre-release]]

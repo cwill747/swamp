@@ -21,14 +21,51 @@ pub const DEFAULT_POOL_SIZE: u32 = 5;
 #[serde(default)]
 pub struct SlotsConfig {
     pub pool_size: u32,
+    pub hooks: SlotHooks,
 }
 
 impl Default for SlotsConfig {
     fn default() -> Self {
         Self {
             pool_size: DEFAULT_POOL_SIZE,
+            hooks: SlotHooks::default(),
         }
     }
+}
+
+/// Commands that swamp runs around slot allocation and release.
+///
+/// ```toml
+/// [[slots.hooks.pre-release]]
+/// run = "bazel shutdown"
+///
+/// [[slots.hooks.post-alloc]]
+/// run = "direnv allow"
+/// timeout_secs = 60
+/// ```
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SlotHooks {
+    /// Run in the worktree after an allocation checks a branch out.
+    #[serde(rename = "post-alloc")]
+    pub post_alloc: Vec<HookCommand>,
+    /// Run in the slot before a release detaches it.
+    #[serde(rename = "pre-release")]
+    pub pre_release: Vec<HookCommand>,
+}
+
+/// Default time limit for one hook command.
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookCommand {
+    /// Shell command, run with `sh -c`.
+    pub run: String,
+    /// Time limit in seconds (default 300). Swamp kills the command's process
+    /// group when the limit passes.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// The per-repository config at `<git-common-dir>/swamp/config.toml`. Each
@@ -43,14 +80,23 @@ pub struct RepoConfig {
 #[serde(default)]
 pub struct RepoSlotsConfig {
     pub pool_size: Option<u32>,
+    pub hooks: SlotHooks,
 }
 
 impl SlotsConfig {
-    /// Apply a per-repository override on top of the user setting.
+    /// Apply a per-repository config on top of the user setting. A set
+    /// `pool_size` replaces the user value. Hooks add up: user hooks run
+    /// first, then the repository's.
     pub fn merged_with(mut self, repo: &RepoSlotsConfig) -> Self {
         if let Some(size) = repo.pool_size {
             self.pool_size = size;
         }
+        self.hooks
+            .post_alloc
+            .extend(repo.hooks.post_alloc.iter().cloned());
+        self.hooks
+            .pre_release
+            .extend(repo.hooks.pre_release.iter().cloned());
         self
     }
 }

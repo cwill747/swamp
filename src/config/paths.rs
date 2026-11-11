@@ -278,4 +278,44 @@ mod tests {
         let err = slots_config(&common).unwrap_err();
         assert!(err.to_string().contains("parse"), "{err}");
     }
+
+    #[test]
+    fn slot_hooks_run_user_first_then_repo() {
+        let _guard = crate::util::test_env_lock();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let user = base.join("swamp").join("config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(
+            &user,
+            "[[slots.hooks.pre-release]]\nrun = \"bazel shutdown\"\n",
+        )
+        .unwrap();
+        let common = base.join("repo.git");
+        fs::create_dir_all(common.join("swamp")).unwrap();
+        fs::write(
+            repo_config_path(&common),
+            "[[slots.hooks.pre-release]]\nrun = \"./cleanup.sh\"\ntimeout_secs = 10\n\n[[slots.hooks.post-alloc]]\nrun = \"direnv allow\"\n",
+        )
+        .unwrap();
+
+        let hooks = slots_config(&common).unwrap().hooks;
+
+        let pre: Vec<_> = hooks.pre_release.iter().map(|h| h.run.as_str()).collect();
+        assert_eq!(pre, ["bazel shutdown", "./cleanup.sh"]);
+        assert_eq!(hooks.pre_release[1].timeout_secs, Some(10));
+        assert_eq!(hooks.post_alloc[0].run, "direnv allow");
+    }
+
+    #[test]
+    fn unknown_hook_event_is_rejected() {
+        let _guard = crate::util::test_env_lock();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let user = base.join("swamp").join("config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(&user, "[[slots.hooks.post-release]]\nrun = \"x\"\n").unwrap();
+
+        assert!(load_config().is_err());
+    }
 }
