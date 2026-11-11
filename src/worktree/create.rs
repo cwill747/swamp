@@ -68,7 +68,7 @@ fn remote_tracking_branch_oid(
 ///
 /// Reuses an existing local branch; otherwise creates it from the matching
 /// remote-tracking branch, the default branch, or HEAD. The worktree dir is a
-/// sibling of `.bare` named after the branch (git-wt layout). `common_dir` must
+/// sibling of `.bare` named after the branch (bare layout). `common_dir` must
 /// point at the bare/common git dir. Adapted from git-workon-lib's
 /// `add_worktree` (Normal-branch path only).
 pub fn create_worktree(common_dir: &Path, branch: &str) -> Result<Worktree> {

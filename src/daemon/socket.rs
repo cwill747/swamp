@@ -26,8 +26,7 @@ pub enum ClientMsg {
     },
     GetVersion,
     Refresh,
-    /// Fetch all remotes and fast-forward the default branch in its worktree —
-    /// the equivalent of the old `git wt update`.
+    /// Fetch all remotes and fast-forward the default branch in its worktree.
     UpdateDefault,
     ListBranches,
     CreateWorktree {

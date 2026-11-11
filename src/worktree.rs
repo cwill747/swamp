@@ -9,6 +9,7 @@
 // deliberately stays a subprocess (it needs the user's credential/SSH setup).
 
 mod branches;
+mod clone;
 mod create;
 mod model;
 mod remove;
@@ -18,6 +19,7 @@ mod status;
 pub use branches::{
     default_branch, default_worktree_path, find_default_worktree, list_branches, list_worktrees,
 };
+pub use clone::clone_repo;
 pub use create::{create_worktree, create_worktree_from_base};
 pub use model::{
     BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, Worktree,
@@ -48,7 +50,7 @@ pub(crate) mod test_support {
         assert!(ok, "git {args:?} failed in {}", dir.display());
     }
 
-    /// Build a git-wt style layout: `root/.bare` (bare repo) with branch `main`
+    /// Build swamp's bare layout: `root/.bare` (bare repo) with branch `main`
     /// committed, and `root/.git` linking to it. Returns `(root, bare_dir)`.
     pub(crate) fn setup() -> (PathBuf, PathBuf) {
         let nanos = std::time::SystemTime::now()

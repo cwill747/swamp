@@ -587,8 +587,7 @@ impl Daemon {
     }
 
     /// Fetch all remotes and fast-forward the default branch in its worktree,
-    /// the equivalent of the old `git wt update`, then broadcast the refreshed
-    /// snapshot.
+    /// then broadcast the refreshed snapshot.
     pub async fn update_default(&self) -> Result<()> {
         let _repo = self.repo_ops.lock().await;
         tracing::info!(
@@ -614,7 +613,7 @@ impl Daemon {
 
         // Fast-forward the default branch in its worktree (if it's checked out).
         // Merge the remote-tracking ref explicitly rather than `@{u}`: in a
-        // bare/git-wt layout the default branch often has no upstream
+        // bare layout the default branch often has no upstream
         // configured, which would make `@{u}` fail with "no upstream
         // configured".
         let common = self.common_dir.clone();

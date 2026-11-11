@@ -9,7 +9,7 @@ use std::time::Instant;
 /// An active prompt that captures keystrokes instead of the normal navigation
 /// keys.
 pub enum InputMode {
-    /// The git-wt-style create picker (centered modal overlay).
+    /// The create picker (centered modal overlay).
     Create(CreatePicker),
     /// Confirming deletion of the named worktree. `force_reason` is set when
     /// an on-demand daemon check refuses non-forced removal; it contains the
