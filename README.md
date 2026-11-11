@@ -319,8 +319,12 @@ Registered repos with no running session are listed under **Not running**.
 | `k` / `↑`     | Move selection up                                          |
 | `g` / `G`     | Select the first or the last row                           |
 | `Enter`       | Go to the session and tab of the selected worktree, or launch the selected repo |
+| `U`           | Update the default branch of each running repo             |
 | `r`           | Reload the registry and refresh the status of each repo    |
 | `q`           | Quit. This ends the `swamp-overview` session only          |
+
+`U` does not start a repo that is not running. The footer shows how many repos
+were updated and names each repo that failed.
 
 `Enter` moves your Zellij client to the repo session. It does not nest that
 session in the overview. If the worktree has no open tab, swamp opens one.

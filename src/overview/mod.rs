@@ -6,7 +6,7 @@ mod attention;
 mod jump;
 mod view;
 
-use crate::daemon::socket::{ClientMsg, read_server_msg, write_client_msg};
+use crate::daemon::socket::ClientMsg;
 use crate::fanin;
 use crate::registry::RepoEntry;
 use crate::util::now_unix;
@@ -19,7 +19,6 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::collections::BTreeMap;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -60,6 +59,8 @@ enum LoopEvent {
     Tick,
     /// A jump or a launch finished.
     Done(Result<Finished, String>),
+    /// An update of all repositories finished.
+    Updated(fanin::UpdateReport),
 }
 
 enum Finished {
@@ -100,19 +101,6 @@ fn run_launch(entry: RepoEntry, inside_zellij: bool) -> Result<Finished> {
     }
     zellij::switch_session(&session, None)?;
     Ok(Finished::Moved(None))
-}
-
-/// Ask one daemon to scan its worktrees again. The result arrives as a
-/// snapshot on the subscription, so the reply is not used.
-async fn request_refresh(sock: PathBuf) {
-    let request = async {
-        let mut stream = crate::discover::connect(&sock).await?;
-        write_client_msg(&mut stream, &ClientMsg::Refresh)
-            .await
-            .ok()?;
-        read_server_msg(&mut stream).await.ok()
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(60), request).await;
 }
 
 fn load_registry(path: Option<&PathBuf>) -> Vec<RepoEntry> {
@@ -246,8 +234,8 @@ where
 
     let mut app = App::default();
     app.set_registry(load_registry(registry_path.as_ref()));
-    let mut sockets: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut busy = false;
+    let mut updating = false;
     let mut ticks = 0u64;
     terminal
         .draw(|f| view::render(f, &app, now_unix()))
@@ -255,17 +243,14 @@ where
 
     while let Some(event) = rx.recv().await {
         match event {
-            LoopEvent::FanIn(event) => {
-                match &event {
-                    fanin::Event::Up { id, sock, .. } => {
-                        sockets.insert(id.clone(), sock.clone());
-                    }
-                    fanin::Event::Down { id } => {
-                        sockets.remove(id);
-                    }
-                    _ => {}
+            LoopEvent::FanIn(event) => app.apply(event),
+            LoopEvent::Updated(report) => {
+                updating = false;
+                if report.failed.is_empty() {
+                    app.info(report.summary());
+                } else {
+                    app.error(report.summary());
                 }
-                app.apply(event);
             }
             LoopEvent::Tick => {
                 ticks += 1;
@@ -293,10 +278,37 @@ where
                     Action::Quit => return Ok(None),
                     Action::Refresh => {
                         app.set_registry(load_registry(registry_path.as_ref()));
-                        for sock in sockets.values() {
-                            tokio::spawn(request_refresh(sock.clone()));
+                        let targets = app.live_sockets();
+                        app.info(format!("Refresh requested from {} repos", targets.len()));
+                        for (_, sock) in targets {
+                            // The result arrives as a snapshot on the
+                            // subscription, so the reply is not used.
+                            tokio::spawn(async move {
+                                let _ = fanin::request(
+                                    &sock,
+                                    &ClientMsg::Refresh,
+                                    fanin::REQUEST_TIMEOUT,
+                                )
+                                .await;
+                            });
                         }
-                        app.info(format!("Refresh requested from {} repos", sockets.len()));
+                    }
+                    Action::UpdateAll if updating => {
+                        app.info("An update of all repos is still in progress");
+                    }
+                    Action::UpdateAll => {
+                        updating = true;
+                        let targets = app.live_sockets();
+                        app.info(format!(
+                            "Updating the default branch in {} repos…",
+                            targets.len()
+                        ));
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let report =
+                                fanin::update_default_all(targets, fanin::REQUEST_TIMEOUT).await;
+                            let _ = tx.send(LoopEvent::Updated(report)).await;
+                        });
                     }
                     // One jump or launch at a time.
                     Action::Jump(_) | Action::Launch(_) if busy => {

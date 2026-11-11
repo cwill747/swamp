@@ -147,6 +147,97 @@ async fn follow(sock: &Path, id: &str, registry: Option<&Path>, tx: &mpsc::Sende
     }
 }
 
+/// How long a daemon can take to answer a one-shot request. A default-branch
+/// update fetches from the remote, so the limit is generous.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Send one request to the daemon at `sock` on a new connection and wait for
+/// the result. Messages that are not a result, such as a broadcast, are
+/// skipped.
+pub async fn request(sock: &Path, msg: &ClientMsg, timeout: Duration) -> Result<(), String> {
+    let exchange = async {
+        let mut stream = discover::connect(sock)
+            .await
+            .ok_or_else(|| "the daemon does not answer".to_string())?;
+        write_client_msg(&mut stream, msg)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        loop {
+            match read_server_msg(&mut stream).await {
+                Ok(Some(ServerMsg::Ok | ServerMsg::RefreshDone { .. })) => return Ok(()),
+                Ok(Some(ServerMsg::Err { message })) => return Err(message),
+                Ok(Some(ServerMsg::ErrDirty { reason, .. })) => return Err(reason),
+                Ok(Some(_)) => continue,
+                Ok(None) => return Err("the daemon closed the connection".to_string()),
+                Err(e) => return Err(format!("{e:#}")),
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("no answer in {} seconds", timeout.as_secs())),
+    }
+}
+
+/// Result of [`update_default_all`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UpdateReport {
+    /// Number of repositories that completed the update.
+    pub updated: usize,
+    /// Name and error text of each repository that failed, sorted by name.
+    pub failed: Vec<(String, String)>,
+}
+
+impl UpdateReport {
+    /// One line for a status bar.
+    pub fn summary(&self) -> String {
+        let total = self.updated + self.failed.len();
+        if total == 0 {
+            return "No repo runs, so there is nothing to update".to_string();
+        }
+        let repos = if total == 1 { "repo" } else { "repos" };
+        if self.failed.is_empty() {
+            return format!("Updated {total} {repos}");
+        }
+        let failures: Vec<String> = self
+            .failed
+            .iter()
+            .map(|(name, error)| format!("{name} ({error})"))
+            .collect();
+        format!(
+            "Updated {} of {total} {repos}. Failed: {}",
+            self.updated,
+            failures.join(", ")
+        )
+    }
+}
+
+/// Ask each daemon in `targets` (repository name and socket) to update its
+/// default branch. The requests run concurrently, and one failure does not
+/// stop the others.
+pub async fn update_default_all(
+    targets: Vec<(String, PathBuf)>,
+    timeout: Duration,
+) -> UpdateReport {
+    let mut requests = tokio::task::JoinSet::new();
+    for (name, sock) in targets {
+        requests.spawn(async move {
+            let result = request(&sock, &ClientMsg::UpdateDefault, timeout).await;
+            (name, result)
+        });
+    }
+    let mut report = UpdateReport::default();
+    while let Some(joined) = requests.join_next().await {
+        match joined {
+            Ok((_, Ok(()))) => report.updated += 1,
+            Ok((name, Err(error))) => report.failed.push((name, error)),
+            Err(e) => report.failed.push(("?".to_string(), e.to_string())),
+        }
+    }
+    report.failed.sort();
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +249,82 @@ mod tests {
     use crate::worktree::test_support::{git_available, setup};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn update_all_reaches_each_daemon_and_names_the_one_that_fails() {
+        use crate::discover::test_support::spawn_fake_daemon_with;
+        let dir = temp_dir("fanin-update");
+        let good = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let bad = dir.join("bbbbbbbbbbbbbbbb.sock");
+        let gone = dir.join("cccccccccccccccc.sock");
+        let _good =
+            spawn_fake_daemon_with(&good, InfoReply::Reject, Vec::new(), None, ServerMsg::Ok);
+        let _bad = spawn_fake_daemon_with(
+            &bad,
+            InfoReply::Reject,
+            Vec::new(),
+            None,
+            ServerMsg::Err {
+                message: "no default branch".into(),
+            },
+        );
+        stale_socket(&gone);
+
+        let report = update_default_all(
+            vec![
+                ("alpha".into(), good.clone()),
+                ("beta".into(), bad),
+                ("gamma".into(), gone),
+            ],
+            WAIT,
+        )
+        .await;
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            report.failed,
+            [
+                ("beta".to_string(), "no default branch".to_string()),
+                (
+                    "gamma".to_string(),
+                    "the daemon does not answer".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            report.summary(),
+            "Updated 1 of 3 repos. Failed: beta (no default branch), gamma (the daemon does not answer)"
+        );
+
+        let report = update_default_all(vec![("alpha".into(), good)], WAIT).await;
+        assert_eq!(report.summary(), "Updated 1 repo");
+        assert_eq!(
+            update_default_all(Vec::new(), WAIT).await.summary(),
+            "No repo runs, so there is nothing to update"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_skips_messages_that_are_not_a_result() {
+        use crate::daemon::socket::{read_msg, write_msg};
+        let dir = temp_dir("fanin-request");
+        let sock = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let got: Option<ClientMsg> = read_msg(&mut stream).await.unwrap();
+            assert!(matches!(got, Some(ClientMsg::UpdateDefault)));
+            let broadcast = ServerMsg::Snapshot(Snapshot::default());
+            write_msg(&mut stream, &broadcast).await.unwrap();
+            write_msg(&mut stream, &ServerMsg::Ok).await.unwrap();
+        });
+        assert_eq!(
+            request(&sock, &ClientMsg::UpdateDefault, WAIT).await,
+            Ok(())
+        );
+        daemon.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn config(dir: &Path, registry: Option<PathBuf>) -> Config {
         Config {
