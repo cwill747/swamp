@@ -181,7 +181,7 @@ fn render_footer(f: &mut Frame, app: &AppState, area: Rect) {
 fn footer_hint(view: TuiView) -> &'static str {
     match view {
         TuiView::All | TuiView::Worktrees => {
-            "j/k move · enter jump · c create · d delete · D delete tab · h harness · r refresh · u update · K kill · q quit"
+            "j/k move · enter jump · c create · d delete · D delete tab · h harness · r refresh · u update · O overview · K kill · q quit"
         }
         TuiView::Resources => "j/k scroll · r refresh · q quit",
         TuiView::AiStatus => "dbl-click jump · r refresh · q quit",

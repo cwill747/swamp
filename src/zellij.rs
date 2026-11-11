@@ -61,6 +61,167 @@ pub fn new_floating_pane(cwd: &Path, name: &str, cmd: &[&str]) -> Result<()> {
     action(&refs)
 }
 
+/// Environment variables that tie a `zellij` command to the session that
+/// contains this process. A command that targets a different session must not
+/// inherit them.
+const SESSION_ENV: [&str; 3] = ["ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"];
+
+/// One tab of a session, from `zellij action list-tabs --json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TabInfo {
+    /// Stable ID for the `*-by-id` actions. A session resurrection assigns
+    /// new IDs, so resolve the ID again before each use.
+    pub tab_id: u32,
+    /// Zero-based position in the tab bar.
+    pub position: usize,
+    pub name: String,
+}
+
+fn parse_tabs_json(stdout: &str) -> Result<Vec<TabInfo>> {
+    serde_json::from_str(stdout.trim()).context("parse `zellij action list-tabs --json` output")
+}
+
+/// Find the tab of worktree `name` among `tabs`.
+pub fn find_tab<'a>(tabs: &'a [TabInfo], name: &str) -> Option<&'a TabInfo> {
+    tabs.iter().find(|tab| tab.name == name)
+}
+
+/// Run `zellij --session <session> <args>` and return its standard output.
+///
+/// Zellij exits with status 0 for an action against a session that does not
+/// exist, so the caller must check [`session_is_live`] first.
+fn in_session(session: &str, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("zellij");
+    for var in SESSION_ENV {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(["--session", session])
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn zellij --session {session} {args:?}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "zellij --session {session} {args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The tabs of `session`, which can be a session other than the current one.
+pub fn list_tabs(session: &str) -> Result<Vec<TabInfo>> {
+    parse_tabs_json(&in_session(session, &["action", "list-tabs", "--json"])?)
+}
+
+fn parse_client_count(stdout: &str) -> usize {
+    // The first line is the column header.
+    stdout
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+/// Number of clients that are attached to `session`.
+pub fn client_count(session: &str) -> Result<usize> {
+    Ok(parse_client_count(&in_session(
+        session,
+        &["action", "list-clients"],
+    )?))
+}
+
+/// Attach to `session` in this terminal and wait until the client detaches
+/// or the session ends.
+pub fn attach_and_wait(session: &str) -> Result<()> {
+    let mut cmd = Command::new("zellij");
+    for var in SESSION_ENV {
+        cmd.env_remove(var);
+    }
+    let status = cmd
+        .args(["attach", "--force-run-commands", session])
+        .status()
+        .context("spawn zellij attach")?;
+    if !status.success() {
+        anyhow::bail!("zellij attach {session} exited {:?}", status.code());
+    }
+    Ok(())
+}
+
+/// Open a tab in `session`, which can be a session other than the current one.
+pub fn new_tab_in(session: &str, layout: &str, cwd: &Path, name: &str) -> Result<()> {
+    let cwd = cwd.to_string_lossy();
+    tracing::info!(session, worktree = %name, layout, cwd = %cwd, "spawning zellij worktree tab");
+    in_session(
+        session,
+        &[
+            "action", "new-tab", "--layout", layout, "--cwd", &cwd, "--name", name,
+        ],
+    )
+    .map(drop)
+}
+
+/// Focus the tab with ID `tab_id` in `session`.
+pub fn go_to_tab_by_id(session: &str, tab_id: u32) -> Result<()> {
+    in_session(session, &["action", "go-to-tab-by-id", &tab_id.to_string()]).map(drop)
+}
+
+fn switch_session_args(target: &str, tab_position: Option<usize>) -> Vec<String> {
+    let mut args = vec!["switch-session".to_string(), target.to_string()];
+    if let Some(position) = tab_position {
+        // `--tab-position` is 1-based. `TabInfo::position` is 0-based.
+        args.push("--tab-position".to_string());
+        args.push((position + 1).to_string());
+    }
+    args
+}
+
+/// Move the Zellij client of this pane to session `target`. With
+/// `tab_position` (a [`TabInfo::position`]), that tab gets the focus.
+pub fn switch_session(target: &str, tab_position: Option<usize>) -> Result<()> {
+    let args = switch_session_args(target, tab_position);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    action(&refs)
+}
+
+/// Start session `session` without a client. With `layout`, the session
+/// starts from that layout. When an exited session with that name exists,
+/// Zellij resurrects it and ignores the layout.
+pub fn create_background_session(session: &str, layout: Option<&Path>, cwd: &Path) -> Result<()> {
+    let mut cmd = Command::new("zellij");
+    for var in SESSION_ENV {
+        cmd.env_remove(var);
+    }
+    cmd.args([
+        "attach",
+        "--create-background",
+        "--force-run-commands",
+        session,
+    ]);
+    if let Some(layout) = layout {
+        cmd.args(["options", "--default-layout"]).arg(layout);
+    }
+    tracing::info!(
+        session,
+        ?layout,
+        "starting zellij session in the background"
+    );
+    let out = cmd
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("spawn zellij attach --create-background")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "zellij attach --create-background {session} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn go_to_tab_name(name: &str) -> Result<()> {
     action(&["go-to-tab-name", name])
 }
@@ -146,7 +307,30 @@ pub fn kill_session(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_sessions() -> Result<Vec<String>> {
+/// State of a session that `zellij list-sessions` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Live,
+    /// The session ended and Zellij can resurrect it.
+    Exited,
+}
+
+fn parse_sessions(stdout: &str) -> Vec<(String, SessionState)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?;
+            let state = if line.contains("(EXITED") {
+                SessionState::Exited
+            } else {
+                SessionState::Live
+            };
+            Some((name.to_string(), state))
+        })
+        .collect()
+}
+
+fn list_session_states() -> Result<Vec<(String, SessionState)>> {
     let out = Command::new("zellij")
         .arg("list-sessions")
         .arg("--no-formatting")
@@ -154,16 +338,38 @@ pub fn list_sessions() -> Result<Vec<String>> {
         .context("zellij list-sessions")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // With no session at all, Zellij reports that on stderr and fails.
+        if stderr.contains("No active zellij sessions") {
+            return Ok(Vec::new());
+        }
         anyhow::bail!(
             "zellij list-sessions exited {:?}: {}",
             out.status.code(),
             stderr.trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+    Ok(parse_sessions(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Each session name, including exited sessions that Zellij can resurrect.
+pub fn list_sessions() -> Result<Vec<String>> {
+    Ok(list_session_states()?
+        .into_iter()
+        .map(|(name, _)| name)
         .collect())
+}
+
+/// The state of session `name`, or `None` when Zellij does not list it.
+pub fn session_state(name: &str) -> Result<Option<SessionState>> {
+    Ok(list_session_states()?
+        .into_iter()
+        .find(|(session, _)| session == name)
+        .map(|(_, state)| state))
+}
+
+/// Remove the record of an exited session, so that the name is free.
+pub fn delete_session(name: &str) -> Result<()> {
+    zellij(&["delete-session", name, "--force"])
 }
 
 fn current_tab_info() -> Result<String> {
@@ -222,6 +428,111 @@ mod exec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tabs_json_reads_id_position_and_name() {
+        // Captured from `zellij action list-tabs --json` (Zellij 0.45.0).
+        let out = r#"[
+  {
+    "position": 0,
+    "name": "dashboard",
+    "active": false,
+    "panes_to_hide": 0,
+    "is_fullscreen_active": false,
+    "is_sync_panes_active": false,
+    "are_floating_panes_visible": false,
+    "other_focused_clients": [],
+    "active_swap_layout_name": null,
+    "is_swap_layout_dirty": false,
+    "viewport_rows": 49,
+    "viewport_columns": 50,
+    "display_area_rows": 50,
+    "display_area_columns": 50,
+    "selectable_tiled_panes_count": 1,
+    "selectable_floating_panes_count": 0,
+    "tab_id": 0,
+    "has_bell_notification": false,
+    "is_flashing_bell": false
+  },
+  {
+    "position": 1,
+    "name": "my feature",
+    "active": true,
+    "tab_id": 7
+  }
+]
+"#;
+        let tabs = parse_tabs_json(out).unwrap();
+        assert_eq!(
+            tabs,
+            [
+                TabInfo {
+                    tab_id: 0,
+                    position: 0,
+                    name: "dashboard".into()
+                },
+                TabInfo {
+                    tab_id: 7,
+                    position: 1,
+                    name: "my feature".into()
+                },
+            ]
+        );
+        assert_eq!(find_tab(&tabs, "my feature").map(|t| t.tab_id), Some(7));
+        assert_eq!(find_tab(&tabs, "feature"), None);
+    }
+
+    #[test]
+    fn parse_tabs_json_rejects_a_session_not_found_message() {
+        // Zellij prints this, with exit status 0, for a missing session.
+        assert!(
+            parse_tabs_json("Session 'gone' not found. The following sessions are active:")
+                .is_err()
+        );
+        assert!(parse_tabs_json("").is_err());
+    }
+
+    #[test]
+    fn parse_client_count_skips_the_header() {
+        let out = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n\
+                   1         terminal_0     N/A            \n\
+                   2         plugin_3       zellij:about   \n";
+        assert_eq!(parse_client_count(out), 2);
+        assert_eq!(
+            parse_client_count("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n"),
+            0
+        );
+        assert_eq!(parse_client_count(""), 0);
+    }
+
+    #[test]
+    fn switch_session_position_is_one_based() {
+        assert_eq!(
+            switch_session_args("repo-1a2b", None),
+            ["switch-session", "repo-1a2b"]
+        );
+        assert_eq!(
+            switch_session_args("repo-1a2b", Some(0)),
+            ["switch-session", "repo-1a2b", "--tab-position", "1"]
+        );
+        assert_eq!(
+            switch_session_args("repo-1a2b", Some(2)),
+            ["switch-session", "repo-1a2b", "--tab-position", "3"]
+        );
+    }
+
+    #[test]
+    fn parse_sessions_separates_live_from_exited() {
+        let out = "GHOSTS-4e6b [Created 4h 46m 44s ago] \n\
+                   backstage-d365 [Created 26days ago] (EXITED - attach to resurrect)\n\n";
+        assert_eq!(
+            parse_sessions(out),
+            [
+                ("GHOSTS-4e6b".to_string(), SessionState::Live),
+                ("backstage-d365".to_string(), SessionState::Exited),
+            ]
+        );
+    }
 
     #[test]
     fn parse_tab_names_trims_blank_lines() {

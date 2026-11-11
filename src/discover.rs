@@ -57,20 +57,8 @@ pub async fn probe(sock: &Path, registry: &[RepoEntry]) -> Probe {
     let Some(mut stream) = connect(sock).await else {
         return Probe::NotLive;
     };
-    if write_client_msg(&mut stream, &ClientMsg::GetInfo)
-        .await
-        .is_ok()
-        && let Ok(Ok(Some(ServerMsg::Info {
-            common_dir,
-            session_name,
-            version,
-        }))) = tokio::time::timeout(REPLY_TIMEOUT, read_server_msg(&mut stream)).await
-    {
-        return Probe::Identified(RepoIdentity {
-            common_dir,
-            session_name,
-            version: Some(version),
-        });
+    if let Some(identity) = get_info(&mut stream).await {
+        return Probe::Identified(identity);
     }
     drop(stream);
 
@@ -86,11 +74,31 @@ pub async fn probe(sock: &Path, registry: &[RepoEntry]) -> Probe {
     }
 }
 
-async fn connect(sock: &Path) -> Option<UnixStream> {
+/// Connect to a daemon socket. `None` means that nothing accepts connections.
+pub async fn connect(sock: &Path) -> Option<UnixStream> {
     tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(sock))
         .await
         .ok()?
         .ok()
+}
+
+/// Send `GetInfo` on `stream`. `None` means that the daemon predates the
+/// request. Such a daemon closes the connection, so the caller must open a
+/// new one before it sends more requests.
+pub async fn get_info(stream: &mut UnixStream) -> Option<RepoIdentity> {
+    write_client_msg(stream, &ClientMsg::GetInfo).await.ok()?;
+    match tokio::time::timeout(REPLY_TIMEOUT, read_server_msg(stream)).await {
+        Ok(Ok(Some(ServerMsg::Info {
+            common_dir,
+            session_name,
+            version,
+        }))) => Some(RepoIdentity {
+            common_dir,
+            session_name,
+            version: Some(version),
+        }),
+        _ => None,
+    }
 }
 
 async fn first_snapshot_rows(sock: &Path) -> Option<Vec<WorktreeRow>> {
@@ -142,7 +150,7 @@ pub fn identity_from_registry(socket_stem: &str, entries: &[RepoEntry]) -> Optio
 pub(crate) mod test_support {
     use super::*;
     use crate::daemon::socket::{read_msg, write_msg};
-    use crate::daemon::state::{AgentStatus, Snapshot};
+    use crate::daemon::state::{AgentStatus, PrSnapshot, Snapshot};
     use tokio::net::UnixListener;
 
     pub(crate) fn row(name: &str, path: &Path) -> WorktreeRow {
@@ -206,20 +214,36 @@ pub(crate) mod test_support {
 
     /// Serve `sock` like a daemon: answer `GetInfo` per `info`, and answer
     /// `Subscribe` with one snapshot of `rows`, then hold the connection open.
+    /// An abort of the returned task also closes each open connection.
     pub(crate) fn spawn_fake_daemon(
         sock: &Path,
         info: InfoReply,
         rows: Vec<WorktreeRow>,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_fake_daemon_with(sock, info, rows, None, ServerMsg::Ok)
+    }
+
+    /// Like [`spawn_fake_daemon`], with a PR snapshot that follows the
+    /// worktree snapshot and a fixed `reply` to each other request.
+    pub(crate) fn spawn_fake_daemon_with(
+        sock: &Path,
+        info: InfoReply,
+        rows: Vec<WorktreeRow>,
+        prs: Option<PrSnapshot>,
+        reply: ServerMsg,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(sock).unwrap();
         tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let info = info.clone();
                 let rows = rows.clone();
-                tokio::spawn(async move {
+                let prs = prs.clone();
+                let reply = reply.clone();
+                connections.spawn(async move {
                     while let Ok(Some(msg)) = read_msg(&mut stream).await {
                         match (msg, &info) {
                             (ClientMsg::GetInfo, InfoReply::Reject) => return,
@@ -237,9 +261,14 @@ pub(crate) mod test_support {
                                     default_known: true,
                                 };
                                 let _ = write_msg(&mut stream, &ServerMsg::Snapshot(snap)).await;
+                                if let Some(prs) = &prs {
+                                    let _ =
+                                        write_msg(&mut stream, &ServerMsg::PrStatus(prs.clone()))
+                                            .await;
+                                }
                             }
                             _ => {
-                                let _ = write_msg(&mut stream, &ServerMsg::Ok).await;
+                                let _ = write_msg(&mut stream, &reply).await;
                             }
                         }
                     }

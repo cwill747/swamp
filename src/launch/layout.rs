@@ -74,6 +74,11 @@ fn fish_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------------------
 
+/// Name of the first tab of a repo session.
+pub(super) const DASHBOARD_TAB: &str = "dashboard";
+/// Name of the only tab of the overview session.
+pub(super) const OVERVIEW_TAB: &str = "overview";
+
 pub(super) fn write_multi_tab_layout(
     worktrees: &[Worktree],
     _session: &str,
@@ -103,7 +108,7 @@ pub(super) fn write_multi_tab_layout(
     // `crate::launch::open_worktree_tab`), so the tab count is independent of
     // the worktree count.
     s.push_str(&format!(
-        "  tab name=\"dashboard\" focus=true cwd=\"{}\" {{\n",
+        "  tab name=\"{DASHBOARD_TAB}\" focus=true cwd=\"{}\" {{\n",
         kdl_escape(&session_cwd(worktrees, git_dir)),
     ));
     push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
@@ -112,6 +117,41 @@ pub(super) fn write_multi_tab_layout(
     let tmp = TempLayout::create("layout", &s)?;
     tracing::info!("built single dashboard-tab session layout");
     Ok(tmp)
+}
+
+/// Generate the layout of the dedicated overview session: one tab with one
+/// pane that runs the cross-repo overview TUI. The pane closes when the TUI
+/// exits, which ends the session.
+pub(super) fn write_overview_layout() -> Result<TempLayout> {
+    let swamp_bin = std::env::current_exe()
+        .context("resolve current executable")?
+        .display()
+        .to_string();
+    TempLayout::create("overview", &overview_layout(&swamp_bin))
+}
+
+fn overview_layout(swamp_bin: &str) -> String {
+    format!(
+        r#"layout {{
+  default_tab_template {{
+    pane size=1 borderless=true {{
+      plugin location="tab-bar"
+    }}
+    children
+    pane size=2 borderless=true {{
+      plugin location="status-bar"
+    }}
+  }}
+  tab name="{OVERVIEW_TAB}" focus=true {{
+    pane command="{swamp_bin}" close_on_exit=true {{
+      args "overview" "--no-session"
+      name "overview"
+    }}
+  }}
+}}
+"#,
+        swamp_bin = kdl_escape(swamp_bin),
+    )
 }
 
 fn session_cwd(worktrees: &[Worktree], git_dir: &Path) -> String {
@@ -463,6 +503,15 @@ mod tests {
 
     fn dummy_git_dir() -> PathBuf {
         PathBuf::from("/nonexistent-git-dir")
+    }
+
+    #[test]
+    fn overview_layout_runs_the_tui_without_a_nested_session() {
+        let content = overview_layout("/bin/swa\"mp");
+        assert!(content.contains(r#"pane command="/bin/swa\"mp" close_on_exit=true"#));
+        assert!(content.contains(r#"args "overview" "--no-session""#));
+        assert!(content.contains(r#"tab name="overview" focus=true"#));
+        assert!(content.contains(r#"plugin location="tab-bar""#));
     }
 
     #[test]

@@ -134,14 +134,18 @@ pub fn repo_id(path: &Path) -> String {
 /// The suffix prevents two repos with the same basename (e.g. `~/a/myproj`
 /// and `~/work/myproj`) from mapping to the same session.
 pub fn session_name_for(common_dir: &Path) -> String {
-    // container = the directory that holds the bare repo or .git dir
+    let id = repo_id(common_dir);
+    format!("{}-{}", repo_name_for(common_dir), &id[..4])
+}
+
+/// Display name of a repo: the basename of the directory that holds the bare
+/// repo or the `.git` directory.
+pub fn repo_name_for(common_dir: &Path) -> String {
     let container = common_dir.parent().unwrap_or(common_dir);
-    let basename = container
+    container
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "swamp".into());
-    let id = repo_id(common_dir);
-    format!("{}-{}", basename, &id[..4])
+        .unwrap_or_else(|| "swamp".into())
 }
 
 pub fn ascii_mode() -> bool {
