@@ -275,6 +275,9 @@ pub struct Allocation {
     /// Non-fatal problems (for example, a failed fetch) for the caller to show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `post-alloc` hook results, for the caller to show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::slot_hooks::HookRun>,
 }
 
 /// Give the caller a worktree for branch `requested`. See the module docs.
@@ -319,6 +322,7 @@ pub fn alloc_locked(
             existing: true,
             created_branch: false,
             warnings,
+            hooks: Vec::new(),
         });
     }
 
@@ -335,6 +339,7 @@ pub fn alloc_locked(
             existing: false,
             created_branch,
             warnings,
+            hooks: Vec::new(),
         }),
         Err(e) => {
             if created_branch && let Ok(mut b) = repo.find_branch(&branch, BranchType::Local) {
@@ -549,6 +554,9 @@ pub struct Release {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub outcome: ReleaseOutcome,
+    /// `pre-release` hook results, for the caller to show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<crate::slot_hooks::HookRun>,
 }
 
 /// Why a non-forced release was refused.
@@ -562,6 +570,11 @@ pub enum ReleaseRefusedReason {
     StatusUnreadable,
     /// Another slot's agent is working; the caller does not run in that slot.
     AgentWorking,
+    /// A `pre-release` hook failed: the command with its error, and its output.
+    HookFailed {
+        hook: String,
+        output: String,
+    },
 }
 
 #[derive(Debug)]
@@ -596,8 +609,17 @@ impl std::fmt::Display for ReleaseRefused {
             ReleaseRefusedReason::AgentWorking => {
                 "has a working agent and you do not run inside it".to_string()
             }
+            ReleaseRefusedReason::HookFailed { hook, .. } => {
+                format!("was not released because pre-release hook {hook} failed")
+            }
         };
-        write!(f, "{}{on} {why}; leaving it in place", self.name)
+        write!(f, "{}{on} {why}; leaving it in place", self.name)?;
+        if let ReleaseRefusedReason::HookFailed { output, .. } = &self.reason
+            && !output.trim().is_empty()
+        {
+            write!(f, "\n{}", output.trim_end())?;
+        }
+        Ok(())
     }
 }
 
@@ -651,16 +673,19 @@ pub fn release(
 ) -> Result<Release> {
     let guard = lock(common)?;
     let wt = resolve_target(common, target, cwd)?;
-    release_locked(&guard, common, &wt, opts)
+    release_locked(&guard, common, &wt, opts, |_| Ok(()))
 }
 
 /// [`release`] for a caller that holds the slot lock and has resolved the
-/// target worktree.
+/// target worktree. `before_detach` runs after every check passes and right
+/// before swamp detaches the slot, with the branch name; an error from it
+/// stops the release with nothing changed.
 pub fn release_locked(
     _lock: &SlotLock,
     common: &Path,
     wt: &Worktree,
     opts: &ReleaseOptions,
+    before_detach: impl FnOnce(&str) -> Result<()>,
 ) -> Result<Release> {
     let name = wt.name();
     let common_repo =
@@ -679,6 +704,7 @@ pub fn release_locked(
         kind,
         branch: branch.clone(),
         outcome,
+        hooks: Vec::new(),
     };
 
     match kind {
@@ -744,6 +770,7 @@ pub fn release_locked(
         }
     }
 
+    before_detach(&branch_name)?;
     slot_repo
         .set_head_detached(tip)
         .with_context(|| format!("detach {name}"))?;

@@ -74,6 +74,8 @@ pub enum ClientMsg {
         base: Option<String>,
         #[serde(default)]
         offline: bool,
+        #[serde(default)]
+        no_hooks: bool,
     },
     /// `swamp slot release`: return a slot to the pool. `cwd` is the client's
     /// working directory, which resolves an empty target and decides whether
@@ -86,6 +88,8 @@ pub enum ClientMsg {
         force: bool,
         #[serde(default)]
         offline: bool,
+        #[serde(default)]
+        no_hooks: bool,
         #[serde(default)]
         pr: Option<PrFacts>,
     },
@@ -280,15 +284,15 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                             }
                         }
                     }
-                    ClientMsg::SlotAlloc { branch, base, offline } => {
-                        let reply = match daemon.slot_alloc(&branch, base, offline).await {
+                    ClientMsg::SlotAlloc { branch, base, offline, no_hooks } => {
+                        let reply = match daemon.slot_alloc(&branch, base, offline, no_hooks).await {
                             Ok(allocation) => ServerMsg::SlotAllocated { allocation },
                             Err(e) => ServerMsg::Err { message: format!("{e:#}") },
                         };
                         write_msg(&mut stream, &reply).await?;
                     }
-                    ClientMsg::SlotRelease { target, cwd, force, offline, pr } => {
-                        let reply = match daemon.slot_release(target, cwd, force, offline, pr).await {
+                    ClientMsg::SlotRelease { target, cwd, force, offline, no_hooks, pr } => {
+                        let reply = match daemon.slot_release(target, cwd, force, offline, no_hooks, pr).await {
                             Ok(release) => ServerMsg::SlotReleased { release },
                             Err(e) => ServerMsg::Err { message: format!("{e:#}") },
                         };
@@ -591,12 +595,14 @@ mod tests {
                 branch: "parser-fix".into(),
                 base: Some("main".into()),
                 offline: true,
+                no_hooks: false,
             },
             ClientMsg::SlotRelease {
                 target: Some("work2".into()),
                 cwd: PathBuf::from("/repo/work2"),
                 force: false,
                 offline: false,
+                no_hooks: true,
                 pr: Some(PrFacts {
                     branch: "parser-fix".into(),
                     state: "MERGED".into(),

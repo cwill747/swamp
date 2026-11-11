@@ -33,8 +33,8 @@ Each numbered group is one PR. Each PR passes `nix build`, `nix develop --comman
 
 ## 4. Lifecycle hooks (PR 4)
 
-- [ ] 4.1 Add `[slots.hooks]` config parsing to the same user and per-repo config files as `pool_size`; verify config tests
-- [ ] 4.2 Run `post-alloc` and `pre-release` hooks with the `SWAMP_*` environment, stdout sent to stderr, a timeout, and `--no-hooks`; verify tests for success, failure semantics, and output routing
+- [x] 4.1 Add `[slots.hooks]` config parsing to the same user and per-repo config files as `pool_size`; verify config tests
+- [x] 4.2 Run `post-alloc` and `pre-release` hooks with the `SWAMP_*` environment, stdout sent to stderr, a timeout, and `--no-hooks`; verify tests for success, failure semantics, and output routing
 
 ## 5. Tabs and Claude worktree hooks (PR 5)
 

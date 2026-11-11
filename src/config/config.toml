@@ -54,6 +54,22 @@ enabled = true
 #
 #   pool_size — the most slots swamp creates (default 5). 0 turns the pool off.
 #
-# A repository can override these settings in
+#   hooks     — shell commands (run with `sh -c`) around slot operations:
+#               "post-alloc" runs in the worktree after an allocation, and
+#               "pre-release" runs in the slot before a release detaches it.
+#               A failed pre-release hook stops the release unless you pass
+#               --force; a failed post-alloc hook only prints a warning. Hooks
+#               get SWAMP_WORKTREE, SWAMP_NAME, SWAMP_KIND, SWAMP_BRANCH, and
+#               SWAMP_REPO_ROOT. Each hook has a 300-second limit by default.
+#
+# A repository can override pool_size and add hooks in
 # <git-common-dir>/swamp/config.toml (for a bare layout, .bare/swamp/config.toml).
+# User hooks run first, then the repository's.
 # pool_size = 5
+#
+# [[slots.hooks.pre-release]]
+# run = "bazel shutdown"
+#
+# [[slots.hooks.post-alloc]]
+# run = "direnv allow"
+# timeout_secs = 60

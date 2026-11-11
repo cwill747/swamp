@@ -157,7 +157,7 @@ Swamp SHALL serialize allocation, release, pin, and unpin across all processes f
 - **THEN** the CLI still takes the lock and completes the operation
 
 ### Requirement: Slot Lifecycle Hooks
-Swamp SHALL run configured `post-alloc` hooks in the worktree after allocation, and configured `pre-release` hooks in the slot before release. Swamp SHALL read hooks from the user config and from a per-repository config under the git common directory, and SHALL run user hooks first. Hooks SHALL receive `SWAMP_WORKTREE`, `SWAMP_NAME`, `SWAMP_KIND`, `SWAMP_BRANCH`, and `SWAMP_REPO_ROOT` in their environment. Hook output SHALL go to stderr so that stdout carries only the path. `--no-hooks` SHALL skip hooks.
+Swamp SHALL run configured `post-alloc` hooks in the worktree after allocation, and configured `pre-release` hooks in the slot after the release checks pass and before the detach. Swamp SHALL run each hook with `sh -c` and SHALL stop at the first failed hook. Swamp SHALL read hooks from the user config and from a per-repository config under the git common directory, and SHALL run user hooks first. Hooks SHALL receive `SWAMP_WORKTREE`, `SWAMP_NAME`, `SWAMP_KIND`, `SWAMP_BRANCH`, and `SWAMP_REPO_ROOT` in their environment. Hook output SHALL go to stderr so that stdout carries only the path. `--no-hooks` SHALL skip hooks.
 
 #### Scenario: post-alloc hook succeeds
 - **WHEN** a `post-alloc` hook `direnv allow` is configured
@@ -174,3 +174,11 @@ Swamp SHALL run configured `post-alloc` hooks in the worktree after allocation, 
 #### Scenario: Hook output
 - **WHEN** a hook prints text to stdout
 - **THEN** swamp sends that text to stderr
+
+#### Scenario: Release refused before hooks
+- **WHEN** a release is refused because the slot is dirty
+- **THEN** swamp does not run the `pre-release` hooks
+
+#### Scenario: Hook timeout
+- **WHEN** a hook runs longer than its time limit
+- **THEN** swamp stops the hook and every process it started, and treats the hook as failed

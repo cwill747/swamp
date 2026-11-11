@@ -13,8 +13,9 @@
 //!
 //! Branch memory is written while the slot lock is held.
 
-use crate::config::Harness;
+use crate::config::{Harness, HookCommand};
 use crate::daemon::state::{AgentRecord, AgentStatus};
+use crate::slot_hooks::{self, HookEnv};
 use crate::util::now_unix;
 use crate::worktree::slots::{
     self, AllocOptions, Allocation, PrFacts, Release, ReleaseOptions, ReleaseOutcome,
@@ -94,14 +95,20 @@ impl AgentChanges {
 }
 
 /// Allocate a worktree for `branch` and work out the agent record it starts
-/// with: the branch's remembered session, or none.
+/// with: the branch's remembered session, or none. `post_alloc` hooks run
+/// after the slot lock is released, so a slow hook does not block other
+/// allocations; a failed hook becomes a warning.
 pub fn alloc(
     common: &Path,
     branch: &str,
     opts: &AllocOptions,
+    post_alloc: &[HookCommand],
 ) -> Result<(Allocation, AgentChanges)> {
-    let guard = slots::lock(common)?;
-    alloc_under(&guard, common, branch, opts)
+    let (a, changes) = {
+        let guard = slots::lock(common)?;
+        alloc_under(&guard, common, branch, opts)?
+    };
+    Ok((run_post_alloc(common, a, post_alloc), changes))
 }
 
 /// [`alloc`] for the CLI when no daemon runs: it applies the agent changes to
@@ -111,11 +118,15 @@ pub fn alloc_with_status_file(
     common: &Path,
     branch: &str,
     opts: &AllocOptions,
+    post_alloc: &[HookCommand],
 ) -> Result<Allocation> {
-    let guard = slots::lock(common)?;
-    let (a, changes) = alloc_under(&guard, common, branch, opts)?;
-    apply_to_status_file(common, &changes)?;
-    Ok(a)
+    let a = {
+        let guard = slots::lock(common)?;
+        let (a, changes) = alloc_under(&guard, common, branch, opts)?;
+        apply_to_status_file(common, &changes)?;
+        a
+    };
+    Ok(run_post_alloc(common, a, post_alloc))
 }
 
 fn alloc_under(
@@ -146,17 +157,37 @@ fn alloc_under(
     Ok((a, changes))
 }
 
+/// Run `post_alloc` hooks for a new allocation. Callers run them after they
+/// release the slot lock.
+fn run_post_alloc(common: &Path, mut a: Allocation, post_alloc: &[HookCommand]) -> Allocation {
+    if !a.existing && !post_alloc.is_empty() {
+        let env = HookEnv::new(common, &a.path, &a.name, a.kind, &a.branch);
+        a.hooks = slot_hooks::run_hooks(post_alloc, &env);
+        if let Some(failed) = slot_hooks::failure(&a.hooks) {
+            a.warnings.push(format!(
+                "post-alloc hook `{}` failed ({}); the worktree is ready anyway",
+                failed.command,
+                failed.error.as_deref().unwrap_or("error")
+            ));
+        }
+    }
+    a
+}
+
 /// Release `target` (see [`slots::release`]). `agents` is the current view of
 /// the agent records; the caller applies the returned changes to it.
+/// `pre_release` hooks run after the safety checks and before the detach; a
+/// failed hook stops the release unless `opts.force` is set.
 pub fn release(
     common: &Path,
     target: Option<&str>,
     cwd: &Path,
     opts: &ReleaseOptions,
     agents: &HashMap<String, AgentRecord>,
+    pre_release: &[HookCommand],
 ) -> Result<(Release, AgentChanges)> {
     let guard = slots::lock(common)?;
-    release_under(&guard, common, target, cwd, opts, agents)
+    release_under(&guard, common, target, cwd, opts, agents, pre_release)
 }
 
 /// [`release`] for the CLI when no daemon runs: it reads the agent records
@@ -167,10 +198,11 @@ pub fn release_with_status_file(
     target: Option<&str>,
     cwd: &Path,
     opts: &ReleaseOptions,
+    pre_release: &[HookCommand],
 ) -> Result<Release> {
     let guard = slots::lock(common)?;
     let agents = load_agents(common);
-    let (r, changes) = release_under(&guard, common, target, cwd, opts, &agents)?;
+    let (r, changes) = release_under(&guard, common, target, cwd, opts, &agents, pre_release)?;
     apply_to_status_file(common, &changes)?;
     Ok(r)
 }
@@ -182,6 +214,7 @@ fn release_under(
     cwd: &Path,
     opts: &ReleaseOptions,
     agents: &HashMap<String, AgentRecord>,
+    pre_release: &[HookCommand],
 ) -> Result<(Release, AgentChanges)> {
     let wt = slots::resolve_target(common, target, cwd)?;
     let name = wt.name();
@@ -200,7 +233,37 @@ fn release_under(
         .into());
     }
 
-    let r = slots::release_locked(guard, common, &wt, opts)?;
+    let mut runs = Vec::new();
+    let mut r = slots::release_locked(guard, common, &wt, opts, |branch| {
+        if pre_release.is_empty() {
+            return Ok(());
+        }
+        let env = HookEnv::new(
+            common,
+            &wt.path,
+            &name,
+            crate::worktree::WorktreeKind::Slot,
+            branch,
+        );
+        runs = slot_hooks::run_hooks(pre_release, &env);
+        match slot_hooks::failure(&runs) {
+            Some(failed) if !opts.force => Err(ReleaseRefused {
+                name: name.clone(),
+                branch: Some(branch.to_string()),
+                reason: ReleaseRefusedReason::HookFailed {
+                    hook: format!(
+                        "`{}` ({})",
+                        failed.command,
+                        failed.error.as_deref().unwrap_or("error")
+                    ),
+                    output: failed.output.clone(),
+                },
+            }
+            .into()),
+            _ => Ok(()),
+        }
+    })?;
+    r.hooks = runs;
     let mut changes = AgentChanges::default();
     if let (ReleaseOutcome::Detached { branch_deleted }, Some(branch)) = (r.outcome, &r.branch) {
         let mut mem = load_branches(common);
@@ -309,7 +372,7 @@ mod tests {
         }
         let (root, bare) = setup();
         let opts = AllocOptions::pool(5);
-        let (a, _) = alloc(&bare, "fix-ci", &opts).unwrap();
+        let (a, _) = alloc(&bare, "fix-ci", &opts, &[]).unwrap();
         // `fix-ci` equals main, so release finds its work safe.
         let mut agents = HashMap::from([(a.name.clone(), record("abc-123", AgentStatus::Idle))]);
         let (_, changes) = release(
@@ -318,14 +381,15 @@ mod tests {
             Path::new("/"),
             &ReleaseOptions::default(),
             &agents,
+            &[],
         )
         .unwrap();
         changes.apply(&mut agents);
         assert!(!agents.contains_key("work1"));
         // Take work1 with another branch so fix-ci lands in work2.
-        alloc(&bare, "other", &opts).unwrap();
+        alloc(&bare, "other", &opts, &[]).unwrap();
 
-        let (b, changes) = alloc(&bare, "fix-ci", &opts).unwrap();
+        let (b, changes) = alloc(&bare, "fix-ci", &opts, &[]).unwrap();
 
         assert_eq!(b.name, "work2");
         assert_eq!(changes.set.len(), 1);
@@ -341,11 +405,11 @@ mod tests {
         }
         let (root, bare) = setup();
         let opts = AllocOptions::pool(5);
-        let (a, _) = alloc(&bare, "first", &opts).unwrap();
+        let (a, _) = alloc(&bare, "first", &opts, &[]).unwrap();
         // Freed by hand (no release), so its stale record is still present.
         detach(&a.path);
 
-        let (b, changes) = alloc(&bare, "second", &opts).unwrap();
+        let (b, changes) = alloc(&bare, "second", &opts, &[]).unwrap();
 
         assert_eq!(b.name, "work1");
         assert_eq!(changes.clear, vec!["work1".to_string()]);
@@ -360,9 +424,9 @@ mod tests {
         }
         let (root, bare) = setup();
         let opts = AllocOptions::pool(5);
-        alloc(&bare, "same", &opts).unwrap();
+        alloc(&bare, "same", &opts, &[]).unwrap();
 
-        let (again, changes) = alloc(&bare, "same", &opts).unwrap();
+        let (again, changes) = alloc(&bare, "same", &opts, &[]).unwrap();
 
         assert!(again.existing);
         assert!(changes.is_empty());
@@ -375,7 +439,7 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let (a, _) = alloc(&bare, "busy", &AllocOptions::pool(5)).unwrap();
+        let (a, _) = alloc(&bare, "busy", &AllocOptions::pool(5), &[]).unwrap();
         let agents = HashMap::from([(a.name.clone(), record("s", AgentStatus::Working))]);
 
         let err = release(
@@ -384,6 +448,7 @@ mod tests {
             Path::new("/"),
             &ReleaseOptions::default(),
             &agents,
+            &[],
         )
         .unwrap_err();
         assert_eq!(
@@ -392,7 +457,15 @@ mod tests {
         );
 
         // The agent may release its own slot.
-        let (r, _) = release(&bare, None, &a.path, &ReleaseOptions::default(), &agents).unwrap();
+        let (r, _) = release(
+            &bare,
+            None,
+            &a.path,
+            &ReleaseOptions::default(),
+            &agents,
+            &[],
+        )
+        .unwrap();
         assert!(matches!(r.outcome, ReleaseOutcome::Detached { .. }));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -403,7 +476,7 @@ mod tests {
             return;
         }
         let (root, bare) = setup();
-        let (a, _) = alloc(&bare, "done", &AllocOptions::pool(5)).unwrap();
+        let (a, _) = alloc(&bare, "done", &AllocOptions::pool(5), &[]).unwrap();
         let mut mem = HashMap::new();
         mem.insert(
             "done".to_string(),
@@ -428,7 +501,15 @@ mod tests {
             ..Default::default()
         };
 
-        let (r, _) = release(&bare, Some("work1"), Path::new("/"), &opts, &HashMap::new()).unwrap();
+        let (r, _) = release(
+            &bare,
+            Some("work1"),
+            Path::new("/"),
+            &opts,
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             r.outcome,
@@ -437,6 +518,112 @@ mod tests {
             }
         );
         assert!(!load_branches(&bare).contains_key("done"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn hook(run: &str) -> HookCommand {
+        HookCommand {
+            run: run.into(),
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn failed_post_alloc_hook_keeps_the_allocation() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let opts = AllocOptions::pool(5);
+
+        let (a, _) = alloc(&bare, "hooked", &opts, &[hook("echo setting up; exit 1")]).unwrap();
+
+        assert_eq!(
+            slots::checked_out_branch(&a.path).as_deref(),
+            Some("hooked")
+        );
+        assert_eq!(a.hooks.len(), 1);
+        assert!(a.hooks[0].output.contains("setting up"));
+        assert!(a.warnings.iter().any(|w| w.contains("post-alloc hook")));
+
+        // An existing allocation changes nothing, so its hooks do not run.
+        let (again, _) = alloc(&bare, "hooked", &opts, &[hook("exit 1")]).unwrap();
+        assert!(again.existing && again.hooks.is_empty() && again.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_pre_release_hook_stops_release_unless_forced() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let (a, _) = alloc(&bare, "keep", &AllocOptions::pool(5), &[]).unwrap();
+        let agents = HashMap::new();
+        let failing = [hook("echo still running; exit 2")];
+
+        let err = release(
+            &bare,
+            Some("work1"),
+            Path::new("/"),
+            &ReleaseOptions::default(),
+            &agents,
+            &failing,
+        )
+        .unwrap_err();
+        let refused = err.downcast::<ReleaseRefused>().unwrap();
+        match refused.reason {
+            ReleaseRefusedReason::HookFailed { hook, output } => {
+                assert!(hook.contains("exit code 2"), "{hook}");
+                assert!(output.contains("still running"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(slots::checked_out_branch(&a.path).as_deref(), Some("keep"));
+
+        let forced = ReleaseOptions {
+            force: true,
+            ..Default::default()
+        };
+        let (r, _) = release(
+            &bare,
+            Some("work1"),
+            Path::new("/"),
+            &forced,
+            &agents,
+            &failing,
+        )
+        .unwrap();
+        assert!(matches!(r.outcome, ReleaseOutcome::Detached { .. }));
+        assert!(!r.hooks[0].success);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pre_release_hook_does_not_run_when_checks_refuse() {
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let (a, _) = alloc(&bare, "dirty", &AllocOptions::pool(5), &[]).unwrap();
+        std::fs::write(a.path.join("wip.txt"), "x").unwrap();
+        let marker = root.join("hook-ran");
+
+        let err = release(
+            &bare,
+            Some("work1"),
+            Path::new("/"),
+            &ReleaseOptions::default(),
+            &HashMap::new(),
+            &[hook(&format!("touch {}", marker.display()))],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.downcast::<ReleaseRefused>().unwrap().reason,
+            ReleaseRefusedReason::Dirty
+        );
+        assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
