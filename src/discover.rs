@@ -232,6 +232,24 @@ pub(crate) mod test_support {
         prs: Option<PrSnapshot>,
         reply: ServerMsg,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_recording_daemon(sock, info, rows, prs, Some(reply), RequestLog::default())
+    }
+
+    /// Each request, other than `GetInfo` and `Subscribe`, that a fake daemon
+    /// received.
+    pub(crate) type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<ClientMsg>>>;
+
+    /// Like [`spawn_fake_daemon_with`], and record each other request in
+    /// `log`. With `reply` `None`, the daemon closes the connection on such a
+    /// request, as a daemon that does not know the request does.
+    pub(crate) fn spawn_recording_daemon(
+        sock: &Path,
+        info: InfoReply,
+        rows: Vec<WorktreeRow>,
+        prs: Option<PrSnapshot>,
+        reply: Option<ServerMsg>,
+        log: RequestLog,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(sock).unwrap();
         tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
@@ -243,6 +261,7 @@ pub(crate) mod test_support {
                 let rows = rows.clone();
                 let prs = prs.clone();
                 let reply = reply.clone();
+                let log = log.clone();
                 connections.spawn(async move {
                     while let Ok(Some(msg)) = read_msg(&mut stream).await {
                         match (msg, &info) {
@@ -267,8 +286,14 @@ pub(crate) mod test_support {
                                             .await;
                                 }
                             }
-                            _ => {
-                                let _ = write_msg(&mut stream, &reply).await;
+                            (other, _) => {
+                                log.lock().unwrap().push(other);
+                                match &reply {
+                                    Some(reply) => {
+                                        let _ = write_msg(&mut stream, reply).await;
+                                    }
+                                    None => return,
+                                }
                             }
                         }
                     }

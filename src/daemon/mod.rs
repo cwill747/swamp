@@ -1,3 +1,4 @@
+pub mod badges;
 pub mod resources;
 pub mod socket;
 pub mod state;
@@ -31,7 +32,17 @@ pub struct Daemon {
     /// its interval. Poked on subscribe when no successful fetch has happened
     /// yet; `Notify` coalesces concurrent pokes into a single wake.
     pub pr_wake: Arc<Notify>,
+    /// The latest count of waiting worktrees in other repositories, with the
+    /// time it arrived. The aggregator sends it, and it lives in memory only.
+    pub external_attention: std::sync::Mutex<Option<(usize, std::time::Instant)>>,
+    /// Wakes the badge reconciler when the external count changes.
+    pub badge_wake: Arc<Notify>,
 }
+
+/// How long an external attention count stays valid. The aggregator sends the
+/// count again before this time passes, so a count from an aggregator that
+/// stopped does not leave a stale badge.
+pub const EXTERNAL_ATTENTION_TTL: Duration = Duration::from_secs(60);
 
 type SharedOpResult = std::result::Result<(), String>;
 type SharedOpRx = watch::Receiver<Option<SharedOpResult>>;
@@ -173,6 +184,8 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
         tx: tx.clone(),
         pr_subscribers: Arc::new(AtomicUsize::new(0)),
         pr_wake: Arc::new(Notify::new()),
+        external_attention: std::sync::Mutex::new(None),
+        badge_wake: Arc::new(Notify::new()),
     });
 
     // Bind the control socket *before* the first state scan. The TUI waits
@@ -181,6 +194,18 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
     // out at once. Binding first also lets concurrent `swamp serve` spawns lose
     // immediately via EADDRINUSE instead of each grinding through a scan.
     let listener = bind_and_kickoff(&daemon, &common, &sock)?;
+
+    // Badge reconciler: the only writer of tab names in the repo session. It
+    // does not run when the configuration turns badges off.
+    if crate::config::load_config()
+        .map(|c| c.badges.enabled)
+        .unwrap_or(true)
+    {
+        tokio::spawn(badges::run(daemon.clone()));
+    }
+    // The aggregator feeds the cross-repo count. One instance serves every
+    // daemon, and a spawn failure only means that the count stays at zero.
+    crate::aggregate::spawn_detached();
 
     // Watcher task.
     {
@@ -480,6 +505,27 @@ async fn await_shared_op(mut rx: SharedOpRx) -> Result<()> {
 }
 
 impl Daemon {
+    /// Store the count of waiting worktrees in other repositories.
+    pub fn set_external_attention(&self, count: usize) {
+        *self.external_attention.lock().unwrap() = Some((count, std::time::Instant::now()));
+        self.badge_wake.notify_one();
+    }
+
+    /// The count of waiting worktrees in other repositories, or zero when no
+    /// count arrived within [`EXTERNAL_ATTENTION_TTL`].
+    pub fn external_attention(&self) -> usize {
+        self.external_attention_at(std::time::Instant::now())
+    }
+
+    fn external_attention_at(&self, now: std::time::Instant) -> usize {
+        match *self.external_attention.lock().unwrap() {
+            Some((count, at)) if now.saturating_duration_since(at) < EXTERNAL_ATTENTION_TTL => {
+                count
+            }
+            _ => 0,
+        }
+    }
+
     pub async fn refresh_all(&self) -> Result<()> {
         if let Some(rx) = self.fetch_op.lock().await.as_ref().cloned() {
             if let Err(e) = await_shared_op(rx).await {
@@ -937,6 +983,8 @@ mod tests {
             tx: broadcast::channel(64).0,
             pr_subscribers: Arc::new(AtomicUsize::new(0)),
             pr_wake: Arc::new(Notify::new()),
+            external_attention: std::sync::Mutex::new(None),
+            badge_wake: Arc::new(Notify::new()),
         })
     }
 
@@ -975,6 +1023,52 @@ mod tests {
         stream.write_all(b"SWP1").await.unwrap();
         stream.write_all(json.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
+    }
+
+    /// The external count is acknowledged, lives in memory only, and expires.
+    #[tokio::test]
+    async fn external_attention_is_acknowledged_expires_and_is_not_in_the_snapshot() {
+        if !git_available() {
+            return;
+        }
+        let root = git_init_repo();
+        let daemon = build_daemon(&root.join(".git")).await;
+        assert_eq!(daemon.external_attention(), 0);
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(socket::handle_client(daemon.clone(), server));
+        socket::write_client_msg(&mut client, &ClientMsg::ExternalAttention { count: 3 })
+            .await
+            .unwrap();
+        let reply = socket::read_server_msg(&mut client).await.unwrap();
+        assert!(matches!(reply, Some(ServerMsg::Ok)), "got {reply:?}");
+        assert_eq!(daemon.external_attention(), 3);
+
+        // The count is not part of the snapshot that clients receive.
+        let snapshot = serde_json::to_string(&daemon.state.read().await.snapshot()).unwrap();
+        assert!(!snapshot.contains("external"), "{snapshot}");
+
+        // The count is valid for less than the full lifetime.
+        let now = std::time::Instant::now();
+        assert_eq!(
+            daemon.external_attention_at(now + EXTERNAL_ATTENTION_TTL - Duration::from_secs(1)),
+            3
+        );
+        assert_eq!(
+            daemon.external_attention_at(now + EXTERNAL_ATTENTION_TTL),
+            0
+        );
+
+        // A new message replaces the count.
+        socket::write_client_msg(&mut client, &ClientMsg::ExternalAttention { count: 0 })
+            .await
+            .unwrap();
+        let _ = socket::read_server_msg(&mut client).await.unwrap();
+        assert_eq!(daemon.external_attention(), 0);
+
+        drop(client);
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `GetInfo` needs no subscription, and a later `Subscribe` on the same

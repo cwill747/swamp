@@ -34,6 +34,12 @@ pub enum ClientMsg {
     /// clients know a daemon only by its socket path, and the socket file name
     /// is a one-way hash of the repository path.
     GetInfo,
+    /// The number of worktrees that wait for the user in other repositories.
+    /// The aggregator sends it. The daemon shows it on the dashboard tab and
+    /// drops it when no new count arrives for a minute.
+    ExternalAttention {
+        count: usize,
+    },
     Refresh,
     /// Fetch all remotes and fast-forward the default branch in its worktree.
     UpdateDefault,
@@ -161,6 +167,10 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                             session_name: daemon.session_name.clone(),
                             version: env!("CARGO_PKG_VERSION").to_string(),
                         }).await?;
+                    }
+                    ClientMsg::ExternalAttention { count } => {
+                        daemon.set_external_attention(count);
+                        write_msg(&mut stream, &ServerMsg::Ok).await?;
                     }
                     ClientMsg::Refresh => {
                         tracing::info!(trigger = "tui_refresh", "client requested refresh");
@@ -509,6 +519,7 @@ mod tests {
             },
             ClientMsg::GetVersion,
             ClientMsg::GetInfo,
+            ClientMsg::ExternalAttention { count: 2 },
             ClientMsg::Refresh,
             ClientMsg::UpdateDefault,
             ClientMsg::ListBranches,

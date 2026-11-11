@@ -49,19 +49,19 @@ Each numbered group from 2 through 5 is one pull request. Before each push, run
 
 ## 5. PR 4: Tab identity, badges, and the aggregator
 
-- [ ] 5.1 Add the canonical-name functions for worktree tabs and the dashboard tab; verify with unit tests for badged names, plain names, a count of two digits, and a worktree name that starts with the badge glyph
-- [ ] 5.2 Replace `go_to_tab_name`, `close_tab_by_name`, `list_tab_names`, and `current_tab_name` call sites with lookups by canonical name that act by tab ID; verify that the existing tab tests pass and add a test that a badged tab is found
-- [ ] 5.3 Verify by hand that open, switch, relaunch, delete, and current-tab delete each target the correct tab when the tab name carries a badge, and record the steps in the PR description
-- [ ] 5.4 Add `[badges] enabled` to `config.toml` with a default of `true`, and add it to the default config that `swamp init` writes; verify with a config parse test for present, absent, and `false`
-- [ ] 5.5 Add the daemon badge reconciler: compute the wanted name of each open tab from agent status and the external count, and rename by ID when the name differs; run it on each relevant state change and each 30 seconds; verify with a unit test on the wanted-name function and a test that a rename failure does not fail the daemon
-- [ ] 5.6 Add `ClientMsg::ExternalAttention { count }`, the in-memory count, and the 60-second expiry; verify with tests for acknowledge, expiry, and absence from `Snapshot`
-- [ ] 5.7 Add the hidden `swamp aggregate` command: single instance through a non-blocking lock on `aggregator.lock`, fan-in subscription, per-daemon count of waiting worktrees in other repos, send on change and each 20 seconds, stop sending to a daemon that rejects the message, exit after 60 seconds with no live daemon; verify with a test that starts two in-process daemons and checks the count that each receives, and a test that a second instance exits with success
-- [ ] 5.8 Spawn the aggregator detached from `swamp launch` and from daemon startup, and ignore a spawn failure; verify with a test that launch succeeds when the spawn fails
-- [ ] 5.9 Verify by hand with two live repo sessions: a `waiting` hook in repo A shows `● <worktree>` in session A and `dashboard ●1` in session B; a `working` hook clears both; killing the aggregator clears the count within 60 seconds; record the steps in the PR description
-- [ ] 5.10 Verify by hand that a daemon built from `main` stays usable while the new aggregator runs, and that its waiting worktree still counts in a new session
-- [ ] 5.11 Update the README: the badge description, the `[badges]` config key, and the aggregator lock file in the files table
+- [x] 5.1 Add the canonical-name functions for worktree tabs and the dashboard tab; verify with unit tests for badged names, plain names, a count of two digits, and a worktree name that starts with the badge glyph
+- [x] 5.2 Replace `go_to_tab_name`, `close_tab_by_name`, `list_tab_names`, and `current_tab_name` call sites with lookups by canonical name that act by tab ID; verify that the existing tab tests pass and add a test that a badged tab is found
+- [x] 5.3 Verify by hand that open, switch, relaunch, delete, and current-tab delete each target the correct tab when the tab name carries a badge, and record the steps in the PR description
+- [x] 5.4 Add `[badges] enabled` to `config.toml` with a default of `true`, and add it to the default config that `swamp init` writes; verify with a config parse test for present, absent, and `false`
+- [x] 5.5 Add the daemon badge reconciler: compute the wanted name of each open tab from agent status and the external count, and rename by ID when the name differs; run it on each relevant state change and each 30 seconds; verify with a unit test on the wanted-name function and a test that a rename failure does not fail the daemon
+- [x] 5.6 Add `ClientMsg::ExternalAttention { count }`, the in-memory count, and the 60-second expiry; verify with tests for acknowledge, expiry, and absence from `Snapshot`
+- [x] 5.7 Add the hidden `swamp aggregate` command: single instance through a non-blocking lock on `aggregator.lock`, fan-in subscription, per-daemon count of waiting worktrees in other repos, send on change and each 20 seconds, stop sending to a daemon that rejects the message, exit after 60 seconds with no live daemon; verify with a test that starts two in-process daemons and checks the count that each receives, and a test that a second instance exits with success
+- [x] 5.8 Spawn the aggregator detached from `swamp launch` and from daemon startup, and ignore a spawn failure; verify with a test that launch succeeds when the spawn fails
+- [x] 5.9 Verify by hand with two live repo sessions: a `waiting` hook in repo A shows `● <worktree>` in session A and `dashboard ●1` in session B; a `working` hook clears both; killing the aggregator clears the count within 60 seconds; record the steps in the PR description
+- [x] 5.10 Verify by hand that a daemon built from `main` stays usable while the new aggregator runs, and that its waiting worktree still counts in a new session
+- [x] 5.11 Update the README: the badge description, the `[badges]` config key, and the aggregator lock file in the files table
 
 ## 6. Close out
 
-- [ ] 6.1 Run `openspec validate swamp-of-swamps --strict` and confirm that it passes
-- [ ] 6.2 Confirm that each scenario in the five spec deltas maps to an automated test or to a recorded manual check
+- [x] 6.1 Run `openspec validate swamp-of-swamps --strict` and confirm that it passes
+- [x] 6.2 Confirm that each scenario in the five spec deltas maps to an automated test or to a recorded manual check

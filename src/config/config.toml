@@ -24,6 +24,13 @@ shell_column = 33
 #              time swamp builds that worktree's tab.
 default = "claude"
 
+[badges]
+# Attention badges in Zellij tab names. A worktree tab shows "● <name>" while
+# its agent waits for you. The dashboard tab shows "dashboard ●<n>" while <n>
+# worktrees in other repos wait for you. Set to false to keep tab names as
+# they are.
+enabled = true
+
 # [logging]
 # Diagnostic logging for debugging swamp itself — e.g. "why was a tab added?"
 # or "what did that git refresh do?". The daemon writes a per-repo log file

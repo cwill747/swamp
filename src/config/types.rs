@@ -9,6 +9,7 @@ pub struct SwampConfig {
     pub harness: HarnessConfig,
     pub logging: LoggingConfig,
     pub slots: SlotsConfig,
+    pub badges: BadgesConfig,
 }
 
 /// Default number of slot worktrees in the pool (`work1`..`work5`).
@@ -51,6 +52,20 @@ impl SlotsConfig {
             self.pool_size = size;
         }
         self
+    }
+}
+
+/// Attention badges in Zellij tab names: `● <worktree>` for a worktree whose
+/// agent waits, and `dashboard ●<n>` for waiting worktrees in other repos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct BadgesConfig {
+    pub enabled: bool,
+}
+
+impl Default for BadgesConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -175,6 +190,24 @@ mod tests {
     use super::*;
 
     const DEFAULT_CONFIG_TOML: &str = include_str!("config.toml");
+
+    #[test]
+    fn badges_are_on_unless_the_config_turns_them_off() {
+        // Absent section.
+        let cfg: SwampConfig = toml::from_str("[dashboard]\nshell_column = 20\n").unwrap();
+        assert!(cfg.badges.enabled);
+        // Present section, with and without the key.
+        let cfg: SwampConfig = toml::from_str("[badges]\nenabled = true\n").unwrap();
+        assert!(cfg.badges.enabled);
+        let cfg: SwampConfig = toml::from_str("[badges]\n").unwrap();
+        assert!(cfg.badges.enabled);
+        let cfg: SwampConfig = toml::from_str("[badges]\nenabled = false\n").unwrap();
+        assert!(!cfg.badges.enabled);
+        // The default config that `swamp init` writes.
+        let cfg: SwampConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert!(cfg.badges.enabled);
+        assert!(DEFAULT_CONFIG_TOML.contains("[badges]"));
+    }
 
     #[test]
     fn default_config_toml_parses_to_defaults() {

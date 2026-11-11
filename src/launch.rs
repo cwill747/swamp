@@ -86,6 +86,9 @@ pub fn run(dir: Option<PathBuf>) -> Result<()> {
         // stays listed after `swamp kill`.
         crate::registry::record_launch(c);
     }
+    // The aggregator feeds the cross-repo count badge. Launch does not wait
+    // for it, and a failure to start it does not fail the launch.
+    crate::aggregate::spawn_detached();
     let session = common
         .as_deref()
         .map(session_name_for)

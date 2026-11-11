@@ -117,6 +117,13 @@ pub enum Cmd {
     Overview(OverviewArgs),
 
     #[command(
+        hide = true,
+        about = "Run the cross-repo attention aggregator",
+        long_about = "Tell each repo daemon how many worktrees wait for the user in the other repos, so that each dashboard tab can show the count. `swamp launch` and the daemon start this process; a second instance exits at once. It is not intended for interactive use."
+    )]
+    Aggregate,
+
+    #[command(
         about = "Add a repo to the registry",
         long_about = "Record a repo in swamp's registry without launching it, so that cross-repo commands can list it while no session runs. With --all-live, record every repo that has a running daemon, including a daemon from an older swamp version. No daemon or session is started, stopped, or restarted."
     )]
@@ -394,6 +401,7 @@ mod tests {
         assert!(help.contains("overview"));
         assert!(help.contains("register"));
         assert!(help.contains("forget"));
+        assert!(!help.contains("aggregate"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));

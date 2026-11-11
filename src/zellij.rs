@@ -81,9 +81,11 @@ fn parse_tabs_json(stdout: &str) -> Result<Vec<TabInfo>> {
     serde_json::from_str(stdout.trim()).context("parse `zellij action list-tabs --json` output")
 }
 
-/// Find the tab of worktree `name` among `tabs`.
+/// Find the tab of worktree `name` among `tabs`. The comparison uses the
+/// canonical tab name, so a tab with an attention badge matches.
 pub fn find_tab<'a>(tabs: &'a [TabInfo], name: &str) -> Option<&'a TabInfo> {
-    tabs.iter().find(|tab| tab.name == name)
+    tabs.iter()
+        .find(|tab| crate::badge::canonical_tab_name(&tab.name) == name)
 }
 
 /// Run `zellij --session <session> <args>` and return its standard output.
@@ -222,55 +224,70 @@ pub fn create_background_session(session: &str, layout: Option<&Path>, cwd: &Pat
     Ok(())
 }
 
-pub fn go_to_tab_name(name: &str) -> Result<()> {
-    action(&["go-to-tab-name", name])
-}
-
-/// Close the tab named `name`, returning focus to whatever tab was active when
-/// called. No-op when no tab named `name` is open.
-///
-/// `close-tab` always closes the *active* tab, so the named tab has to be
-/// focused first. The existence check guards the dangerous fallthrough: a
-/// `go-to-tab-name` for a missing tab silently leaves focus put (it still exits
-/// 0), so without the check the following `close-tab` tears down the active tab
-/// instead — closing the dashboard, or the whole session when it is the last
-/// tab. That fired whenever a worktree whose tab was not open got deleted.
-pub fn close_tab_by_name(name: &str) -> Result<()> {
-    if !list_tab_names()?.iter().any(|t| t == name) {
-        return Ok(());
-    }
-    let origin = current_tab_name().ok().filter(|o| o != name);
-    go_to_tab_name(name)?;
-    action(&["close-tab"])?;
-    if let Some(origin) = origin {
-        let _ = go_to_tab_name(&origin);
-    }
-    Ok(())
-}
-
-pub fn list_tab_names() -> Result<Vec<String>> {
+/// The tabs of the session that contains this process.
+fn list_tabs_here() -> Result<Vec<TabInfo>> {
     let out = Command::new("zellij")
-        .args(["action", "query-tab-names"])
+        .args(["action", "list-tabs", "--json"])
         .output()
-        .context("zellij action query-tab-names")?;
+        .context("zellij action list-tabs")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!(
-            "zellij action query-tab-names exited {:?}: {}",
+            "zellij action list-tabs exited {:?}: {}",
             out.status.code(),
             stderr.trim()
         );
     }
-    Ok(parse_tab_names(&String::from_utf8_lossy(&out.stdout)))
+    parse_tabs_json(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_tab_names(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+/// Focus the tab of worktree `name` in the current session.
+///
+/// The tab is found by its canonical name, so a tab with an attention badge
+/// matches, and the focus moves by tab ID. A tab that was opened a moment ago
+/// can be absent from the first list, so the lookup repeats for a short time.
+pub fn go_to_tab_name(name: &str) -> Result<()> {
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if let Some(tab) = find_tab(&list_tabs_here()?, name) {
+            return action(&["go-to-tab-by-id", &tab.tab_id.to_string()]);
+        }
+    }
+    anyhow::bail!("no open tab for {name}")
+}
+
+/// Close the tab of worktree `name` in the current session. No-op when no
+/// such tab is open.
+///
+/// The tab is found by its canonical name and closed by its ID, so the focus
+/// of the caller does not change and no other tab can close by mistake.
+pub fn close_tab_by_name(name: &str) -> Result<()> {
+    match find_tab(&list_tabs_here()?, name) {
+        Some(tab) => action(&["close-tab-by-id", &tab.tab_id.to_string()]),
+        None => Ok(()),
+    }
+}
+
+/// Canonical name of each open tab in the current session, in tab order.
+pub fn list_tab_names() -> Result<Vec<String>> {
+    Ok(canonical_names(&list_tabs_here()?))
+}
+
+fn canonical_names(tabs: &[TabInfo]) -> Vec<String> {
+    tabs.iter()
+        .map(|tab| crate::badge::canonical_tab_name(&tab.name).to_string())
         .collect()
+}
+
+/// Rename the tab with ID `tab_id` in `session`.
+pub fn rename_tab_by_id(session: &str, tab_id: u32, name: &str) -> Result<()> {
+    in_session(
+        session,
+        &["action", "rename-tab-by-id", &tab_id.to_string(), name],
+    )
+    .map(drop)
 }
 
 /// Launch a brand-new Zellij session attached to `layout`, with `cwd` and `session`.
@@ -370,38 +387,6 @@ pub fn session_state(name: &str) -> Result<Option<SessionState>> {
 /// Remove the record of an exited session, so that the name is free.
 pub fn delete_session(name: &str) -> Result<()> {
     zellij(&["delete-session", name, "--force"])
-}
-
-fn current_tab_info() -> Result<String> {
-    let out = Command::new("zellij")
-        .args(["action", "current-tab-info"])
-        .output()
-        .context("zellij action current-tab-info")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!(
-            "zellij action current-tab-info exited {:?}: {}",
-            out.status.code(),
-            stderr.trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Name of the currently active tab, parsed from the `name:` line of
-/// `zellij action current-tab-info`.
-pub fn current_tab_name() -> Result<String> {
-    parse_tab_name(&current_tab_info()?).context("parse tab name from current-tab-info")
-}
-
-fn parse_tab_name(stdout: &str) -> Result<String> {
-    stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("name:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("no parseable `name:` line in current-tab-info output"))
 }
 
 /// Attach to an existing session, replacing this process via `exec`. Zellij 0.45
@@ -535,23 +520,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_tab_names_trims_blank_lines() {
-        assert_eq!(
-            parse_tab_names("dashboard\n main \n\nfeature\r\n"),
-            vec!["dashboard", "main", "feature"]
-        );
-    }
-
-    #[test]
-    fn parse_tab_name_reads_name_line() {
-        let out = "name: dashboard\nid: 3\nposition: 1\n";
-        assert_eq!(parse_tab_name(out).unwrap(), "dashboard");
-    }
-
-    #[test]
-    fn parse_tab_name_missing_or_blank_is_error() {
-        assert!(parse_tab_name("id: 3\nposition: 1\n").is_err());
-        assert!(parse_tab_name("name:\nid: 3\n").is_err());
+    fn a_badged_tab_is_found_by_its_canonical_name() {
+        let tabs = vec![
+            TabInfo {
+                tab_id: 0,
+                position: 0,
+                name: "dashboard ●2".into(),
+            },
+            TabInfo {
+                tab_id: 4,
+                position: 1,
+                name: "● feature".into(),
+            },
+            TabInfo {
+                tab_id: 5,
+                position: 2,
+                name: "main".into(),
+            },
+        ];
+        assert_eq!(find_tab(&tabs, "feature").map(|t| t.tab_id), Some(4));
+        assert_eq!(find_tab(&tabs, "dashboard").map(|t| t.tab_id), Some(0));
+        assert_eq!(find_tab(&tabs, "main").map(|t| t.tab_id), Some(5));
+        assert_eq!(find_tab(&tabs, "● feature"), None);
+        assert_eq!(canonical_names(&tabs), ["dashboard", "feature", "main"]);
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub(super) fn spawn_close_tab(tx: mpsc::Sender<AppEvent>, name: String) {
 ///
 /// This is the only path that opens worktree tabs: tab pinning is gone, so a
 /// worktree gets a tab only when the user activates it (Enter / double-click)
-/// or when swamp itself just created the worktree. Querying `query-tab-names`
+/// or when swamp itself just created the worktree. Querying the open tabs
 /// first makes activation idempotent — an existing tab is switched to rather
 /// than duplicated. If tab names can't be queried the tab state is unknown, so
 /// we do nothing rather than blind-open a possible duplicate. Outside zellij

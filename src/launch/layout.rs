@@ -74,8 +74,7 @@ fn fish_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------------------
 
-/// Name of the first tab of a repo session.
-pub(super) const DASHBOARD_TAB: &str = "dashboard";
+pub(super) use crate::badge::DASHBOARD_TAB;
 /// Name of the only tab of the overview session.
 pub(super) const OVERVIEW_TAB: &str = "overview";
 

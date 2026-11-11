@@ -212,6 +212,13 @@ names, and then act by stable tab ID.
   without a Zellij session.
 - IDs are resolved at each use and are not stored. A stored ID can go stale
   across a session resurrection.
+- The reconcile runs when the badge inputs change: the set of worktrees, the
+  set of waiting worktrees, and the external count. A tab that opens while its
+  agent already waits changes none of them, so it gets its badge at the next
+  timer reconcile, within 30 seconds. The user has that tab in view at that
+  time, so the delay is acceptable.
+- With `[badges] enabled = false`, the daemon does not start the reconciler,
+  so it renames no tab. A badge from an earlier run stays until the tab closes.
 - **Alternative: the aggregator renames dashboard tabs directly.** Two writers
   in one session can race on the same tab name.
 - **Alternative: a swamp-owned tab bar.** This gives full control but replaces
@@ -256,6 +263,9 @@ applies the dashboard badge (D7).
 - A non-blocking exclusive `flock` on `aggregator.lock` in the runtime
   directory enforces one instance. A second instance exits with success.
 - The aggregator exits after 60 seconds with no live daemon.
+- Nothing restarts an aggregator that dies while daemons run. The counts
+  expire within 60 seconds, and the next launch or daemon start starts a new
+  aggregator.
 - The aggregator has no socket and holds no state on disk.
 
 ### D10. Attention ranking
@@ -316,7 +326,8 @@ keeps its existing behavior until the user restarts the session.
 
 ## Open Questions
 
-- The badge glyph in ASCII mode (`ascii_mode()` in `src/util.rs`). A `*` is the
-  default candidate.
+- Resolved: the badge glyph in ASCII mode is `*`. The canonical-name functions
+  accept both glyphs, whatever the current mode is, so a change of mode does
+  not leave a tab that swamp cannot find.
 - The key for update-all (`U`) and for open-overview (`O`) can change after
   first use.

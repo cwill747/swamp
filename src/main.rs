@@ -1,3 +1,5 @@
+mod aggregate;
+mod badge;
 mod cli;
 mod codex_notify;
 mod config;
@@ -47,6 +49,7 @@ async fn main() -> Result<()> {
             launch::delete_tab(&args.name, &args.dir, args.force).await
         }
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
+        Some(cli::Cmd::Aggregate) => aggregate::run().await,
         Some(cli::Cmd::Overview(args)) => overview::run(args.no_session).await,
         Some(cli::Cmd::Register(args)) => registry::run_register(args.dir, args.all_live).await,
         Some(cli::Cmd::Forget(args)) => registry::run_forget(args.dir),

@@ -391,10 +391,32 @@ shell_column     = 33
 [harness]
 # "claude", "codex", or "choose"
 default = "claude"
+
+[badges]
+enabled = true
 ```
 
 Set `[harness] default = "choose"` to pick Claude or Codex per worktree from the
 TUI with `h`.
+
+### Attention badges
+
+swamp marks Zellij tab names, so that you can see a waiting agent from any tab:
+
+- A worktree tab is named `● <worktree>` while its agent waits for you.
+- The dashboard tab is named `dashboard ●<n>` while `<n>` worktrees in other
+  repos wait for you.
+
+The daemon removes a badge when the agent works again. A tab that opens while
+its agent already waits gets its badge within 30 seconds. With `SWAMP_ASCII`
+set, the badge glyph is `*`.
+
+The cross-repo count comes from a background process, `swamp aggregate`, that
+`swamp launch` and the daemon start. One instance serves all repos, and it
+exits when no repo session has run for one minute.
+
+To keep tab names unchanged, set `[badges] enabled = false` and restart the
+session.
 
 ## Files
 
@@ -406,6 +428,7 @@ TUI with `h`.
 | `$XDG_STATE_HOME/swamp/repos.json`    | Registry of repos swamp has launched |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`     | Daemon PID file                      |
+| `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Single-instance lock of `swamp aggregate` |
 
 ## Contributing
 
