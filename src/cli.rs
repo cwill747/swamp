@@ -123,6 +123,12 @@ pub enum Cmd {
     Init,
 
     #[command(
+        about = "Manage the reusable worktree pool",
+        long_about = "Manage the pool of reusable worktrees (slots) named work1, work2, ... A slot is free when its HEAD is detached, its tree is clean, and no pin holds it. `alloc` checks a branch out into the lowest free slot, or into a dedicated branch-named worktree when the pool is full; `release` detaches the slot again and keeps its build output."
+    )]
+    Slot(SlotArgs),
+
+    #[command(
         about = "Clone a repo into swamp's bare layout",
         long_about = "Clone a repository into swamp's bare layout: the git data in `.bare`, a `.git` file that points to it, and a worktree for the default branch. Prints the default branch worktree path on stdout."
     )]
@@ -133,6 +139,64 @@ pub enum Cmd {
         long_about = "Generate shell completions for swamp. Packagers should use this command to install completions from the exact binary they ship."
     )]
     Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+pub struct SlotArgs {
+    #[command(subcommand)]
+    pub command: SlotCmd,
+    /// Path inside the repo (default: current directory).
+    #[arg(long, global = true, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Print the result as JSON on stdout.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum SlotCmd {
+    /// Check a branch out into a free slot and print the worktree path.
+    #[command(
+        long_about = "Give the caller a worktree for BRANCH and print its absolute path on stdout. An existing local or remote branch is checked out; otherwise swamp creates BRANCH from the default remote's default branch. When a worktree already has BRANCH, swamp prints that path and changes nothing. When every slot is busy, swamp creates a dedicated branch-named worktree."
+    )]
+    Alloc {
+        /// Branch to check out or create. Unsafe characters become `-`.
+        #[arg(value_name = "BRANCH")]
+        branch: String,
+        /// Skip the fetch of the default remote.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Detach a slot so it returns to the pool.
+    #[command(
+        long_about = "Detach a slot at its branch tip and keep the directory. Without --force, swamp refuses when the tree has changes, or when the branch has commits that are not on the remote and its PR is not merged or closed. When the PR is merged or closed, swamp also deletes the local branch. An overflow worktree is left in place."
+    )]
+    Release {
+        /// Slot name, worktree path, or branch name (default: the worktree that contains the current directory).
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+        /// Skip the safety checks.
+        #[arg(long)]
+        force: bool,
+        /// Skip the fetch and the PR lookup.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Hold a free slot so allocation skips it.
+    Pin {
+        #[arg(value_name = "SLOT")]
+        slot: String,
+        /// Why the slot is held (for example, "review #172").
+        #[arg(value_name = "REASON", num_args = 1.., trailing_var_arg = true)]
+        reason: Vec<String>,
+    },
+    /// Remove the pin on a slot.
+    Unpin {
+        #[arg(value_name = "SLOT")]
+        slot: String,
+    },
+    /// List the slots and overflow worktrees.
+    List,
 }
 
 #[derive(Args)]
@@ -284,6 +348,7 @@ mod tests {
         assert!(help.contains("init"));
         assert!(help.contains("completions"));
         assert!(help.contains("clone"));
+        assert!(help.contains("slot"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));
@@ -319,5 +384,16 @@ mod tests {
         };
 
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn slot_help_lists_subcommands() {
+        let mut cmd = Cli::command();
+        let slot = cmd.find_subcommand_mut("slot").unwrap();
+        let help = slot.render_long_help().to_string();
+
+        for sub in ["alloc", "release", "pin", "unpin", "list"] {
+            assert!(help.contains(sub), "missing {sub} in:\n{help}");
+        }
     }
 }

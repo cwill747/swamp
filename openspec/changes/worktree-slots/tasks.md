@@ -9,17 +9,17 @@ Each numbered group is one PR. Each PR passes `nix build`, `nix develop --comman
 
 ## 2. Slot core (PR 2)
 
-- [ ] 2.1 Add `[slots] pool_size` (default 5) to the user config and the per-repo `<common>/swamp/config.toml`, with the per-repo value taking precedence, and add a commented `[slots]` section to the default `src/config/config.toml`; verify config tests for the default, the override, and 0
-- [ ] 2.2 Add a `worktree::slots` module with slot-name parsing and the `default`/`slot`/`overflow` kind; verify unit tests for `work1`, `work12`, `work3-1`, and `workx`
-- [ ] 2.3 Add `classify()` (free, busy, pinned) from `HEAD`, `git_info()`, and pin files; verify tests for detached clean, checked-out branch, detached dirty, and pinned
-- [ ] 2.4 Add the `flock` helper on `<common>/swamp/slots.lock`; verify a test where two threads allocate concurrently and receive different slots
-- [ ] 2.5 Add the checkout into an existing slot dir (safe checkout, ignored files kept); verify a test that an ignored `target/` file survives a reallocation
-- [ ] 2.6 Implement alloc (fetch best effort, existing branch reuse, new branch from `origin/<default>`, lowest free slot, lazy slot creation, overflow at the pool size, slots above the pool size skipped, pool size 0, name sanitizing); verify tests for each scenario in spec Slot Allocation
-- [ ] 2.7 Add the `-1` suffix for overflow names that match `work<N>`; verify a test
-- [ ] 2.8 Extract the shared "branch work is safe" check from `removal_verdict` and use it in removal; verify that the existing removal tests still pass
-- [ ] 2.9 Implement release (dirty refusal, pushed check, PR merged or closed, force branch delete, pin clear, overflow no-op); verify tests for each scenario in spec Slot Release, with a stubbed PR state
-- [ ] 2.10 Implement pin, unpin, and list (`--json`); verify tests for pin of a free slot, refusal for a busy slot, and the list output with a slot outside the pool
-- [ ] 2.11 Add the `swamp slot {alloc,release,pin,unpin,list}` CLI with in-process execution; verify `swamp slot --help` output and an end-to-end test in a temp repo
+- [x] 2.1 Add `[slots] pool_size` (default 5) to the user config and the per-repo `<common>/swamp/config.toml`, with the per-repo value taking precedence, and add a commented `[slots]` section to the default `src/config/config.toml`; verify config tests for the default, the override, and 0
+- [x] 2.2 Add a `worktree::slots` module with slot-name parsing and the `default`/`slot`/`overflow` kind; verify unit tests for `work1`, `work12`, `work3-1`, and `workx`
+- [x] 2.3 Add `classify()` (free, busy, pinned) from `HEAD`, `git_info()`, and pin files; verify tests for detached clean, checked-out branch, detached dirty, and pinned
+- [x] 2.4 Add the `flock` helper on `<common>/swamp/slots.lock`; verify a test where two threads allocate concurrently and receive different slots
+- [x] 2.5 Add the checkout into an existing slot dir (safe checkout, ignored files kept); verify a test that an ignored `target/` file survives a reallocation
+- [x] 2.6 Implement alloc (fetch best effort, existing branch reuse, new branch from `origin/<default>`, lowest free slot, lazy slot creation, overflow at the pool size, slots above the pool size skipped, pool size 0, name sanitizing); verify tests for each scenario in spec Slot Allocation
+- [x] 2.7 Add the `-1` suffix for overflow names that match `work<N>`; verify a test
+- [x] 2.8 Extract the shared "branch work is safe" check from `removal_verdict` and use it in removal; verify that the existing removal tests still pass
+- [x] 2.9 Implement release (dirty refusal, pushed check, PR merged or closed, force branch delete, pin clear, overflow no-op); verify tests for each scenario in spec Slot Release, with a stubbed PR state
+- [x] 2.10 Implement pin, unpin, and list (`--json`); verify tests for pin of a free slot, refusal for a busy slot, and the list output with a slot outside the pool
+- [x] 2.11 Add the `swamp slot {alloc,release,pin,unpin,list}` CLI with in-process execution; verify `swamp slot --help` output and an end-to-end test in a temp repo
 
 ## 3. Daemon integration and branch memory (PR 3)
 

@@ -6,11 +6,14 @@ mod types;
 pub use claude::ensure_claude_hooks;
 pub use codex::ensure_codex_notify;
 #[allow(unused_imports)]
-pub use paths::{ConfigPaths, ensure_config_toml, ensure_configs, load_config};
+pub use paths::{
+    ConfigPaths, ensure_config_toml, ensure_configs, load_config, load_repo_config,
+    repo_config_path, slots_config,
+};
 #[allow(unused_imports)]
 pub use types::{
-    DashboardConfig, Harness, HarnessConfig, HarnessSetting, LogLevel, LoggingConfig, SwampConfig,
-    resolve_harness,
+    DEFAULT_POOL_SIZE, DashboardConfig, Harness, HarnessConfig, HarnessSetting, LogLevel,
+    LoggingConfig, RepoConfig, RepoSlotsConfig, SlotsConfig, SwampConfig, resolve_harness,
 };
 
 use anyhow::Result;
