@@ -122,4 +122,28 @@ mod tests {
         // this wouldn't compile. No assertions needed.
         let _: fn(Option<PathBuf>) -> Result<()> = run;
     }
+
+    /// `swamp kill` stops a session but keeps the repo registered, so the
+    /// repo stays listed as not running.
+    #[test]
+    fn kill_daemon_leaves_the_registry_entry() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp =
+            std::env::temp_dir().join(format!("swamp-kill-reg-{}-{nanos}", std::process::id()));
+        let common = tmp.join("repo").join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        let registry = tmp.join("repos.json");
+        crate::registry::upsert_at(&registry, &common, "repo-0000", 1).unwrap();
+
+        // No daemon runs for this repo, so this only walks the cleanup path.
+        kill_daemon(&common);
+
+        let entries = crate::registry::load_at(&registry);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_name, "repo-0000");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

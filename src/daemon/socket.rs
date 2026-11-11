@@ -6,6 +6,7 @@ use crate::worktree::BranchInfo;
 use anyhow::Result;
 use git2::Reference;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -29,6 +30,10 @@ pub enum ClientMsg {
         subagent: Option<SubagentEvent>,
     },
     GetVersion,
+    /// Ask which repository and Zellij session this daemon serves. Cross-repo
+    /// clients know a daemon only by its socket path, and the socket file name
+    /// is a one-way hash of the repository path.
+    GetInfo,
     Refresh,
     /// Fetch all remotes and fast-forward the default branch in its worktree.
     UpdateDefault,
@@ -78,6 +83,12 @@ pub enum ServerMsg {
     Version {
         version: String,
     },
+    /// Reply to `GetInfo`.
+    Info {
+        common_dir: PathBuf,
+        session_name: String,
+        version: String,
+    },
     RefreshDone {
         worktree_names: Vec<String>,
     },
@@ -97,7 +108,20 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
     loop {
         tokio::select! {
             res = read_client_msg(&mut stream, subscription.is_some()) => {
-                let Some(msg) = res? else { return Ok(()); };
+                let Some(incoming) = res? else { return Ok(()); };
+                // A request this daemon cannot decode comes from a newer
+                // client. Answer it, so that the client can fall back, and
+                // keep the connection open.
+                let msg = match incoming {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::debug!("undecodable client request: {e}");
+                        write_msg(&mut stream, &ServerMsg::Err {
+                            message: format!("unsupported request: {e}"),
+                        }).await?;
+                        continue;
+                    }
+                };
                 match msg {
                     ClientMsg::Ping => write_msg(&mut stream, &ServerMsg::Pong).await?,
                     ClientMsg::Subscribe => {
@@ -130,6 +154,13 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     }
                     ClientMsg::GetVersion => {
                         write_msg(&mut stream, &ServerMsg::Version { version: env!("CARGO_PKG_VERSION").to_string() }).await?;
+                    }
+                    ClientMsg::GetInfo => {
+                        write_msg(&mut stream, &ServerMsg::Info {
+                            common_dir: daemon.common_dir.clone(),
+                            session_name: daemon.session_name.clone(),
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                        }).await?;
                     }
                     ClientMsg::Refresh => {
                         tracing::info!(trigger = "tui_refresh", "client requested refresh");
@@ -265,17 +296,29 @@ const MAX_SERVER_FRAME_LEN: usize = 16 * 1024 * 1024;
 const MAX_NAME_LEN: usize = 255;
 const MAX_SESSION_FIELD_LEN: usize = 512;
 
-async fn read_client_msg(stream: &mut UnixStream, subscribed: bool) -> Result<Option<ClientMsg>> {
+/// A client frame that arrived intact. The inner `Err` is a frame whose JSON
+/// this daemon cannot decode, which a caller can answer without dropping the
+/// connection.
+type Incoming = std::result::Result<ClientMsg, serde_json::Error>;
+
+async fn read_client_msg(stream: &mut UnixStream, subscribed: bool) -> Result<Option<Incoming>> {
     if subscribed {
-        read_msg(stream).await
+        read_incoming(stream).await
     } else {
-        match tokio::time::timeout(CLIENT_READ_TIMEOUT, read_msg(stream)).await {
+        match tokio::time::timeout(CLIENT_READ_TIMEOUT, read_incoming(stream)).await {
             Ok(res) => res,
             Err(_) => anyhow::bail!("timed out waiting for client message"),
         }
     }
 }
 
+async fn read_incoming(stream: &mut UnixStream) -> Result<Option<Incoming>> {
+    Ok(read_frame(stream, MAX_CLIENT_FRAME_LEN)
+        .await?
+        .map(|buf| decode_frame(&buf)))
+}
+
+#[cfg(test)]
 pub async fn read_msg(stream: &mut UnixStream) -> Result<Option<ClientMsg>> {
     read_framed_json(stream, MAX_CLIENT_FRAME_LEN).await
 }
@@ -296,6 +339,18 @@ async fn read_framed_json<T: for<'de> Deserialize<'de>>(
     stream: &mut UnixStream,
     max_frame_len: usize,
 ) -> Result<Option<T>> {
+    match read_frame(stream, max_frame_len).await? {
+        Some(buf) => Ok(Some(decode_frame(&buf)?)),
+        None => Ok(None),
+    }
+}
+
+fn decode_frame<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_slice(buf.strip_prefix(PROTOCOL_MAGIC).unwrap_or(buf))
+}
+
+/// Read one length-prefixed frame. `None` means a clean end of stream.
+async fn read_frame(stream: &mut UnixStream, max_frame_len: usize) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     if let Err(e) = stream.read_exact(&mut len_buf).await {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -311,8 +366,7 @@ async fn read_framed_json<T: for<'de> Deserialize<'de>>(
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    let payload = buf.strip_prefix(PROTOCOL_MAGIC).unwrap_or(&buf);
-    Ok(Some(serde_json::from_slice(payload)?))
+    Ok(Some(buf))
 }
 
 async fn write_framed_json<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
@@ -454,6 +508,7 @@ mod tests {
                 }),
             },
             ClientMsg::GetVersion,
+            ClientMsg::GetInfo,
             ClientMsg::Refresh,
             ClientMsg::UpdateDefault,
             ClientMsg::ListBranches,

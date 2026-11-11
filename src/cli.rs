@@ -111,6 +111,18 @@ pub enum Cmd {
     Kill(KillArgs),
 
     #[command(
+        about = "Add a repo to the registry",
+        long_about = "Record a repo in swamp's registry without launching it, so that cross-repo commands can list it while no session runs. With --all-live, record every repo that has a running daemon, including a daemon from an older swamp version. No daemon or session is started, stopped, or restarted."
+    )]
+    Register(RegisterArgs),
+
+    #[command(
+        about = "Remove a repo from the registry",
+        long_about = "Remove a repo from swamp's registry. The repo's daemon and Zellij session, if any, keep running; use `swamp kill` to stop them."
+    )]
+    Forget(ForgetArgs),
+
+    #[command(
         about = "Show the repo's diagnostic log",
         long_about = "Print swamp's per-repository diagnostic log (tab additions, git refreshes, hook updates). With no DIR, scopes output to the worktree containing the current directory; pass --all for the whole repo, or -f to follow new output."
     )]
@@ -311,6 +323,23 @@ pub struct KillArgs {
 }
 
 #[derive(Args)]
+pub struct RegisterArgs {
+    /// Path inside the repo to register (default: current directory).
+    #[arg(value_name = "DIR", conflicts_with = "all_live")]
+    pub dir: Option<PathBuf>,
+    /// Register every repo that has a running daemon.
+    #[arg(long)]
+    pub all_live: bool,
+}
+
+#[derive(Args)]
+pub struct ForgetArgs {
+    /// Path inside the repo to forget (default: current directory).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
 pub struct LogsArgs {
     /// Path inside the repo to inspect (default: current directory). When it
     /// falls inside a worktree, output is scoped to that worktree.
@@ -349,6 +378,8 @@ mod tests {
         assert!(help.contains("completions"));
         assert!(help.contains("clone"));
         assert!(help.contains("slot"));
+        assert!(help.contains("register"));
+        assert!(help.contains("forget"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));
@@ -374,6 +405,19 @@ mod tests {
         assert!(help.contains("bash"));
         assert!(help.contains("fish"));
         assert!(help.contains("zsh"));
+    }
+
+    #[test]
+    fn register_rejects_dir_with_all_live() {
+        let err = match Cli::try_parse_from(["swamp", "register", "some/dir", "--all-live"]) {
+            Ok(_) => panic!("DIR and --all-live should conflict"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        assert!(Cli::try_parse_from(["swamp", "register", "--all-live"]).is_ok());
+        assert!(Cli::try_parse_from(["swamp", "register", "some/dir"]).is_ok());
+        assert!(Cli::try_parse_from(["swamp", "forget"]).is_ok());
     }
 
     #[test]

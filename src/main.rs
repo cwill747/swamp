@@ -2,11 +2,13 @@ mod cli;
 mod codex_notify;
 mod config;
 mod daemon;
+mod discover;
 mod github;
 mod hook;
 mod kill;
 mod launch;
 mod logging;
+mod registry;
 mod slot_cmd;
 mod tui;
 mod util;
@@ -43,6 +45,8 @@ async fn main() -> Result<()> {
             launch::delete_tab(&args.name, &args.dir, args.force).await
         }
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
+        Some(cli::Cmd::Register(args)) => registry::run_register(args.dir, args.all_live).await,
+        Some(cli::Cmd::Forget(args)) => registry::run_forget(args.dir),
         Some(cli::Cmd::Logs(args)) => logging::show(args.dir, args.follow, args.all).await,
         Some(cli::Cmd::Init) => config::init(),
         Some(cli::Cmd::Slot(args)) => slot_cmd::run(args),
