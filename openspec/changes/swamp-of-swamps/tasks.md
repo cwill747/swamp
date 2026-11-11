@@ -43,9 +43,9 @@ Each numbered group from 2 through 5 is one pull request. Before each push, run
 
 ## 4. PR 3: Update all
 
-- [ ] 4.1 Add a one-shot `UpdateDefault` client call that the fan-in module can run against each live daemon concurrently and that skips unrelated broadcasts; verify with a test against two in-process daemons where one returns an error
-- [ ] 4.2 Bind `U` in the overview to update-all and show the success count and the failed repo names in the footer; verify with an input test that cold repos receive no request and no launch
-- [ ] 4.3 Update the README key table for `U`
+- [x] 4.1 Add a one-shot `UpdateDefault` client call that the fan-in module can run against each live daemon concurrently and that skips unrelated broadcasts; verify with a test against two in-process daemons where one returns an error
+- [x] 4.2 Bind `U` in the overview to update-all and show the success count and the failed repo names in the footer; verify with an input test that cold repos receive no request and no launch
+- [x] 4.3 Update the README key table for `U`
 
 ## 5. PR 4: Tab identity, badges, and the aggregator
 

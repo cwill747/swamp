@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::time::Duration;
 
-const FOOTER_HINT: &str = "j/k move · enter jump or launch · r refresh · q quit";
+const FOOTER_HINT: &str = "j/k move · enter jump or launch · U update all · r refresh · q quit";
 const OLD_DAEMON_HINT: &str =
     "Some sessions run an older swamp that cannot be identified. Restart them to enable jump.";
 const MAX_REPO_WIDTH: usize = 24;

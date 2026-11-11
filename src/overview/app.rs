@@ -16,6 +16,7 @@ pub const RESTART_HINT: &str = "Restart that swamp session to enable jump";
 /// One live daemon.
 #[derive(Debug, Default)]
 struct Repo {
+    sock: PathBuf,
     identity: Option<RepoIdentity>,
     snapshot: Snapshot,
     prs: PrSnapshot,
@@ -34,6 +35,8 @@ pub enum Action {
     None,
     Quit,
     Refresh,
+    /// Update the default branch of each live repository.
+    UpdateAll,
     Jump(Target),
     Launch(RepoEntry),
 }
@@ -77,6 +80,23 @@ impl App {
             .count()
     }
 
+    fn repo_name(id: &str, repo: &Repo) -> String {
+        match &repo.identity {
+            Some(identity) => repo_name_for(&identity.common_dir),
+            // The socket ID is the only name that is known.
+            None => id.to_string(),
+        }
+    }
+
+    /// Name and socket of each live daemon. A repository that does not run
+    /// has no socket, so a request to these targets cannot start one.
+    pub fn live_sockets(&self) -> Vec<(String, PathBuf)> {
+        self.repos
+            .iter()
+            .map(|(id, repo)| (Self::repo_name(id, repo), repo.sock.clone()))
+            .collect()
+    }
+
     pub fn row_count(&self) -> usize {
         self.items.len() + self.cold.len()
     }
@@ -104,8 +124,10 @@ impl App {
 
     pub fn apply(&mut self, event: fanin::Event) {
         match event {
-            fanin::Event::Up { id, identity, .. } => {
-                self.repos.entry(id).or_default().identity = identity;
+            fanin::Event::Up { id, sock, identity } => {
+                let repo = self.repos.entry(id).or_default();
+                repo.sock = sock;
+                repo.identity = identity;
             }
             fanin::Event::Snapshot { id, snapshot } => {
                 self.repos.entry(id).or_default().snapshot = snapshot;
@@ -146,14 +168,7 @@ impl App {
         let names: BTreeMap<&str, String> = self
             .repos
             .iter()
-            .map(|(id, repo)| {
-                let name = match &repo.identity {
-                    Some(identity) => repo_name_for(&identity.common_dir),
-                    // The socket ID is the only name that is known.
-                    None => id.clone(),
-                };
-                (id.as_str(), name)
-            })
+            .map(|(id, repo)| (id.as_str(), Self::repo_name(id, repo)))
             .collect();
         let states: Vec<RepoState<'_>> = self
             .repos
@@ -237,6 +252,7 @@ impl App {
             }
             KeyCode::Enter => self.activate(),
             KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Char('U') => Action::UpdateAll,
             _ => Action::None,
         }
     }
@@ -375,6 +391,31 @@ mod tests {
         );
         assert_eq!(press(&mut app, KeyCode::Char('r')), Action::Refresh);
         assert_eq!(press(&mut app, KeyCode::Char('x')), Action::None);
+    }
+
+    #[test]
+    fn update_all_targets_only_the_live_repositories() {
+        let mut app = app();
+        // The selection is on a cold repository.
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected, 3);
+
+        // `U` is not an activation: it launches nothing.
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Action::UpdateAll);
+        assert_eq!(
+            app.live_sockets(),
+            [
+                ("alpha".to_string(), PathBuf::from("/run/swamp/a.sock")),
+                ("beta".to_string(), PathBuf::from("/run/swamp/b.sock")),
+            ]
+        );
+        assert_eq!(app.cold.len(), 2);
+
+        // With no live repository there is no target at all.
+        let mut app = App::default();
+        app.set_registry(vec![entry("zulu")]);
+        assert_eq!(press(&mut app, KeyCode::Char('U')), Action::UpdateAll);
+        assert!(app.live_sockets().is_empty());
     }
 
     #[test]
