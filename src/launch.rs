@@ -237,6 +237,13 @@ fn acquire_launch_lock(common_dir: &Path) -> Result<std::fs::File> {
 /// Open a new zellij tab for a worktree, using a freshly generated,
 /// `$SHELL`-aware layout rather than an externally-installed one.
 pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
+    open_worktree_tab_in(None, path, name)
+}
+
+/// Open a worktree tab in `session`, or in the current session for `None`.
+/// The cross-repo overview uses this to open a tab in a session that is not
+/// the one that contains the caller.
+pub fn open_worktree_tab_in(session: Option<&str>, path: &Path, name: &str) -> Result<()> {
     let cfg = config::ensure_configs()?;
     let common = git_common_dir(&resolve_git_dir(path)).ok();
     // Resolve this worktree's harness: the repo setting, plus its persisted
@@ -260,7 +267,81 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
         resume = resume.is_some(),
         "wrote worktree tab layout"
     );
-    zellij::new_tab(&layout.to_string_lossy(), path, name)
+    match session {
+        Some(session) => zellij::new_tab_in(session, &layout.to_string_lossy(), path, name),
+        None => zellij::new_tab(&layout.to_string_lossy(), path, name),
+    }
+}
+
+/// Wait until `session` is live and, with `tab`, until it has a tab with
+/// that name.
+///
+/// `zellij attach --create-background` returns before the new session reads
+/// its layout file. The caller must keep that file until the tab from the
+/// layout exists, or the session starts with the default layout.
+fn wait_for_session(session: &str, tab: Option<&str>) -> Result<()> {
+    for _ in 0..100 {
+        let live = zellij::session_state(session)? == Some(zellij::SessionState::Live);
+        let ready = live
+            && tab.is_none_or(|name| {
+                zellij::list_tabs(session).is_ok_and(|tabs| tabs.iter().any(|t| t.name == name))
+            });
+        if ready {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("zellij session {session} did not start within 5 seconds")
+}
+
+/// Make sure that the session of the repository at `common_dir` runs, without
+/// a client attached to it. Returns the session name.
+///
+/// This is the launch path of the cross-repo overview, which then moves its
+/// own client to the session. An exited session is resurrected, as `swamp
+/// launch` does when it attaches.
+pub fn ensure_background_session(common_dir: &Path) -> Result<String> {
+    let worktrees = list_worktrees(common_dir)
+        .with_context(|| format!("list worktrees of {}", common_dir.display()))?;
+    if worktrees.is_empty() {
+        anyhow::bail!("no worktrees found for {}", common_dir.display());
+    }
+    let session = session_name_for(common_dir);
+    let _lock = acquire_launch_lock(common_dir)?;
+    let state = zellij::session_state(&session)?;
+    if state == Some(zellij::SessionState::Live) {
+        return Ok(session);
+    }
+    let cfg = config::ensure_configs()?;
+    crate::registry::record_launch(common_dir);
+    let cwd = common_dir.parent().unwrap_or(common_dir);
+    if state == Some(zellij::SessionState::Exited) {
+        zellij::create_background_session(&session, None, cwd)?;
+        wait_for_session(&session, None)?;
+    } else {
+        let layout = write_multi_tab_layout(&worktrees, &session, &cfg, common_dir)?;
+        zellij::create_background_session(&session, Some(&layout), cwd)?;
+        wait_for_session(&session, Some(layout::DASHBOARD_TAB))?;
+    }
+    Ok(session)
+}
+
+/// Make sure that the dedicated overview session runs, without a client
+/// attached to it. The session holds one pane that runs the overview TUI.
+pub fn ensure_overview_session(session: &str) -> Result<()> {
+    match zellij::session_state(session)? {
+        Some(zellij::SessionState::Live) => return Ok(()),
+        // The session holds no state, so a new one replaces an exited one.
+        Some(zellij::SessionState::Exited) => zellij::delete_session(session)?,
+        None => {}
+    }
+    let layout = layout::write_overview_layout()?;
+    let cwd = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    zellij::create_background_session(session, Some(&layout), &cwd)?;
+    wait_for_session(session, Some(layout::OVERVIEW_TAB))
 }
 
 /// Close the worktree's tab and reopen it, so a harness swap takes effect live.

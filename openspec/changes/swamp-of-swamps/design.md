@@ -70,6 +70,10 @@ that session.
 
 - Inside Zellij, `swamp overview` runs `switch-session swamp-overview`.
 - Outside Zellij, `swamp overview` attaches to the session, or creates it.
+- The session has one pane that runs `swamp overview --no-session`, which is
+  the TUI itself. The pane closes when the TUI exits, so `q` ends the overview
+  session. The next `swamp overview` replaces the exited session with a new
+  one.
 - **Alternative: a floating pane in each repo session.** A `switch-session`
   call from that pane leaves the pane open in the old session. Each session
   then accumulates overview panes.
@@ -78,11 +82,18 @@ that session.
 
 `switch-session` accepts a tab position, not a tab name. The jump sequence is:
 
-1. Run `zellij --session <S> action list-tabs --json`.
-2. Find the tab whose canonical name (see D7) equals the worktree name.
-3. If no tab exists, open one in session `<S>` with the same layout code that
-   the dashboard uses, then list the tabs again.
-4. Run `zellij action switch-session <S> --tab-position <N>`.
+1. Check that session `<S>` is live. Start it in the background when it is not.
+2. Run `zellij --session <S> action list-tabs --json`.
+3. Find the tab whose canonical name (see D7) equals the worktree name.
+4. If the tab exists, run `zellij action switch-session <S> --tab-position <N>`.
+5. If the tab does not exist, run `zellij action switch-session <S>` first.
+   Wait until `<S>` lists a client. Then open the tab in `<S>` with the same
+   layout code that the dashboard uses, and focus it with `go-to-tab-by-id`.
+
+The order in step 5 is necessary. A session with no client has no display
+size, and Zellij cannot lay out a new tab with more than one pane there
+(`Failed to apply layout: Not enough room for panes`). In the flat session
+model the target session usually has no client, so the client must move first.
 
 Spike results (Zellij 0.45.0):
 
@@ -90,18 +101,33 @@ Spike results (Zellij 0.45.0):
   `list-tabs --json` plus 1. Position 2 landed on the tab with `position: 1`.
 - `list-tabs --json` returns objects with `tab_id`, `position`, and `name`.
 - `zellij --session <S> action new-tab` from outside opens the tab in `<S>` and
-  prints the new tab ID on stdout.
-- `zellij --session <S> action switch-session <T>` from outside moves the
-  client of `<S>` to `<T>`.
+  prints the new tab ID on stdout. With more than one pane in the layout, this
+  works only while a client is attached to `<S>`.
 - An action against a session that does not exist prints an error and exits
   with status 0. swamp must check that the session exists before it trusts an
   action result.
+- `zellij action switch-session` moves the client that last sent a key to the
+  session. The overview and the dashboard run the command in response to a key,
+  so the correct client moves. With two clients on one session, only the client
+  that pressed the key moves.
+- `go-to-tab-by-id` from outside moves the attached client, with or without a
+  key from that client.
+- `zellij attach --create-background <S> options --default-layout <file>`
+  returns before the new session reads the file. swamp keeps the layout file
+  until the session lists the tab from the layout.
+- `attach --create-background` resurrects an exited session with that name and
+  ignores the layout. `--force-run-commands` applies to that case.
 
-If step 3 fails, the overview switches to the session without a tab position.
-The user lands on the last active tab, which is an acceptable result.
+If step 5 fails after the switch, the user stays on the last active tab of the
+session, which is an acceptable result. If step 4 fails, the overview switches
+to the session without a tab position.
 
-Outside Zellij, the overview focuses the tab with
-`zellij --session <S> action go-to-tab-by-id`, then attaches.
+Outside Zellij, the overview attaches to `<S>` as a child process. A helper
+thread then waits for the client, opens the tab when it is absent, and focuses
+it with `go-to-tab-by-id`.
+
+Cold-repo activation starts the session with `attach --create-background`, so
+that no client is nested in the overview pane, and then switches to it.
 
 ### D4. `GetInfo`, with identity derived from the snapshot for old daemons
 

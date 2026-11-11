@@ -2,7 +2,7 @@ use super::client::{request_branches, send_refresh, send_update, subscribe_loop}
 use super::ensure_daemon;
 use super::input::{
     activate_worktree_tab, handle_create_key, handle_delete_current_tab_key, handle_delete_key,
-    handle_input_key, handle_mouse, spawn_close_tab,
+    handle_input_key, handle_mouse, handle_open_overview_key, spawn_close_tab,
 };
 use super::state::{AppState, CreatePicker, CreateStep, HitRegions, InputMode};
 use super::view;
@@ -393,6 +393,9 @@ where
                                 let _ = tx.send(AppEvent::UpdateDone(Err(e.to_string()))).await;
                             }
                         });
+                    }
+                    KeyCode::Char('O') => {
+                        handle_open_overview_key(&mut app, &tx, crate::zellij::in_zellij());
                     }
                     KeyCode::Char('K') => {
                         return kill::run(Some(common.parent().unwrap_or(common).to_path_buf()));

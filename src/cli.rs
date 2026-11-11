@@ -111,6 +111,12 @@ pub enum Cmd {
     Kill(KillArgs),
 
     #[command(
+        about = "Show what needs you across all repos",
+        long_about = "Open the cross-repo overview: one list of the worktrees that need you in every running repo session, plus the registered repos that are not running. Enter moves you to the session and tab of the selected worktree, or launches the selected repo. The overview runs in its own Zellij session, `swamp-overview`, which swamp creates when it does not exist."
+    )]
+    Overview(OverviewArgs),
+
+    #[command(
         about = "Add a repo to the registry",
         long_about = "Record a repo in swamp's registry without launching it, so that cross-repo commands can list it while no session runs. With --all-live, record every repo that has a running daemon, including a daemon from an older swamp version. No daemon or session is started, stopped, or restarted."
     )]
@@ -323,6 +329,13 @@ pub struct KillArgs {
 }
 
 #[derive(Args)]
+pub struct OverviewArgs {
+    /// Run the overview TUI in this terminal, not in the `swamp-overview` session.
+    #[arg(long)]
+    pub no_session: bool,
+}
+
+#[derive(Args)]
 pub struct RegisterArgs {
     /// Path inside the repo to register (default: current directory).
     #[arg(value_name = "DIR", conflicts_with = "all_live")]
@@ -378,6 +391,7 @@ mod tests {
         assert!(help.contains("completions"));
         assert!(help.contains("clone"));
         assert!(help.contains("slot"));
+        assert!(help.contains("overview"));
         assert!(help.contains("register"));
         assert!(help.contains("forget"));
         assert!(!help.contains("codex-notify"));

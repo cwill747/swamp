@@ -28,18 +28,18 @@ Each numbered group from 2 through 5 is one pull request. Before each push, run
 
 ## 3. PR 2: Overview TUI with jump and cold launch
 
-- [ ] 3.1 Add the fan-in module: scan the runtime directory for `*.sock` each 2 seconds, connect, send `GetInfo` then `Subscribe`, and drop a connection that fails; verify with a test that starts two in-process daemons and observes both, then stops one and observes its removal
-- [ ] 3.2 Use the identification from task 2.9 in the fan-in module, and add the registry fallback that matches the socket file stem to `repo_id(common_dir)` of each entry; verify with a test against a fake daemon that rejects `GetInfo`, for usable row paths, for unusable paths with a registered repo, and for an unidentifiable repo
-- [ ] 3.3 Implement the attention ranking as a pure function over the snapshots of all repos; verify with unit tests for each tier, a worktree in two tiers, the default-branch exclusion, the `deleting` exclusion, and the order inside tier 1 and tier 5
-- [ ] 3.4 Add tab resolution in `src/zellij.rs`: parse `list-tabs --json` for a given session and return ID, position, and name; verify with a parser test on the JSON captured in task 1.2
-- [ ] 3.5 Implement jump: resolve the tab, open it in the target session when it is absent, then `switch-session --tab-position`; fall back to a switch without a position on failure; verify by hand in two live repo sessions and record the steps in the PR description
-- [ ] 3.6 Implement jump outside Zellij with `go-to-tab-by-id` and attach; verify by hand from a plain terminal
-- [ ] 3.7 Build the overview view: item rows with repo, worktree, reason, and age; a separate section for cold repos; an empty state; the old-daemon hint; verify with render tests on a fixed-size buffer for each state
-- [ ] 3.8 Add overview input: movement, `Enter`, `r`, and `q`; verify with input tests that selection crosses from items into cold repos and that `q` exits without a daemon request
-- [ ] 3.9 Implement cold-repo activation: run the launch path for the registered `common_dir`, then switch to the session; show a launch failure in the footer; verify by hand with a killed repo and with a registry entry that points to a broken repo
-- [ ] 3.10 Add the public `swamp overview` command with the dedicated `swamp-overview` session: create or attach outside Zellij, `switch-session` inside Zellij, and no second TUI when the session exists; verify by hand for all three cases
-- [ ] 3.11 Add the dashboard TUI key `O` that opens the overview, with a footer message outside Zellij; verify with an input test for the outside-Zellij case and by hand inside Zellij
-- [ ] 3.12 Update the README for `overview` and the `O` key, and regenerate completions; verify that `swamp --help` lists `overview`
+- [x] 3.1 Add the fan-in module: scan the runtime directory for `*.sock` each 2 seconds, connect, send `GetInfo` then `Subscribe`, and drop a connection that fails; verify with a test that starts two in-process daemons and observes both, then stops one and observes its removal
+- [x] 3.2 Use the identification from task 2.9 in the fan-in module, and add the registry fallback that matches the socket file stem to `repo_id(common_dir)` of each entry; verify with a test against a fake daemon that rejects `GetInfo`, for usable row paths, for unusable paths with a registered repo, and for an unidentifiable repo
+- [x] 3.3 Implement the attention ranking as a pure function over the snapshots of all repos; verify with unit tests for each tier, a worktree in two tiers, the default-branch exclusion, the `deleting` exclusion, and the order inside tier 1 and tier 5
+- [x] 3.4 Add tab resolution in `src/zellij.rs`: parse `list-tabs --json` for a given session and return ID, position, and name; verify with a parser test on the JSON captured in task 1.2
+- [x] 3.5 Implement jump: resolve the tab, open it in the target session when it is absent, then `switch-session --tab-position`; fall back to a switch without a position on failure; verify by hand in two live repo sessions and record the steps in the PR description
+- [x] 3.6 Implement jump outside Zellij with `go-to-tab-by-id` and attach; verify by hand from a plain terminal
+- [x] 3.7 Build the overview view: item rows with repo, worktree, reason, and age; a separate section for cold repos; an empty state; the old-daemon hint; verify with render tests on a fixed-size buffer for each state
+- [x] 3.8 Add overview input: movement, `Enter`, `r`, and `q`; verify with input tests that selection crosses from items into cold repos and that `q` exits without a daemon request
+- [x] 3.9 Implement cold-repo activation: run the launch path for the registered `common_dir`, then switch to the session; show a launch failure in the footer; verify by hand with a killed repo and with a registry entry that points to a broken repo
+- [x] 3.10 Add the public `swamp overview` command with the dedicated `swamp-overview` session: create or attach outside Zellij, `switch-session` inside Zellij, and no second TUI when the session exists; verify by hand for all three cases
+- [x] 3.11 Add the dashboard TUI key `O` that opens the overview, with a footer message outside Zellij; verify with an input test for the outside-Zellij case and by hand inside Zellij
+- [x] 3.12 Update the README for `overview` and the `O` key, and regenerate completions; verify that `swamp --help` lists `overview`
 
 ## 4. PR 3: Update all
 

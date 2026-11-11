@@ -244,7 +244,9 @@ pub fn run_forget(dir: Option<PathBuf>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::discover::RepoIdentity;
-    use crate::discover::test_support::{InfoReply, row, spawn_fake_daemon, temp_dir};
+    use crate::discover::test_support::{
+        InfoReply, row, spawn_fake_daemon, stale_socket, temp_dir,
+    };
     use crate::util::repo_id;
     use crate::worktree::create_worktree;
     use crate::worktree::test_support::{git_available, setup};
@@ -432,7 +434,7 @@ mod tests {
             vec![row("gone", &tmp.join("no-such-worktree"))],
         );
         let stale_sock = runtime.join("dddddddddddddddd.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale_sock).unwrap());
+        stale_socket(&stale_sock);
 
         let report = register_all_live_at(&reg, &runtime).await.unwrap();
 

@@ -89,6 +89,33 @@ pub(super) fn activate_worktree_tab(tx: mpsc::Sender<AppEvent>, path: PathBuf, n
     });
 }
 
+/// Footer message for the `O` key when the TUI does not run inside Zellij.
+pub(super) const OVERVIEW_NEEDS_ZELLIJ: &str =
+    "Not inside Zellij: run `swamp overview` in a terminal";
+
+/// Handle the `O` key: move the client to the cross-repo overview session.
+/// The switch needs a Zellij client, so outside Zellij the footer says how to
+/// open the overview and nothing else happens.
+pub(super) fn handle_open_overview_key(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppEvent>,
+    in_zellij: bool,
+) {
+    if !in_zellij {
+        app.status_msg = Some(OVERVIEW_NEEDS_ZELLIJ.into());
+        return;
+    }
+    app.status_msg = None;
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::overview::open_session() {
+            let _ = tx.blocking_send(AppEvent::ZellijError(format!(
+                "open overview failed: {e:#}"
+            )));
+        }
+    });
+}
+
 /// Open (if needed) and switch to the tab for the worktree at `idx`.
 fn jump_to_worktree(app: &AppState, tx: mpsc::Sender<AppEvent>, idx: usize) {
     if let Some(r) = app.snapshot.rows.get(idx) {
@@ -753,6 +780,20 @@ mod tests {
             regions: super::super::state::HitRegions::default(),
             last_click: None,
         }
+    }
+
+    /// Outside Zellij, `O` cannot switch a client. It reports that in the
+    /// footer and starts no session.
+    #[tokio::test]
+    async fn open_overview_key_outside_zellij_sets_a_footer_message() {
+        let mut app = app_with_row(row("feature", None, false));
+        let (tx, mut rx) = mpsc::channel(4);
+
+        handle_open_overview_key(&mut app, &tx, false);
+
+        assert_eq!(app.status_msg.as_deref(), Some(OVERVIEW_NEEDS_ZELLIJ));
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "no background work was started");
     }
 
     /// Pressing `d` on a row carrying a blocking reason opens the confirmation

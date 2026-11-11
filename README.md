@@ -179,6 +179,7 @@ Useful keys:
 | `h`       | Choose Claude or Codex harness      |
 | `r`       | Refresh status                      |
 | `u`       | Update branches                     |
+| `O`       | Open the cross-repo overview        |
 | `K`       | Kill the swamp session              |
 | `q`       | Quit                                |
 
@@ -286,6 +287,50 @@ app/
 
 swamp creates and removes worktrees in this layout itself. You do not need
 another worktree tool.
+
+### `swamp overview`
+
+Shows one list of the worktrees that need you, across every running repo
+session:
+
+```bash
+swamp overview
+```
+
+The overview runs in its own Zellij session, `swamp-overview`. Outside Zellij,
+the command attaches to that session. Inside Zellij, it switches your client to
+that session. swamp creates the session when it does not exist. From a repo
+dashboard, press `O` to do the same.
+
+A worktree is listed one time, for the first reason that applies:
+
+1. The agent waits for you.
+2. The pull request checks failed.
+3. The pull request review requests changes.
+4. The worktree has a merge conflict or a rebase in progress.
+5. The agent is idle and the worktree has uncommitted changes. The default
+   branch is not listed for this reason.
+
+Registered repos with no running session are listed under **Not running**.
+
+| Key           | Action                                                     |
+| ------------- | ---------------------------------------------------------- |
+| `j` / `↓`     | Move selection down                                        |
+| `k` / `↑`     | Move selection up                                          |
+| `g` / `G`     | Select the first or the last row                           |
+| `Enter`       | Go to the session and tab of the selected worktree, or launch the selected repo |
+| `r`           | Reload the registry and refresh the status of each repo    |
+| `q`           | Quit. This ends the `swamp-overview` session only          |
+
+`Enter` moves your Zellij client to the repo session. It does not nest that
+session in the overview. If the worktree has no open tab, swamp opens one.
+
+To run the overview in the current terminal, without the dedicated session, use
+`swamp overview --no-session`.
+
+A session that runs an older swamp version shows its worktrees in the overview.
+To let the overview launch a repo that is not running, register the repo with
+`swamp register`.
 
 ### `swamp register`
 

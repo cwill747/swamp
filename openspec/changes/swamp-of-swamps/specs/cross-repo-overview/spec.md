@@ -6,7 +6,7 @@ the user and moves the user to the correct repo session and worktree tab.
 ## ADDED Requirements
 
 ### Requirement: Overview Session
-`swamp overview` SHALL open a dedicated Zellij session that contains the overview TUI. The command SHALL create the session when it does not exist and SHALL reuse it when it exists.
+`swamp overview` SHALL open a dedicated Zellij session that contains the overview TUI. The command SHALL create the session when it does not exist and SHALL reuse it when it exists. With `--no-session`, the command SHALL run the overview TUI in the current terminal and SHALL NOT create a session.
 
 #### Scenario: Run outside Zellij
 - **WHEN** the user runs `swamp overview` outside any Zellij session
@@ -20,6 +20,11 @@ the user and moves the user to the correct repo session and worktree tab.
 #### Scenario: Overview session already exists
 - **WHEN** the overview session exists and the user runs `swamp overview`
 - **THEN** swamp does not start a second overview TUI
+
+#### Scenario: Run in the current terminal
+- **WHEN** the user runs `swamp overview --no-session`
+- **THEN** the overview TUI runs in the current terminal
+- **AND** swamp does not create the overview session
 
 ### Requirement: Repo Discovery
 The overview SHALL discover each live per-repo daemon in the swamp runtime directory without configuration, and SHALL add and remove repositories as daemons start and stop while the overview runs.
@@ -117,6 +122,10 @@ Activation of an item SHALL move the user to the Zellij session of that reposito
 - **WHEN** swamp cannot find or open the worktree tab
 - **THEN** the client still moves to the repo session
 - **AND** the overview does not exit with an error
+
+#### Scenario: Overview runs outside Zellij
+- **WHEN** the user activates an item in an overview that runs outside Zellij
+- **THEN** swamp attaches the terminal to that repo session with that tab in focus
 
 #### Scenario: Worktree tab has a badge
 - **WHEN** the worktree tab name carries an attention badge
