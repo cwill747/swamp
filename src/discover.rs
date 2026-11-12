@@ -7,6 +7,7 @@
 
 use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
 use crate::daemon::state::WorktreeRow;
+use crate::registry::RepoEntry;
 use crate::util::{repo_id, session_name_for};
 use crate::worktree::git_common_dir;
 use std::path::{Path, PathBuf};
@@ -49,7 +50,10 @@ pub fn socket_files(runtime_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Connect to the daemon at `sock` and determine which repository it serves.
-pub async fn probe(sock: &Path) -> Probe {
+///
+/// `registry` holds the registered repositories. It identifies an older
+/// daemon whose snapshot has no usable worktree path.
+pub async fn probe(sock: &Path, registry: &[RepoEntry]) -> Probe {
     let Some(mut stream) = connect(sock).await else {
         return Probe::NotLive;
     };
@@ -75,11 +79,9 @@ pub async fn probe(sock: &Path) -> Probe {
     let Some(stem) = sock.file_stem().and_then(|s| s.to_str()) else {
         return Probe::Unidentified;
     };
-    match first_snapshot_rows(sock).await {
-        Some(rows) => match identity_from_rows(stem, &rows) {
-            Some(identity) => Probe::Identified(identity),
-            None => Probe::Unidentified,
-        },
+    let rows = first_snapshot_rows(sock).await.unwrap_or_default();
+    match identity_from_rows(stem, &rows).or_else(|| identity_from_registry(stem, registry)) {
+        Some(identity) => Probe::Identified(identity),
         None => Probe::Unidentified,
     }
 }
@@ -119,6 +121,19 @@ pub fn identity_from_rows(socket_stem: &str, rows: &[WorktreeRow]) -> Option<Rep
         .map(|common| RepoIdentity {
             session_name: session_name_for(&common),
             common_dir: std::fs::canonicalize(&common).unwrap_or(common),
+            version: None,
+        })
+}
+
+/// Find the registered repository whose `repo_id` equals `socket_stem`. This
+/// identifies an older daemon whose worktree paths are all gone.
+pub fn identity_from_registry(socket_stem: &str, entries: &[RepoEntry]) -> Option<RepoIdentity> {
+    entries
+        .iter()
+        .find(|entry| repo_id(&entry.common_dir) == socket_stem)
+        .map(|entry| RepoIdentity {
+            common_dir: entry.common_dir.clone(),
+            session_name: entry.session_name.clone(),
             version: None,
         })
 }
@@ -277,7 +292,7 @@ mod tests {
         };
         let daemon = spawn_fake_daemon(&sock, InfoReply::Answer(identity.clone()), Vec::new());
 
-        assert_eq!(probe(&sock).await, Probe::Identified(identity));
+        assert_eq!(probe(&sock, &[]).await, Probe::Identified(identity));
         daemon.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -293,7 +308,7 @@ mod tests {
 
         let sock = dir.join(format!("{}.sock", repo_id(&bare)));
         let daemon = spawn_fake_daemon(&sock, InfoReply::Reject, vec![row("feature", &wt.path)]);
-        match probe(&sock).await {
+        match probe(&sock, &[]).await {
             Probe::Identified(id) => {
                 assert_eq!(id.common_dir, bare.canonicalize().unwrap());
                 assert_eq!(id.version, None);
@@ -305,7 +320,7 @@ mod tests {
         // Same rows behind a socket whose name does not match the repository.
         let wrong = dir.join("0000000000000000.sock");
         let daemon = spawn_fake_daemon(&wrong, InfoReply::Reject, vec![row("feature", &wt.path)]);
-        assert_eq!(probe(&wrong).await, Probe::Unidentified);
+        assert_eq!(probe(&wrong, &[]).await, Probe::Unidentified);
         daemon.abort();
 
         // A daemon whose worktree paths are all gone.
@@ -315,7 +330,33 @@ mod tests {
             InfoReply::Reject,
             vec![row("gone", &root.join("no-such-worktree"))],
         );
-        assert_eq!(probe(&gone).await, Probe::Unidentified);
+        assert_eq!(probe(&gone, &[]).await, Probe::Unidentified);
+        daemon.abort();
+
+        // The registry identifies an old daemon that reports no usable path.
+        let empty = dir.join(format!("{}.sock", repo_id(&bare)));
+        let _ = std::fs::remove_file(&empty);
+        let daemon = spawn_fake_daemon(&empty, InfoReply::Reject, vec![]);
+        let entry = RepoEntry {
+            common_dir: bare.clone(),
+            session_name: "demo-1a2b".into(),
+            last_launched: 0,
+        };
+        assert_eq!(probe(&empty, &[]).await, Probe::Unidentified);
+        assert_eq!(
+            probe(&empty, std::slice::from_ref(&entry)).await,
+            Probe::Identified(RepoIdentity {
+                common_dir: bare.clone(),
+                session_name: "demo-1a2b".into(),
+                version: None,
+            })
+        );
+        // An entry of a different repository does not match the socket.
+        let other = RepoEntry {
+            common_dir: root.join("other/.bare"),
+            ..entry
+        };
+        assert_eq!(probe(&empty, &[other]).await, Probe::Unidentified);
         daemon.abort();
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -328,8 +369,8 @@ mod tests {
         let sock = dir.join("2222222222222222.sock");
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
         assert!(sock.exists());
-        assert_eq!(probe(&sock).await, Probe::NotLive);
-        assert_eq!(probe(&dir.join("missing.sock")).await, Probe::NotLive);
+        assert_eq!(probe(&sock, &[]).await, Probe::NotLive);
+        assert_eq!(probe(&dir.join("missing.sock"), &[]).await, Probe::NotLive);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
