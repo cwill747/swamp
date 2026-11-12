@@ -402,8 +402,9 @@ fn place(
 }
 
 /// Check `branch` out over the existing slot at `path`. The checkout is safe:
-/// it refuses to overwrite files it cannot restore, and it leaves ignored
-/// files (build output) in place.
+/// it refuses to overwrite files it cannot restore, and it refuses to
+/// overwrite an ignored file (such as a local `.env`) that `branch` tracks.
+/// Other ignored files (build output) stay in place.
 fn checkout_branch_in(path: &Path, branch: &str) -> Result<()> {
     let repo = Repository::open(path).with_context(|| format!("open {}", path.display()))?;
     let refname = format!("refs/heads/{branch}");
@@ -411,7 +412,7 @@ fn checkout_branch_in(path: &Path, branch: &str) -> Result<()> {
         .revparse_single(&refname)
         .with_context(|| format!("resolve {refname}"))?;
     let mut co = CheckoutBuilder::new();
-    co.safe();
+    co.safe().overwrite_ignored(false);
     repo.checkout_tree(&target, Some(&mut co))
         .with_context(|| format!("check out {branch} in {}", path.display()))?;
     repo.set_head(&refname)
@@ -924,6 +925,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(b.path.join("target/cache.bin")).unwrap(),
             "warm"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn alloc_skips_slot_whose_ignored_file_the_branch_tracks() {
+        if !git_available() {
+            return;
+        }
+        let (scratch, _origin, common) = cloned();
+        let a = alloc(&common, "tracked", OPTS).unwrap();
+        std::fs::create_dir_all(a.path.join("target")).unwrap();
+        std::fs::write(a.path.join("target/x"), "branch").unwrap();
+        run(&a.path, &["add", "-f", "target/x"]);
+        run(&a.path, &["commit", "-q", "-m", "track target/x"]);
+        run(&a.path, &["checkout", "-q", "--detach", "origin/main"]);
+        // work1 is now free, with an ignored local file at the same path.
+        std::fs::create_dir_all(a.path.join("target")).unwrap();
+        std::fs::write(a.path.join("target/x"), "local").unwrap();
+
+        let b = alloc(&common, "tracked", OPTS).unwrap();
+
+        assert_eq!(b.name, "work2");
+        assert_eq!(
+            std::fs::read_to_string(a.path.join("target/x")).unwrap(),
+            "local"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
