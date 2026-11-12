@@ -229,6 +229,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
+                d.expire_subagents(crate::util::now_unix()).await;
                 tracing::debug!(trigger = "heartbeat", "git refresh");
                 if let Err(e) = d.refresh_all().await {
                     tracing::warn!("heartbeat refresh: {e:?}");
@@ -804,9 +805,10 @@ impl Daemon {
         status: &str,
         session_name: Option<&str>,
         session_id: Option<&str>,
+        subagent: Option<&state::SubagentEvent>,
     ) -> Result<()> {
         let mut s = self.state.write().await;
-        let changed = s.apply_hook(wt_name, status, session_name, session_id)?;
+        let changed = s.apply_hook_event(wt_name, status, session_name, session_id, subagent)?;
         if !changed {
             // Timestamp-only ping (active agents send one per tool call). The
             // in-memory record is fresh; skip the persist — whose status-file
@@ -826,6 +828,18 @@ impl Daemon {
 
     /// Record the per-worktree harness override, persist it, and broadcast the
     /// refreshed snapshot so the indicator updates.
+    /// Drop finished and stale subagents, and broadcast a snapshot when any
+    /// were dropped. Subagents are in memory only, so there is no persist.
+    pub async fn expire_subagents(&self, now: u64) {
+        let mut s = self.state.write().await;
+        if s.expire_subagents(now) {
+            tracing::debug!("expired subagents");
+            let snap = s.snapshot();
+            drop(s);
+            let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        }
+    }
+
     pub async fn set_harness(&self, wt_name: &str, harness: crate::config::Harness) -> Result<()> {
         let mut s = self.state.write().await;
         s.set_harness(wt_name, harness);
@@ -949,6 +963,7 @@ mod tests {
             is_default: false,
             removal_block: None,
             deleting: false,
+            subagents: Vec::new(),
         }
     }
 
@@ -986,6 +1001,73 @@ mod tests {
             }
         }
         assert!(cleared, "dropping the guard must clear the deleting mark");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Subagent start, stop, and expiry broadcast a snapshot. An activity ping
+    /// for a known subagent does not.
+    #[tokio::test]
+    async fn subagent_changes_broadcast_and_pings_do_not() {
+        use crate::daemon::state::{SUBAGENT_DONE_GRACE_SECS, SubagentEvent, SubagentEventKind};
+        if !git_available() {
+            eprintln!("skipping subagent_changes_broadcast_and_pings_do_not: git not on PATH");
+            return;
+        }
+        let repo = git_init_repo();
+        let common = git_common_dir(&repo).unwrap();
+        let daemon = build_daemon(&common).await;
+        daemon
+            .state
+            .write()
+            .await
+            .rows
+            .insert("feature".into(), make_row("feature"));
+        let mut rx = daemon.tx.subscribe();
+        let ev = |kind| SubagentEvent {
+            kind,
+            agent_id: Some("a1".into()),
+            agent_type: "Explore".into(),
+            description: None,
+        };
+        let hook = |kind| {
+            let daemon = daemon.clone();
+            async move {
+                daemon
+                    .apply_hook("feature", "working", None, None, Some(&ev(kind)))
+                    .await
+                    .unwrap();
+            }
+        };
+        let snapshots = |rx: &mut broadcast::Receiver<ServerMsg>| {
+            let mut n = 0;
+            while let Ok(msg) = rx.try_recv() {
+                if matches!(msg, ServerMsg::Snapshot(_)) {
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        hook(SubagentEventKind::Start).await;
+        assert_eq!(snapshots(&mut rx), 1, "start broadcasts");
+        hook(SubagentEventKind::Activity).await;
+        assert_eq!(snapshots(&mut rx), 0, "activity ping does not broadcast");
+        hook(SubagentEventKind::Stop).await;
+        assert_eq!(snapshots(&mut rx), 1, "stop broadcasts");
+
+        let now = crate::util::now_unix();
+        daemon.expire_subagents(now).await;
+        assert_eq!(snapshots(&mut rx), 0, "nothing to expire yet");
+        daemon
+            .expire_subagents(now + SUBAGENT_DONE_GRACE_SECS + 5)
+            .await;
+        assert_eq!(snapshots(&mut rx), 1, "expiry broadcasts");
+        assert!(
+            daemon.state.read().await.snapshot().rows[0]
+                .subagents
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }

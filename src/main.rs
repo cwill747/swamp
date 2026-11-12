@@ -29,7 +29,10 @@ async fn main() -> Result<()> {
             dir,
             session_name,
             session_id,
-        })) => hook::run(status.to_string(), dir, session_name, session_id).await,
+        })) => {
+            let payload = hook::read_stdin_payload();
+            hook::run(status.to_string(), dir, session_name, session_id, payload).await
+        }
         Some(cli::Cmd::CodexNotify(args)) => codex_notify::run(args.payload).await,
         Some(cli::Cmd::RelaunchTab(args)) => launch::relaunch_worktree_tab(&args.name, &args.dir),
         Some(cli::Cmd::ConfirmDelete(args)) => {
