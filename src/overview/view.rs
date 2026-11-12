@@ -162,17 +162,63 @@ fn body(app: &App, now: u64) -> (Vec<Line<'static>>, usize) {
     (lines, selected_line)
 }
 
+/// Break `text` into lines of `width` columns or fewer. A break is at a
+/// space when possible. A word that is longer than `width` is cut.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut len = 0;
+    for word in text.split(' ') {
+        let mut word: Vec<char> = word.chars().collect();
+        if len > 0 && len + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut line));
+            len = 0;
+        }
+        if len > 0 {
+            line.push(' ');
+            len += 1;
+        }
+        while len + word.len() > width {
+            let rest = word.split_off(width - len);
+            line.extend(word);
+            lines.push(std::mem::take(&mut line));
+            len = 0;
+            word = rest;
+        }
+        len += word.len();
+        line.extend(word);
+    }
+    lines.push(line);
+    lines
+}
+
 /// Draw the overview. `now` is the current Unix time, for the item ages.
 pub fn render(f: &mut Frame, app: &App, now: u64) {
+    let area = f.area();
+    // A status message that is wider than the screen continues on more rows.
+    // The list keeps half of the screen or more.
+    let (footer, style) = match &app.status {
+        Some(status) => (
+            wrap(&status.text, area.width as usize),
+            Style::default().fg(if status.error {
+                Color::Red
+            } else {
+                Color::Green
+            }),
+        ),
+        None => (vec![FOOTER_HINT.to_string()], muted()),
+    };
+    let footer_height = footer.len().min((area.height as usize / 2).max(1)) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
-        .split(f.area());
+        .split(area);
 
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     let header = Line::from(vec![
@@ -198,18 +244,11 @@ pub fn render(f: &mut Frame, app: &App, now: u64) {
         chunks[2],
     );
 
-    let footer = match &app.status {
-        Some(status) => Span::styled(
-            status.text.clone(),
-            Style::default().fg(if status.error {
-                Color::Red
-            } else {
-                Color::Green
-            }),
-        ),
-        None => Span::styled(FOOTER_HINT, muted()),
-    };
-    f.render_widget(Paragraph::new(Line::from(footer)), chunks[3]);
+    let footer: Vec<Line> = footer
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect();
+    f.render_widget(Paragraph::new(footer), chunks[3]);
 }
 
 #[cfg(test)]
@@ -340,6 +379,34 @@ mod tests {
         app.error("launch failed: no worktrees found");
         let lines = screen(&app, 80, 6);
         assert_eq!(lines[5], "launch failed: no worktrees found");
+    }
+
+    #[test]
+    fn a_long_status_message_continues_on_more_rows() {
+        let mut app = App::default();
+        app.error("Updated 1 of 3 repos. Failed: beta, gamma. beta: no default branch; gamma: the daemon does not answer");
+        let lines = screen(&app, 40, 12);
+        assert_eq!(
+            lines[9..],
+            [
+                "Updated 1 of 3 repos. Failed: beta,",
+                "gamma. beta: no default branch; gamma:",
+                "the daemon does not answer",
+            ]
+        );
+        // The message gets no more than half of a short screen.
+        let lines = screen(&app, 20, 6);
+        assert_eq!(lines[3], "Updated 1 of 3");
+        assert_eq!(lines[4], "repos. Failed: beta,");
+        assert_eq!(lines[5], "gamma. beta: no");
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_cuts_a_long_word() {
+        assert_eq!(wrap("one two", 20), ["one two"]);
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("abcdefgh ij", 3), ["abc", "def", "gh", "ij"]);
+        assert_eq!(wrap("", 5), [""]);
     }
 
     #[test]
