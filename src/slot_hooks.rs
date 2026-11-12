@@ -126,27 +126,55 @@ fn run_one(hook: &HookCommand, env: &HookEnv) -> HookRun {
     // Drop our copies of the write end so the reader sees EOF when the hook
     // and its children exit.
     drop(cmd);
-    let collector = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    // The collector reads in chunks into a shared buffer, so a timeout can
+    // still report what the hook printed. It signals on `done` at EOF.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
+    {
+        let buf = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+            let _ = done_tx.send(());
+        });
+    }
 
-    let started = Instant::now();
-    let status = loop {
+    // The deadline covers the shell and every process that still holds the
+    // output pipe: a hook that leaves `sleep 600 &` behind must not hang the
+    // slot operation after `sh` exits.
+    let deadline = Instant::now() + timeout;
+    let kill_group = |child: &mut std::process::Child| {
+        // SAFETY: plain syscall on the child's process group id.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    };
+    let timed_out = || format!("timed out after {}s", timeout.as_secs());
+    let mut status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) if started.elapsed() >= timeout => {
-                // SAFETY: plain syscall on the child's process group id.
-                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            Ok(None) if Instant::now() >= deadline => {
+                kill_group(&mut child);
                 let _ = child.wait();
-                break Err(format!("timed out after {}s", timeout.as_secs()));
+                break Err(timed_out());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => break Err(format!("wait for hook: {e}")),
         }
     };
-    let output = collector.join().unwrap_or_default();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if done.recv_timeout(remaining).is_err() {
+        // A background process still holds the pipe after the deadline.
+        kill_group(&mut child);
+        let _ = done.recv_timeout(Duration::from_secs(1));
+        if status.is_ok() {
+            status = Err(timed_out());
+        }
+    }
+    let output = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     match status {
         Ok(s) if s.success() => HookRun {
             command: hook.run.clone(),
@@ -255,5 +283,37 @@ mod tests {
         assert!(runs[0].error.as_deref().unwrap().contains("timed out"));
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!marker.exists(), "child in the hook's group must be killed");
+    }
+
+    #[test]
+    fn background_child_holding_output_cannot_outlast_timeout() {
+        let dir = std::env::temp_dir();
+        let lingering = HookCommand {
+            run: "echo started; sleep 30 &".into(),
+            timeout_secs: Some(1),
+        };
+
+        let started = Instant::now();
+        let runs = run_hooks(&[lingering], &env(&dir));
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!runs[0].success);
+        assert!(runs[0].error.as_deref().unwrap().contains("timed out"));
+        assert!(runs[0].output.contains("started"));
+    }
+
+    #[test]
+    fn detached_background_child_does_not_block() {
+        let dir = std::env::temp_dir();
+        let detached = HookCommand {
+            run: "sleep 30 >/dev/null 2>&1 &".into(),
+            timeout_secs: Some(5),
+        };
+
+        let started = Instant::now();
+        let runs = run_hooks(&[detached], &env(&dir));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(runs[0].success, "{:?}", runs[0].error);
     }
 }
