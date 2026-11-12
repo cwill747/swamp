@@ -105,6 +105,13 @@ pub enum Cmd {
     DeleteTab(DeleteTabArgs),
 
     #[command(
+        hide = true,
+        about = "Open or close a slot tab",
+        long_about = "Open (without taking focus) or close the Zellij tab of a slot or overflow worktree. `swamp slot alloc` and `release` spawn this command with ZELLIJ_SESSION_NAME set to the repo session; it is not intended for interactive use."
+    )]
+    SlotTab(SlotTabArgs),
+
+    #[command(
         about = "Stop the repo session",
         long_about = "Stop the per-repo daemon, kill the matching Zellij session, and remove swamp's runtime socket and PID files."
     )]
@@ -143,9 +150,9 @@ pub enum Cmd {
 
     #[command(
         about = "Install user config and agent hooks",
-        long_about = "Write swamp's config file if it is missing, refresh managed config files, install or update Claude Code hooks, and configure Codex notify."
+        long_about = "Write swamp's config file if it is missing, refresh managed config files, install or update Claude Code hooks, and configure Codex notify. With --claude-worktrees, also install Claude Code WorktreeCreate and WorktreeRemove hooks so that `claude --worktree` and worktree subagents use swamp's slot pool."
     )]
-    Init,
+    Init(InitArgs),
 
     #[command(
         about = "Manage the reusable worktree pool",
@@ -164,6 +171,14 @@ pub enum Cmd {
         long_about = "Generate shell completions for swamp. Packagers should use this command to install completions from the exact binary they ship."
     )]
     Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+pub struct InitArgs {
+    /// Also route Claude Code worktrees through the slot pool. This changes
+    /// `claude --worktree` for every repository on this machine.
+    #[arg(long)]
+    pub claude_worktrees: bool,
 }
 
 #[derive(Args)]
@@ -186,14 +201,22 @@ pub enum SlotCmd {
     )]
     Alloc {
         /// Branch to check out or create. Unsafe characters become `-`.
-        #[arg(value_name = "BRANCH")]
-        branch: String,
+        #[arg(value_name = "BRANCH", required_unless_present = "hook_json")]
+        branch: Option<String>,
+        /// Read the branch from a Claude Code `WorktreeCreate` hook payload on
+        /// stdin (its `name` field). Implies --no-tab: Claude runs in the
+        /// worktree itself.
+        #[arg(long, conflicts_with = "branch")]
+        hook_json: bool,
         /// Skip the fetch of the default remote.
         #[arg(long)]
         offline: bool,
         /// Skip the `post-alloc` hooks.
         #[arg(long)]
         no_hooks: bool,
+        /// Do not open a Zellij tab for the worktree.
+        #[arg(long)]
+        no_tab: bool,
     },
     /// Detach a slot so it returns to the pool.
     #[command(
@@ -203,6 +226,10 @@ pub enum SlotCmd {
         /// Slot name, worktree path, or branch name (default: the worktree that contains the current directory).
         #[arg(value_name = "TARGET")]
         target: Option<String>,
+        /// Read the target from a Claude Code `WorktreeRemove` hook payload on
+        /// stdin (its `worktree_path` field).
+        #[arg(long, conflicts_with = "target")]
+        hook_json: bool,
         /// Skip the safety checks.
         #[arg(long)]
         force: bool,
@@ -212,6 +239,9 @@ pub enum SlotCmd {
         /// Skip the `pre-release` hooks.
         #[arg(long)]
         no_hooks: bool,
+        /// Do not close the slot's Zellij tab.
+        #[arg(long)]
+        no_tab: bool,
     },
     /// Hold a free slot so allocation skips it.
     Pin {
@@ -334,6 +364,24 @@ pub struct DeleteTabArgs {
     pub force: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SlotTabOp {
+    Open,
+    Close,
+}
+
+#[derive(Args)]
+pub struct SlotTabArgs {
+    #[arg(value_enum)]
+    pub op: SlotTabOp,
+    /// Worktree (tab) name.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Worktree path.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+}
+
 #[derive(Args)]
 pub struct KillArgs {
     /// Path inside the repo session to stop (default: current directory).
@@ -412,6 +460,7 @@ mod tests {
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));
         assert!(!help.contains("delete-tab"));
+        assert!(!help.contains("slot-tab"));
     }
 
     #[test]
@@ -467,5 +516,13 @@ mod tests {
         for sub in ["alloc", "release", "pin", "unpin", "list"] {
             assert!(help.contains(sub), "missing {sub} in:\n{help}");
         }
+    }
+
+    #[test]
+    fn slot_alloc_needs_branch_or_hook_json() {
+        assert!(Cli::try_parse_from(["swamp", "slot", "alloc"]).is_err());
+        assert!(Cli::try_parse_from(["swamp", "slot", "alloc", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["swamp", "slot", "alloc", "--hook-json"]).is_ok());
+        assert!(Cli::try_parse_from(["swamp", "slot", "alloc", "x", "--hook-json"]).is_err());
     }
 }

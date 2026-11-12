@@ -38,11 +38,11 @@ Each numbered group is one PR. Each PR passes `nix build`, `nix develop --comman
 
 ## 5. Tabs and Claude worktree hooks (PR 5)
 
-- [ ] 5.1 Open or switch to the slot tab on alloc when the repo session exists; verify by a manual run inside Zellij
-- [ ] 5.2 Close the slot tab on release, with a detached completion when the release runs inside that tab; verify by a manual run from inside the slot tab
-- [ ] 5.3 Verify the `WorktreeCreate` and `WorktreeRemove` stdin JSON contract against the current Claude Code hooks docs, and record the fields in a code comment
-- [ ] 5.4 Add `--hook-json` to alloc and release; verify tests that feed sample hook JSON and check stdout
-- [ ] 5.5 Add `swamp init --claude-worktrees` with idempotent install and foreign-hook conflict detection; verify tests in `src/config/claude.rs`
+- [x] 5.1 Open the slot tab on alloc when the repo session exists, keeping the caller's focus; verified in a scratch background Zellij session (tab opens once, `--no-tab` skips it). Focus return needs an attached client and was not checked by hand
+- [x] 5.2 Close the slot tab on release (by tab id, detached process); verified in a scratch background Zellij session. A release from inside the slot tab with an attached client was not run by hand
+- [x] 5.3 Verify the `WorktreeCreate` and `WorktreeRemove` stdin JSON contract against the current Claude Code hooks docs, and record the fields in a code comment
+- [x] 5.4 Add `--hook-json` to alloc and release; verify tests that feed sample hook JSON and check stdout
+- [x] 5.5 Add `swamp init --claude-worktrees` with idempotent install and foreign-hook conflict detection; verify tests in `src/config/claude.rs`
 
 ## 6. Titles and work-item dashboard (PR 6)
 

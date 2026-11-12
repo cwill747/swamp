@@ -21,7 +21,7 @@ use anyhow::Result;
 
 /// `swamp init`: write the default TOML config, refresh the embedded configs,
 /// and install/update Claude Code hooks + Codex notify.
-pub fn init() -> Result<()> {
+pub fn init(claude_worktrees: bool) -> Result<()> {
     let (cfg_path, wrote) = ensure_config_toml()?;
     println!(
         "swamp: config {} at {}",
@@ -32,7 +32,7 @@ pub fn init() -> Result<()> {
     let paths = ensure_configs()?;
     println!("swamp: lazygit config at {}", paths.lazygit.display());
 
-    ensure_claude_hooks()?;
+    ensure_claude_hooks(claude_worktrees)?;
     ensure_codex_notify()?;
     Ok(())
 }
