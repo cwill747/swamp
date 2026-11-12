@@ -60,12 +60,19 @@ pub struct HookRun {
     pub error: Option<String>,
 }
 
+// Share a capture budget across the whole hook chain. Keep ample room below
+// the 16 MiB server-frame limit, including JSON escaping and lossy UTF-8 decoding.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const TRUNCATED_OUTPUT: &str = "\n[swamp: hook output truncated]\n";
+
 /// Run `hooks` in order and stop at the first failure. The last entry of the
 /// result is the failed hook, if one failed.
 pub fn run_hooks(hooks: &[HookCommand], env: &HookEnv) -> Vec<HookRun> {
     let mut runs = Vec::new();
+    let mut remaining = MAX_OUTPUT_BYTES;
     for hook in hooks {
-        let run = run_one(hook, env);
+        let run = run_one(hook, env, remaining);
+        remaining = remaining.saturating_sub(run.output.len());
         let failed = !run.success;
         runs.push(run);
         if failed {
@@ -88,7 +95,7 @@ fn kind_label(kind: WorktreeKind) -> &'static str {
     }
 }
 
-fn run_one(hook: &HookCommand, env: &HookEnv) -> HookRun {
+fn run_one(hook: &HookCommand, env: &HookEnv, output_limit: usize) -> HookRun {
     let timeout = Duration::from_secs(hook.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
     let fail = |output: String, error: String| HookRun {
         command: hook.run.clone(),
@@ -126,9 +133,9 @@ fn run_one(hook: &HookCommand, env: &HookEnv) -> HookRun {
     // Drop our copies of the write end so the reader sees EOF when the hook
     // and its children exit.
     drop(cmd);
-    // The collector reads in chunks into a shared buffer, so a timeout can
-    // still report what the hook printed. It signals on `done` at EOF.
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Keep draining after the budget is exhausted so a verbose hook cannot
+    // block on a full pipe. Shared state also preserves output on timeout.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), false)));
     let (done_tx, done) = std::sync::mpsc::channel::<()>();
     {
         let buf = buf.clone();
@@ -138,7 +145,10 @@ fn run_one(hook: &HookCommand, env: &HookEnv) -> HookRun {
                 if n == 0 {
                     break;
                 }
-                buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+                let mut capture = buf.lock().unwrap();
+                let keep = n.min(output_limit.saturating_sub(capture.0.len()));
+                capture.0.extend_from_slice(&chunk[..keep]);
+                capture.1 |= keep < n;
             }
             let _ = done_tx.send(());
         });
@@ -174,7 +184,14 @@ fn run_one(hook: &HookCommand, env: &HookEnv) -> HookRun {
             status = Err(timed_out());
         }
     }
-    let output = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let output = {
+        let capture = buf.lock().unwrap();
+        let mut output = String::from_utf8_lossy(&capture.0).into_owned();
+        if capture.1 {
+            output.push_str(TRUNCATED_OUTPUT);
+        }
+        output
+    };
     match status {
         Ok(s) if s.success() => HookRun {
             command: hook.run.clone(),
@@ -246,6 +263,38 @@ mod tests {
         assert!(out.contains("err"), "stderr is captured: {out}");
         let canon = dir.canonicalize().unwrap();
         assert!(out.contains(canon.to_str().unwrap()) || out.contains(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn verbose_hooks_share_a_budget_and_keep_draining_stdout_and_stderr() {
+        let dir = std::env::temp_dir();
+        // NULs also exercise the worst JSON expansion (six bytes per byte).
+        let noisy = "head -c 17000000 /dev/zero; head -c 17000000 /dev/zero >&2";
+        let runs = run_hooks(&[hook(noisy), hook(noisy), hook("echo done")], &env(&dir));
+        assert_eq!(runs.len(), 3);
+        assert!(runs.iter().all(|r| r.success), "{runs:?}");
+        assert_eq!(
+            runs[0].output.len(),
+            MAX_OUTPUT_BYTES + TRUNCATED_OUTPUT.len()
+        );
+        assert_eq!(runs[1].output, TRUNCATED_OUTPUT);
+        assert_eq!(runs[2].output, TRUNCATED_OUTPUT);
+        assert!(serde_json::to_vec(&runs).unwrap().len() < 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn truncated_output_keeps_the_failure_status_and_stops_the_chain() {
+        let runs = run_hooks(
+            &[
+                hook("head -c 1000000 /dev/zero; exit 7"),
+                hook("echo never"),
+            ],
+            &env(&std::env::temp_dir()),
+        );
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].success);
+        assert_eq!(runs[0].error.as_deref(), Some("exit code 7"));
+        assert!(runs[0].output.ends_with(TRUNCATED_OUTPUT));
     }
 
     #[test]

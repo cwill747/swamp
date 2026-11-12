@@ -568,6 +568,8 @@ pub enum ReleaseRefusedReason {
     NotOnRemote,
     DefaultBranchWorktree,
     StatusUnreadable,
+    /// A hook switched or detached HEAD; never release a different branch.
+    BranchChanged,
     /// Another slot's agent is working; the caller does not run in that slot.
     AgentWorking,
     /// A `pre-release` hook failed: the command with its error, and its output.
@@ -606,6 +608,9 @@ impl std::fmt::Display for ReleaseRefused {
                 "holds the default branch and is not a slot".to_string()
             }
             ReleaseRefusedReason::StatusUnreadable => "has unreadable git status".to_string(),
+            ReleaseRefusedReason::BranchChanged => {
+                "changed branches during pre-release hooks".to_string()
+            }
             ReleaseRefusedReason::AgentWorking => {
                 "has a working agent and you do not run inside it".to_string()
             }
@@ -646,9 +651,11 @@ pub fn resolve_target(common: &Path, target: Option<&str>, cwd: &Path) -> Result
     if let Some(wt) = worktrees.iter().find(|w| w.name() == target) {
         return Ok(wt.clone());
     }
-    let as_path = Path::new(target);
+    // The daemon's cwd is the common directory, not the caller's worktree.
+    // Joining an absolute target leaves it unchanged.
+    let as_path = cwd.join(target);
     if as_path.exists()
-        && let Some(wt) = containing(as_path)
+        && let Some(wt) = containing(&as_path)
     {
         return Ok(wt);
     }
@@ -677,9 +684,9 @@ pub fn release(
 }
 
 /// [`release`] for a caller that holds the slot lock and has resolved the
-/// target worktree. `before_detach` runs after every check passes and right
-/// before swamp detaches the slot, with the branch name; an error from it
-/// stops the release with nothing changed.
+/// target worktree. `before_detach` runs after the initial safety checks, with
+/// the branch name. Recheck git state afterwards: hooks may commit, dirty the
+/// tree, or switch branches. A refusal leaves any hook changes in place.
 pub fn release_locked(
     _lock: &SlotLock,
     common: &Path,
@@ -728,50 +735,64 @@ pub fn release_locked(
         let _ = git_subprocess(common, &["fetch", "--quiet", remote, &spec]);
     }
 
-    let slot_repo =
-        Repository::open(&wt.path).map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?;
-    let tip = slot_repo
-        .head()
-        .ok()
-        .and_then(|h| h.target())
-        .ok_or_else(|| refused(ReleaseRefusedReason::StatusUnreadable))?;
-    let pr = opts.pr.as_ref().filter(|p| p.branch == branch_name);
-    let pr_finished = pr.is_some_and(|p| {
-        matches!(p.state.as_str(), "MERGED" | "CLOSED") && p.head_oid.is_none_or(|h| h == tip)
-    });
+    let check = |original_tip: Option<Oid>| -> Result<(Oid, bool)> {
+        // Open afresh so hooks cannot leave us using cached HEAD/index state.
+        let slot_repo = Repository::open(&wt.path)
+            .map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?;
+        if checked_out_branch(&wt.path).as_deref() != Some(&branch_name) {
+            // Even --force must not detach another branch (especially main).
+            return Err(refused(ReleaseRefusedReason::BranchChanged).into());
+        }
+        let tip = slot_repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .ok_or_else(|| refused(ReleaseRefusedReason::StatusUnreadable))?;
+        let pr = opts.pr.as_ref().filter(|p| {
+            p.branch == branch_name
+                // PR facts with no head OID cannot vouch for a hook's new commit.
+                && (p.head_oid.is_some() || original_tip.is_none_or(|old| old == tip))
+        });
+        let pr_finished = pr.is_some_and(|p| {
+            matches!(p.state.as_str(), "MERGED" | "CLOSED") && p.head_oid.is_none_or(|h| h == tip)
+        });
 
-    if !opts.force {
-        let info: GitInfo =
-            git_info(&wt.path).map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?;
-        if info.is_dirty() {
-            return Err(refused(ReleaseRefusedReason::Dirty).into());
-        }
-        if info.rebase || slot_repo.state() != RepositoryState::Clean {
-            return Err(refused(ReleaseRefusedReason::OperationInProgress).into());
-        }
-        if !pr_finished {
-            let ahead = info.ahead;
-            let ctx = VerdictContext {
-                git_info: info,
-                default_branch: default.clone(),
-                default_branch_tip: super::branches::default_branch_tip_in_repo(&common_repo),
-                pr_state: pr.map(|p| p.state.clone()),
-                pr_head_oid: pr.and_then(|p| p.head_oid),
-            };
-            match branch_safety(&common_repo, &ctx) {
-                RemovalVerdict::Removable => {}
-                RemovalVerdict::Blocked(RemoveRefusedReason::UnpushedCommits) => {
-                    return Err(refused(ReleaseRefusedReason::UnpushedCommits(ahead)).into());
-                }
-                RemovalVerdict::Blocked(_) => {
-                    return Err(refused(ReleaseRefusedReason::NotOnRemote).into());
+        if !opts.force {
+            let info: GitInfo =
+                git_info(&wt.path).map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?;
+            if info.is_dirty() {
+                return Err(refused(ReleaseRefusedReason::Dirty).into());
+            }
+            if info.rebase || slot_repo.state() != RepositoryState::Clean {
+                return Err(refused(ReleaseRefusedReason::OperationInProgress).into());
+            }
+            if !pr_finished {
+                let ahead = info.ahead;
+                let ctx = VerdictContext {
+                    git_info: info,
+                    default_branch: default.clone(),
+                    default_branch_tip: super::branches::default_branch_tip_in_repo(&common_repo),
+                    pr_state: pr.map(|p| p.state.clone()),
+                    pr_head_oid: pr.and_then(|p| p.head_oid),
+                };
+                match branch_safety(&common_repo, &ctx) {
+                    RemovalVerdict::Removable => {}
+                    RemovalVerdict::Blocked(RemoveRefusedReason::UnpushedCommits) => {
+                        return Err(refused(ReleaseRefusedReason::UnpushedCommits(ahead)).into());
+                    }
+                    RemovalVerdict::Blocked(_) => {
+                        return Err(refused(ReleaseRefusedReason::NotOnRemote).into());
+                    }
                 }
             }
         }
-    }
+        Ok((tip, pr_finished))
+    };
 
+    let (original_tip, _) = check(None)?;
     before_detach(&branch_name)?;
-    slot_repo
+    let (tip, pr_finished) = check(Some(original_tip))?;
+    Repository::open(&wt.path)?
         .set_head_detached(tip)
         .with_context(|| format!("detach {name}"))?;
     clear_pin(common, &name);
@@ -1333,6 +1354,160 @@ mod tests {
     }
 
     #[test]
+    fn release_rechecks_hook_commits_even_with_finished_pr_or_force() {
+        if !git_available() {
+            return;
+        }
+        for force in [false, true] {
+            for known_head in [false, true] {
+                let (scratch, _origin, common) = cloned();
+                let a = alloc(&common, "hook-commit", &opts()).unwrap();
+                let old_tip = head_oid(&a.path);
+                let options = ReleaseOptions {
+                    force,
+                    pr: Some(PrFacts {
+                        branch: a.branch.clone(),
+                        state: "MERGED".into(),
+                        head_oid: known_head.then_some(old_tip),
+                    }),
+                    ..Default::default()
+                };
+                let guard = lock(&common).unwrap();
+                let wt = resolve_target(&common, Some(&a.name), &a.path).unwrap();
+                let result = release_locked(&guard, &common, &wt, &options, |_| {
+                    commit(&a.path, "from-hook.txt");
+                    Ok(())
+                });
+                let branch_tip = Repository::open(&common)
+                    .unwrap()
+                    .find_branch(&a.branch, BranchType::Local)
+                    .unwrap()
+                    .get()
+                    .target()
+                    .unwrap();
+                assert_ne!(branch_tip, old_tip);
+                assert_eq!(head_oid(&a.path), branch_tip);
+                if force {
+                    assert_eq!(
+                        result.unwrap().outcome,
+                        ReleaseOutcome::Detached {
+                            branch_deleted: false,
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        refusal(result.unwrap_err()),
+                        ReleaseRefusedReason::NotOnRemote
+                    );
+                    assert_eq!(checked_out_branch(&a.path), Some(a.branch));
+                }
+                let _ = std::fs::remove_dir_all(scratch);
+            }
+        }
+    }
+
+    #[test]
+    fn release_detaches_at_the_hooks_new_pushed_tip() {
+        if !git_available() {
+            return;
+        }
+        let (scratch, _origin, common) = cloned();
+        let a = alloc(&common, "hook-push", &opts()).unwrap();
+        let guard = lock(&common).unwrap();
+        let wt = resolve_target(&common, Some(&a.name), &a.path).unwrap();
+        let r = release_locked(&guard, &common, &wt, &ReleaseOptions::default(), |_| {
+            commit(&a.path, "from-hook.txt");
+            run(&a.path, &["push", "-q", "origin", &a.branch]);
+            Ok(())
+        })
+        .unwrap();
+        let repo = Repository::open(&common).unwrap();
+        let tip = repo
+            .find_branch(&a.branch, BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(head_oid(&a.path), tip);
+        assert_eq!(
+            r.outcome,
+            ReleaseOutcome::Detached {
+                branch_deleted: false
+            }
+        );
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn release_rechecks_dirty_and_in_progress_state_after_hooks() {
+        if !git_available() {
+            return;
+        }
+        for in_progress in [false, true] {
+            let (scratch, _origin, common) = cloned();
+            let a = alloc(&common, "hook-state", &opts()).unwrap();
+            let guard = lock(&common).unwrap();
+            let wt = resolve_target(&common, Some(&a.name), &a.path).unwrap();
+            let err = release_locked(&guard, &common, &wt, &ReleaseOptions::default(), |_| {
+                if in_progress {
+                    let repo = Repository::open(&a.path).unwrap();
+                    std::fs::write(
+                        repo.path().join("MERGE_HEAD"),
+                        head_oid(&a.path).to_string(),
+                    )?;
+                } else {
+                    std::fs::write(a.path.join("hook-output.txt"), "dirty")?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(
+                refusal(err),
+                if in_progress {
+                    ReleaseRefusedReason::OperationInProgress
+                } else {
+                    ReleaseRefusedReason::Dirty
+                }
+            );
+            assert_eq!(checked_out_branch(&a.path), Some(a.branch));
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    }
+
+    #[test]
+    fn release_refuses_hook_branch_switch_or_detach_even_when_forced() {
+        if !git_available() {
+            return;
+        }
+        for detach in [false, true] {
+            let (scratch, _origin, common) = cloned();
+            let a = alloc(&common, "hook-switch", &opts()).unwrap();
+            let guard = lock(&common).unwrap();
+            let wt = resolve_target(&common, Some(&a.name), &a.path).unwrap();
+            let options = ReleaseOptions {
+                force: true,
+                ..Default::default()
+            };
+            let err = release_locked(&guard, &common, &wt, &options, |_| {
+                if detach {
+                    run(&a.path, &["checkout", "-q", "--detach"]);
+                } else {
+                    run(&a.path, &["checkout", "-q", "-b", "another"]);
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(refusal(err), ReleaseRefusedReason::BranchChanged);
+            assert!(local_branch_exists(&common, &a.branch));
+            assert_eq!(
+                checked_out_branch(&a.path),
+                (!detach).then(|| "another".into())
+            );
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    }
+
+    #[test]
     fn release_of_free_slot_clears_pin() {
         if !git_available() {
             return;
@@ -1391,6 +1566,33 @@ mod tests {
         let by_path = resolve_target(&common, None, &a.path).unwrap();
         assert_eq!(by_path.path, a.path);
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn release_resolves_relative_paths_against_the_client_cwd() {
+        if !git_available() {
+            return;
+        }
+        let (scratch, _origin, common) = cloned();
+        let a = alloc(&common, "relative-target", &opts()).unwrap();
+        let sub = a.path.join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        for (cwd, target) in [
+            (&a.path, "./"),
+            (&sub, ".."),
+            (&common, "../work1"),
+            (&sub, a.path.to_str().unwrap()),
+            (&sub, "work1"),
+            (&sub, "relative-target"),
+        ] {
+            assert_eq!(
+                resolve_target(&common, Some(target), cwd).unwrap().path,
+                a.path
+            );
+        }
+        release(&common, Some(".."), &sub, &ReleaseOptions::default()).unwrap();
+        assert!(checked_out_branch(&a.path).is_none());
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     #[test]

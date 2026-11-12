@@ -8,16 +8,16 @@ Always run project toolchain commands through the flake dev shell using
 Always use `nix build` to verify changes, not `cargo build` or
 `cargo check`.
 
-The default output is the fast local/PR build. It uses cargo's `dev` profile
-(opt-level 0, no LTO, parallel codegen) instead of the heavy `[profile.release]`
-the shipped binary uses, so it compiles much faster:
+The default output is the optimized release build with shell completions:
 
 ```
 nix build
 ```
 
-`#dev` remains an alias for the fast build. Use the fast build for local
-verification; main-branch CI and release workflows build `#release`.
+For fast local/PR verification, use `nix build .#dev`. It uses cargo's `dev`
+profile (opt-level 0, no LTO, parallel codegen) instead of the heavy
+`[profile.release]` the shipped binary uses. Main-branch CI and release
+workflows build `#release`, which selects the same package as the default.
 
 ## Linting
 

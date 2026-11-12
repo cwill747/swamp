@@ -20,11 +20,12 @@ nix build
 ./result/bin/swamp --help
 ```
 
-The default package is a fast local/PR build. Before main-branch cache work or
-release validation, build the optimized release output:
+The default package is the optimized release build with shell completions,
+identical to `nix build .#release`. For faster local/PR verification, use the
+unoptimized development output:
 
 ```bash
-nix build .#release
+nix build .#dev
 ```
 
 ## Testing
