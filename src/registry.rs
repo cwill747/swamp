@@ -83,10 +83,6 @@ fn existing(entries: Vec<RepoEntry>) -> Vec<RepoEntry> {
 }
 
 /// Read the registry at `path`. A missing or malformed file reads as empty.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the cross-repo overview is the first reader")
-)]
 pub fn load_at(path: &Path) -> Vec<RepoEntry> {
     match read_stored(path) {
         Stored::Entries(entries) => existing(entries),
@@ -186,8 +182,9 @@ pub struct AllLiveReport {
 /// reads from the daemons: none is started, stopped, or restarted.
 pub async fn register_all_live_at(registry: &Path, runtime_dir: &Path) -> Result<AllLiveReport> {
     let mut report = AllLiveReport::default();
+    let known = load_at(registry);
     for sock in discover::socket_files(runtime_dir) {
-        match discover::probe(&sock).await {
+        match discover::probe(&sock, &known).await {
             Probe::NotLive => {}
             Probe::Unidentified => report.skipped.push(sock),
             Probe::Identified(id) => {
