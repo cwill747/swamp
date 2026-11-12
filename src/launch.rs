@@ -347,6 +347,84 @@ pub fn ensure_overview_session(session: &str) -> Result<()> {
     wait_for_session(session, Some(layout::OVERVIEW_TAB))
 }
 
+/// `swamp slot-tab`: open or close a slot or overflow worktree's tab in the
+/// session that `ZELLIJ_SESSION_NAME` names. The slot CLI spawns this with
+/// that variable set to the repo session, so it also works from a shell
+/// outside the session.
+///
+/// Open leaves an existing tab as it is and gives focus back to the tab that
+/// had it, so an agent that allocates a slot does not take the user's view.
+pub fn slot_tab(op: crate::cli::SlotTabOp, name: &str, path: &Path) -> Result<()> {
+    if let Ok(common) = git_common_dir(&resolve_git_dir(path)) {
+        let log_cfg = config::load_config().map(|c| c.logging).unwrap_or_default();
+        crate::logging::init(&common, false, false, &log_cfg);
+    }
+    match op {
+        crate::cli::SlotTabOp::Open => {
+            if zellij::list_tab_names()?.iter().any(|t| t == name) {
+                return Ok(());
+            }
+            let origin = zellij::active_tab_id().ok().flatten();
+            tracing::info!(worktree = %name, "opening slot tab");
+            open_worktree_tab(path, name)?;
+            if let Some(origin) = origin {
+                let _ = zellij::action(&["go-to-tab-by-id", &origin.to_string()]);
+            }
+            Ok(())
+        }
+        crate::cli::SlotTabOp::Close => {
+            tracing::info!(worktree = %name, "closing slot tab");
+            zellij::close_tab_by_name(name)
+        }
+    }
+}
+
+/// Spawn `swamp slot-tab <op>` against the repo session for `common_dir`.
+/// Does nothing when that session is not running. `wait` blocks until the tab
+/// operation ends; without it the child runs detached (own process group, cwd
+/// outside every worktree), so it survives a close of the caller's own tab.
+pub fn spawn_slot_tab(
+    common_dir: &Path,
+    op: crate::cli::SlotTabOp,
+    name: &str,
+    path: &Path,
+    wait: bool,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let session = crate::util::session_name_for(common_dir);
+    if !zellij::session_is_live(&session).unwrap_or(false) {
+        tracing::debug!(%session, worktree = %name, "repo session not running; no slot tab change");
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("locate swamp executable")?;
+    let op = match op {
+        crate::cli::SlotTabOp::Open => "open",
+        crate::cli::SlotTabOp::Close => "close",
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("slot-tab")
+        .arg(op)
+        .arg(name)
+        .arg(path)
+        .env("ZELLIJ", "0")
+        .env("ZELLIJ_SESSION_NAME", &session)
+        .env_remove("ZELLIJ_PANE_ID")
+        .current_dir(common_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    if wait {
+        let status = cmd.status().context("run swamp slot-tab")?;
+        if !status.success() {
+            anyhow::bail!("swamp slot-tab {op} {name} exited {status}");
+        }
+    } else {
+        cmd.spawn().context("spawn swamp slot-tab")?;
+    }
+    Ok(())
+}
+
 /// Close the worktree's tab and reopen it, so a harness swap takes effect live.
 /// Reopening reads the freshly-persisted override, so the new tab's agent pane
 /// comes up as the chosen harness.

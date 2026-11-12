@@ -54,11 +54,19 @@ The dashboard TUI SHALL open a worktree's Zellij tab only in response to explici
 ## ADDED Requirements
 
 ### Requirement: Slot Tab Lifecycle
-When the repository's Zellij session exists, a slot allocation SHALL open a tab for the allocated worktree, or switch to its tab when one already exists. A slot release SHALL close the slot's tab. When the release runs inside the tab it closes, swamp SHALL complete the release in a process that survives the tab close.
+When the repository's Zellij session exists, a slot allocation from the CLI SHALL open a tab for the allocated worktree when it has none, and SHALL give focus back to the tab that had it. An existing tab SHALL stay as it is. An allocation from the Claude `WorktreeCreate` hook, or with `--no-tab`, SHALL NOT open a tab, because Claude runs in that worktree itself. A slot release SHALL close the slot's tab unless the user passes `--no-tab`. When the release runs inside the tab it closes, swamp SHALL complete the release in a process that survives the tab close.
 
 #### Scenario: Allocation with a session
 - **WHEN** an agent allocates `parser-fix` into `work2` and the repository session exists
 - **THEN** a `work2` tab opens with the agent, lazygit, and shell panes
+
+#### Scenario: Agent allocation keeps the user's view
+- **WHEN** an agent allocates a slot while the user looks at the dashboard tab
+- **THEN** the new slot tab opens and the dashboard tab keeps focus
+
+#### Scenario: Claude worktree hook
+- **WHEN** the `WorktreeCreate` hook allocates a slot
+- **THEN** swamp opens no tab
 
 #### Scenario: Allocation without a session
 - **WHEN** no repository Zellij session exists

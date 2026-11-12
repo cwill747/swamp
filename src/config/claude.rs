@@ -141,6 +141,94 @@ fn apply_swamp_hooks(settings: &mut Value) -> bool {
     changed
 }
 
+/// The Claude Code worktree events swamp can serve, and the command for each.
+const WORKTREE_HOOKS: &[(&str, &str)] = &[
+    ("WorktreeCreate", "swamp slot alloc --hook-json"),
+    ("WorktreeRemove", "swamp slot release --hook-json"),
+];
+
+/// A worktree hook command belongs to swamp if it invokes `swamp slot`.
+fn is_swamp_worktree_command(cmd: &str) -> bool {
+    cmd.contains("swamp slot")
+}
+
+/// Merge swamp's `WorktreeCreate` / `WorktreeRemove` hooks into `settings`.
+/// Existing swamp commands are updated in place. An event that already has a
+/// hook swamp does not own is left alone and returned as a conflict: a second
+/// `WorktreeCreate` hook would fight the first over where worktrees go.
+/// Returns whether anything changed, and the conflicting events.
+fn apply_worktree_hooks(settings: &mut Value) -> (bool, Vec<&'static str>) {
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let hooks = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks = hooks.as_object_mut().unwrap();
+    let mut changed = false;
+    let mut conflicts = Vec::new();
+    for (event, desired) in WORKTREE_HOOKS {
+        let arr = match hooks.get_mut(*event) {
+            Some(v) if v.is_array() => v.as_array_mut().unwrap(),
+            _ => {
+                hooks.insert(event.to_string(), json!([]));
+                changed = true;
+                hooks.get_mut(*event).unwrap().as_array_mut().unwrap()
+            }
+        };
+        let commands = |group: &Value| -> Vec<String> {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|inner| {
+                    inner
+                        .iter()
+                        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut ours = false;
+        let mut foreign = false;
+        for group in arr.iter() {
+            for cmd in commands(group) {
+                if is_swamp_worktree_command(&cmd) {
+                    ours = true;
+                } else {
+                    foreign = true;
+                }
+            }
+        }
+        if foreign {
+            conflicts.push(*event);
+            continue;
+        }
+        if ours {
+            for group in arr.iter_mut() {
+                if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    for hook in inner.iter_mut() {
+                        let cmd = hook.get("command").and_then(|c| c.as_str());
+                        if cmd.is_some_and(is_swamp_worktree_command) && cmd != Some(*desired) {
+                            hook["command"] = json!(desired);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            arr.push(json!({ "hooks": [{ "type": "command", "command": desired }] }));
+            changed = true;
+        }
+    }
+    (changed, conflicts)
+}
+
 /// Write `content` to `path` atomically (via a temp file in the same directory)
 /// and, if `backup_path` is Some, copy the original to that path first.
 fn atomic_write(
@@ -166,7 +254,7 @@ fn atomic_write(
 /// Install or update swamp's Claude Code hooks in the user's `settings.json`.
 /// If the file is read-only (common under nix/home-manager), don't attempt a
 /// write: log that, and warn if the existing hooks are out of date.
-pub fn ensure_claude_hooks() -> Result<()> {
+pub fn ensure_claude_hooks(worktrees: bool) -> Result<()> {
     let path = claude_settings_path();
     let original = std::fs::read_to_string(&path).ok();
 
@@ -180,7 +268,19 @@ pub fn ensure_claude_hooks() -> Result<()> {
         })?,
     };
 
-    let changed = apply_swamp_hooks(&mut settings);
+    let mut changed = apply_swamp_hooks(&mut settings);
+    if worktrees {
+        let (wt_changed, conflicts) = apply_worktree_hooks(&mut settings);
+        changed |= wt_changed;
+        for event in conflicts {
+            eprintln!(
+                "swamp: warning: {} already has a {event} hook that swamp does not manage; \
+                 not adding swamp's. Remove it and run `swamp init --claude-worktrees` again \
+                 to use the slot pool for Claude worktrees.",
+                path.display()
+            );
+        }
+    }
     if !changed {
         println!(
             "swamp: Claude hooks already up to date in {}",
@@ -241,6 +341,77 @@ mod tests {
         let p = std::env::temp_dir().join(format!("swamp-claude-test-{}-{id}", std::process::id()));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn worktree_hooks_install_and_stay_idempotent() {
+        let mut settings = json!({});
+        let (changed, conflicts) = apply_worktree_hooks(&mut settings);
+        assert!(changed && conflicts.is_empty());
+        assert_eq!(
+            settings["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
+            "swamp slot alloc --hook-json"
+        );
+        assert_eq!(
+            settings["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
+            "swamp slot release --hook-json"
+        );
+        assert!(
+            settings["hooks"]["WorktreeCreate"][0]
+                .get("matcher")
+                .is_none()
+        );
+
+        let (again, _) = apply_worktree_hooks(&mut settings);
+        assert!(!again);
+        assert_eq!(
+            settings["hooks"]["WorktreeCreate"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn worktree_hooks_update_stale_swamp_command() {
+        let mut settings = json!({"hooks": {"WorktreeCreate": [
+            {"hooks": [{"type": "command", "command": "swamp slot alloc --old-flag"}]}
+        ]}});
+
+        let (changed, conflicts) = apply_worktree_hooks(&mut settings);
+
+        assert!(changed && conflicts.is_empty());
+        assert_eq!(
+            settings["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
+            "swamp slot alloc --hook-json"
+        );
+    }
+
+    #[test]
+    fn foreign_worktree_hook_is_kept_and_reported() {
+        let mut settings = json!({"hooks": {"WorktreeCreate": [
+            {"hooks": [{"type": "command", "command": "wt-pool alloc"}]}
+        ]}});
+
+        let (_, conflicts) = apply_worktree_hooks(&mut settings);
+
+        assert_eq!(conflicts, ["WorktreeCreate"]);
+        let create = settings["hooks"]["WorktreeCreate"].as_array().unwrap();
+        assert_eq!(create.len(), 1);
+        assert_eq!(create[0]["hooks"][0]["command"], "wt-pool alloc");
+        // The other event has no foreign hook, so swamp's is installed.
+        assert_eq!(
+            settings["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
+            "swamp slot release --hook-json"
+        );
+    }
+
+    #[test]
+    fn plain_init_leaves_worktree_hooks_alone() {
+        let mut settings = json!({});
+        apply_swamp_hooks(&mut settings);
+        assert!(settings["hooks"].get("WorktreeCreate").is_none());
     }
 
     #[test]
@@ -381,7 +552,7 @@ mod tests {
             let bad = "{\"key\": \"value\",}"; // trailing comma — invalid JSON
             fs::write(&path, bad).unwrap();
 
-            let err = ensure_claude_hooks().unwrap_err();
+            let err = ensure_claude_hooks(false).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("malformed") || msg.contains("settings.json"),
@@ -398,7 +569,7 @@ mod tests {
             let path = dir.join("settings.json");
             let bak = dir.join("settings.json.bak");
             assert!(!path.exists());
-            ensure_claude_hooks().unwrap();
+            ensure_claude_hooks(false).unwrap();
             assert!(path.exists(), "settings.json should be created");
             assert!(!bak.exists(), "no backup when creating fresh file");
         });
@@ -411,7 +582,7 @@ mod tests {
             let bak = dir.join("settings.json.bak");
             // Write a valid but hook-less settings file.
             fs::write(&path, "{\"theme\": \"dark\"}\n").unwrap();
-            ensure_claude_hooks().unwrap();
+            ensure_claude_hooks(false).unwrap();
             assert!(path.exists());
             assert!(
                 bak.exists(),
@@ -428,11 +599,11 @@ mod tests {
         with_claude_dir(|dir| {
             let bak = dir.join("settings.json.bak");
             // Run once to populate.
-            ensure_claude_hooks().unwrap();
+            ensure_claude_hooks(false).unwrap();
             // Remove any backup that was created (there was none since no prior file).
             let _ = fs::remove_file(&bak);
             // Run again — should be idempotent: no write, no backup.
-            ensure_claude_hooks().unwrap();
+            ensure_claude_hooks(false).unwrap();
             assert!(!bak.exists(), "no backup on a no-op second run");
         });
     }
@@ -443,7 +614,7 @@ mod tests {
             let path = dir.join("settings.json");
             // Write a settings file with keys in a deliberate non-alphabetical order.
             fs::write(&path, "{\n  \"zzz\": 1,\n  \"aaa\": 2\n}\n").unwrap();
-            ensure_claude_hooks().unwrap();
+            ensure_claude_hooks(false).unwrap();
             let content = fs::read_to_string(&path).unwrap();
             let zzz_pos = content.find("zzz").unwrap();
             let aaa_pos = content.find("aaa").unwrap();

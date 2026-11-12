@@ -74,8 +74,14 @@ run = "direnv allow"
 ### D8: Claude worktree hooks are opt-in
 A `WorktreeCreate` hook in `~/.claude/settings.json` changes `claude --worktree` for every repo on the machine. For that reason, `swamp init` installs it only with `--claude-worktrees`. Commands: `swamp slot alloc --hook-json` and `swamp slot release --hook-json`. Both read stdin.
 
-### D9: Tab lifecycle goes through the existing Zellij helpers
-Alloc calls the same open-or-switch logic that the TUI uses on `Enter`, when the repo session exists. Release reuses the detached-process pattern of `delete-tab`: close the tab first, then detach. A slot release from inside its own tab spawns the hidden `delete-tab`-style command with a release mode.
+### D9: Tab lifecycle through a session-targeted helper
+The slot CLI can run outside the repo session (an agent in another session, or a Claude hook). It spawns the hidden `swamp slot-tab open|close` command with `ZELLIJ_SESSION_NAME` set to the repo session, so the existing Zellij helpers act on that session. Swamp skips this when that session is not running.
+
+Open leaves an existing tab alone and gives focus back to the tab that had it, so an agent's allocation does not take the user's view. The Claude `WorktreeCreate` path opens no tab, because Claude runs in that worktree itself and a tab would start a second agent there.
+
+Close runs detached (its own process group, cwd in the common dir), because the caller can be a pane in the tab being closed. It closes by stable tab id (`list-tabs --json` and `close-tab-by-id`), not with the focus-then-`close-tab` sequence, so it works with no attached client and cannot close the wrong tab.
+
+The TUI `c` flow already opens the created worktree's tab. It now matches the new row by branch, because a slot's name says nothing about its branch.
 
 ### D10: Title sources
 - PR title: from the existing PR snapshot. This adds a `title` field to `PrSummary` if the GraphQL query does not fetch it yet.

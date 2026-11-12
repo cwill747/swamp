@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::ConfirmDelete(args)) => {
             launch::confirm_delete(&args.name, &args.dir, &args.reason, args.close_tab).await
         }
+        Some(cli::Cmd::SlotTab(args)) => launch::slot_tab(args.op, &args.name, &args.dir),
         Some(cli::Cmd::DeleteTab(args)) => {
             launch::delete_tab(&args.name, &args.dir, args.force).await
         }
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::Register(args)) => registry::run_register(args.dir, args.all_live).await,
         Some(cli::Cmd::Forget(args)) => registry::run_forget(args.dir),
         Some(cli::Cmd::Logs(args)) => logging::show(args.dir, args.follow, args.all).await,
-        Some(cli::Cmd::Init) => config::init(),
+        Some(cli::Cmd::Init(args)) => config::init(args.claude_worktrees),
         Some(cli::Cmd::Slot(args)) => slot_cmd::run(args).await,
         Some(cli::Cmd::Clone(args)) => {
             let path = worktree::clone_repo(&args.url, args.dir.as_deref())?;

@@ -241,6 +241,35 @@ fn list_tabs_here() -> Result<Vec<TabInfo>> {
     parse_tabs_json(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The ID of the active tab in the current session, from the `active` field
+/// of `zellij action list-tabs --json`.
+pub fn active_tab_id() -> Result<Option<u32>> {
+    let out = Command::new("zellij")
+        .args(["action", "list-tabs", "--json"])
+        .output()
+        .context("zellij action list-tabs")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "zellij action list-tabs exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_active_tab_id(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_active_tab_id(stdout: &str) -> Result<Option<u32>> {
+    #[derive(serde::Deserialize)]
+    struct Tab {
+        tab_id: u32,
+        #[serde(default)]
+        active: bool,
+    }
+    let tabs: Vec<Tab> = serde_json::from_str(stdout.trim())
+        .context("parse `zellij action list-tabs --json` output")?;
+    Ok(tabs.into_iter().find(|t| t.active).map(|t| t.tab_id))
+}
+
 /// Focus the tab of worktree `name` in the current session.
 ///
 /// The tab is found by its canonical name, so a tab with an attention badge
@@ -384,6 +413,11 @@ pub fn session_state(name: &str) -> Result<Option<SessionState>> {
         .map(|(_, state)| state))
 }
 
+/// Whether a running (not exited) session named `name` exists.
+pub fn session_is_live(name: &str) -> Result<bool> {
+    Ok(session_state(name)? == Some(SessionState::Live))
+}
+
 /// Remove the record of an exited session, so that the name is free.
 pub fn delete_session(name: &str) -> Result<()> {
     zellij(&["delete-session", name, "--force"])
@@ -465,6 +499,18 @@ mod tests {
         );
         assert_eq!(find_tab(&tabs, "my feature").map(|t| t.tab_id), Some(7));
         assert_eq!(find_tab(&tabs, "feature"), None);
+    }
+
+    #[test]
+    fn parse_active_tab_id_finds_the_active_tab() {
+        let out = r#"[{"position":0,"name":"dashboard","active":false,"tab_id":0},
+                      {"position":1,"name":"work1","active":true,"tab_id":4}]"#;
+        assert_eq!(parse_active_tab_id(out).unwrap(), Some(4));
+        assert_eq!(
+            parse_active_tab_id(r#"[{"position":0,"name":"a","tab_id":0}]"#).unwrap(),
+            None
+        );
+        assert!(parse_active_tab_id("not json").is_err());
     }
 
     #[test]
