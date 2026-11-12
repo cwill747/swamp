@@ -252,13 +252,17 @@ pub fn parse_payload(v: &serde_json::Value) -> HookPayload {
     if matches!(tool, "Agent" | "Task") && matches!(event, "PreToolUse" | "PostToolUse") {
         let input = v.get("tool_input").unwrap_or(&serde_json::Value::Null);
         let description = str_field(input, "description");
-        if description.is_some() {
-            let response = v.get("tool_response").unwrap_or(&serde_json::Value::Null);
+        let response = v.get("tool_response").unwrap_or(&serde_json::Value::Null);
+        let agent_id = (event == "PostToolUse")
+            .then(|| str_field(response, "agentId"))
+            .flatten();
+        // The PreToolUse queues the description. A PostToolUse is useful only
+        // when it names the agent. Without an id, it would queue the
+        // description again for a later subagent of the same type.
+        if description.is_some() && (event == "PreToolUse" || agent_id.is_some()) {
             out.subagent = Some(SubagentEvent {
                 kind: SubagentEventKind::Spawn,
-                agent_id: (event == "PostToolUse")
-                    .then(|| str_field(response, "agentId"))
-                    .flatten(),
+                agent_id,
                 agent_type: str_field(input, "subagent_type")
                     .unwrap_or_else(|| "general-purpose".to_string()),
                 description,
@@ -449,6 +453,18 @@ mod tests {
         let ev = p.subagent.unwrap();
         assert_eq!(ev.kind, SubagentEventKind::Spawn);
         assert_eq!(ev.agent_id.as_deref(), Some("agent-9"));
+    }
+
+    #[test]
+    fn foreground_agent_response_without_id_is_not_spawn() {
+        let p = parse(json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "tool_input": {"description": "Find code", "subagent_type": "Explore"},
+            "tool_response": {"content": [{"type": "text", "text": "done"}]}
+        }));
+        assert!(!p.skip);
+        assert!(p.subagent.is_none());
     }
 
     #[test]
