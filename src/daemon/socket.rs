@@ -302,7 +302,11 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                     }
                     ClientMsg::SetTitle { branch, title } => {
                         if let Err(e) = validate_branch_name(&branch)
-                            .and_then(|_| validate_optional_field("title", title.as_deref(), 200))
+                            .and_then(|_| validate_optional_field(
+                                "title",
+                                title.as_deref(),
+                                crate::slot_service::MAX_TITLE_BYTES,
+                            ))
                         {
                             write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
                             continue;

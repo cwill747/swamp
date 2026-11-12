@@ -79,7 +79,18 @@ pub fn user_titles(common: &Path) -> HashMap<String, String> {
 }
 
 /// Set (or, with `None` or a blank string, clear) the user title of `branch`.
+/// The longest user title, in UTF-8 bytes.
+pub const MAX_TITLE_BYTES: usize = 200;
+
 pub fn set_title(common: &Path, branch: &str, title: Option<&str>) -> Result<()> {
+    if let Some(t) = title {
+        if t.len() > MAX_TITLE_BYTES {
+            anyhow::bail!("title exceeds {MAX_TITLE_BYTES} bytes");
+        }
+        if t.chars().any(char::is_control) {
+            anyhow::bail!("title contains a control character");
+        }
+    }
     let _guard = slots::lock(common)?;
     let mut mem = load_branches(common);
     let title = title.map(str::trim).filter(|t| !t.is_empty());

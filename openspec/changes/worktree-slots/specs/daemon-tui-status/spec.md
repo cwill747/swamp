@@ -77,7 +77,7 @@ When the repository's Zellij session exists, a slot allocation from the CLI SHAL
 - **THEN** swamp closes the `work2` tab and the release still completes
 
 ### Requirement: Work Item Presentation
-The worktrees pane SHALL show each row's title in place of the worktree name, and SHALL show the slot name (`work<N>`) in a short label column for slot rows. The label SHALL be blank for other rows, whose name repeats the branch. Free and pinned slot rows SHALL be dimmed and SHALL show no branch. Pinned slot rows SHALL show the pin reason as their title. When a peer sends no title, the pane SHALL show the worktree name.
+The worktrees pane SHALL show each row's title in place of the worktree name, and SHALL show the slot name (`work<N>`) in a short label column for slot rows. The label SHALL be blank for other rows, whose name repeats the branch. Free and pinned slot rows SHALL be dimmed and SHALL show no branch. Pinned slot rows SHALL show the pin reason as their title. When a peer sends no title, the pane SHALL show the worktree name. When the pane is narrow, the slot label SHALL join the title cell, and the title and branch columns SHALL keep a minimum width ahead of the status columns.
 
 #### Scenario: Busy slot
 - **WHEN** `work1` holds a branch whose PR is titled `Fix flaky CI retry logic`
@@ -86,3 +86,7 @@ The worktrees pane SHALL show each row's title in place of the worktree name, an
 #### Scenario: Free slot
 - **WHEN** `work3` is free
 - **THEN** the row shows the title `free` in the muted style
+
+#### Scenario: Narrow pane
+- **WHEN** the worktrees pane is 40 columns wide
+- **THEN** each row still shows its title and branch
