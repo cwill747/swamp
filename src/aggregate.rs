@@ -424,25 +424,35 @@ mod tests {
     #[tokio::test]
     async fn a_second_instance_exits_with_success_and_an_idle_one_exits() {
         let dir = temp_dir("aggregate-lock");
-        let first = tokio::spawn(run_at(dir.clone(), timing()));
         let lock = dir.join(LOCK_FILE);
-        wait_for("the first instance takes the lock", || {
-            lock.exists() && matches!(try_lock(&lock), Ok(None))
-        })
-        .await;
 
+        // The test holds the lock, as a first instance does. A probe of the
+        // lock of a real first instance can take the lock before it does.
+        let held = try_lock(&lock).unwrap().expect("the lock is free");
         let second = run_at(dir.clone(), timing()).await.unwrap();
         assert_eq!(second, Exit::AlreadyRunning);
+        drop(held);
 
-        // No daemon is live, so the first instance exits after the idle time.
-        let exit = tokio::time::timeout(Duration::from_secs(5), first)
-            .await
-            .expect("the idle aggregator exits")
-            .unwrap()
-            .unwrap();
+        // A child process that a parallel test forks can hold a copy of the
+        // lock file for a moment, so each step that needs the free lock
+        // waits for it.
+        let free = || matches!(try_lock(&lock), Ok(Some(_)));
+
+        // No daemon is live, so an instance with the lock exits after the
+        // idle time.
+        let mut exit = Exit::AlreadyRunning;
+        for _ in 0..50 {
+            wait_for("the lock is free", free).await;
+            exit = tokio::time::timeout(Duration::from_secs(5), run_at(dir.clone(), timing()))
+                .await
+                .expect("the idle aggregator exits")
+                .unwrap();
+            if exit != Exit::AlreadyRunning {
+                break;
+            }
+        }
         assert_eq!(exit, Exit::Idle);
-        // The lock is free again.
-        assert!(matches!(try_lock(&lock), Ok(Some(_))));
+        wait_for("the lock is free again", free).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
