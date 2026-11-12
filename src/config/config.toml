@@ -37,3 +37,16 @@ default = "claude"
 # The RUST_LOG environment variable overrides both when set.
 # level = "info"
 # filter = "swamp::zellij=debug,info"
+
+# [slots]
+# Reusable worktrees ("slots") named work1, work2, ... under the repository
+# worktree root. `swamp slot alloc <branch>` checks a branch out into the first
+# free slot, and `swamp slot release` detaches the slot again so its build
+# caches stay warm. When every slot is busy, swamp creates a dedicated
+# branch-named worktree instead.
+#
+#   pool_size — the most slots swamp creates (default 5). 0 turns the pool off.
+#
+# A repository can override these settings in
+# <git-common-dir>/swamp/config.toml (for a bare layout, .bare/swamp/config.toml).
+# pool_size = 5

@@ -8,6 +8,50 @@ pub struct SwampConfig {
     pub dashboard: DashboardConfig,
     pub harness: HarnessConfig,
     pub logging: LoggingConfig,
+    pub slots: SlotsConfig,
+}
+
+/// Default number of slot worktrees in the pool (`work1`..`work5`).
+pub const DEFAULT_POOL_SIZE: u32 = 5;
+
+/// Slot pool settings. `pool_size` is the most slot worktrees swamp creates; 0
+/// turns the pool off so every allocation gets its own overflow worktree.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct SlotsConfig {
+    pub pool_size: u32,
+}
+
+impl Default for SlotsConfig {
+    fn default() -> Self {
+        Self {
+            pool_size: DEFAULT_POOL_SIZE,
+        }
+    }
+}
+
+/// The per-repository config at `<git-common-dir>/swamp/config.toml`. Each
+/// field that is set overrides the user config for that repository only.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct RepoConfig {
+    pub slots: RepoSlotsConfig,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct RepoSlotsConfig {
+    pub pool_size: Option<u32>,
+}
+
+impl SlotsConfig {
+    /// Apply a per-repository override on top of the user setting.
+    pub fn merged_with(mut self, repo: &RepoSlotsConfig) -> Self {
+        if let Some(size) = repo.pool_size {
+            self.pool_size = size;
+        }
+        self
+    }
 }
 
 /// Minimum severity recorded in the diagnostic log. Mirrors the standard

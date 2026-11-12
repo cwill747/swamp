@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::types::{DashboardConfig, HarnessSetting, LoggingConfig, SwampConfig};
+use super::types::{
+    DashboardConfig, HarnessSetting, LoggingConfig, RepoConfig, SlotsConfig, SwampConfig,
+};
 
 const LAZYGIT_CONFIG: &str = include_str!("lazygit.yml");
 const DEFAULT_CONFIG_TOML: &str = include_str!("config.toml");
@@ -46,6 +48,29 @@ pub fn load_config() -> Result<SwampConfig> {
             .with_context(|| format!("invalid [logging] filter in {}", path.display()))?;
     }
     Ok(cfg)
+}
+
+/// Path to the per-repository config under the git common dir.
+pub fn repo_config_path(common_dir: &Path) -> PathBuf {
+    common_dir.join("swamp").join("config.toml")
+}
+
+/// Load the per-repository config. A missing file yields defaults; a malformed
+/// one is an error, the same as the user config.
+pub fn load_repo_config(common_dir: &Path) -> Result<RepoConfig> {
+    let path = repo_config_path(common_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display())),
+        Err(_) => Ok(RepoConfig::default()),
+    }
+}
+
+/// The effective slot settings for one repository: the user config with the
+/// per-repository config applied on top.
+pub fn slots_config(common_dir: &Path) -> Result<SlotsConfig> {
+    let user = load_config()?.slots;
+    let repo = load_repo_config(common_dir)?;
+    Ok(user.merged_with(&repo.slots))
 }
 
 /// Write the default `config.toml` if it doesn't exist yet. Unlike the embedded
@@ -202,5 +227,58 @@ mod tests {
 
         let err = load_config().unwrap_err();
         assert!(err.to_string().contains("config.toml"));
+    }
+
+    #[test]
+    fn slots_pool_size_defaults_to_five() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let common = base.join("repo.git");
+        fs::create_dir_all(&common).unwrap();
+
+        assert_eq!(slots_config(&common).unwrap().pool_size, 5);
+    }
+
+    #[test]
+    fn repo_config_overrides_user_pool_size() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let user = base.join("swamp").join("config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(&user, "[slots]\npool_size = 5\n").unwrap();
+        let common = base.join("repo.git");
+        fs::create_dir_all(common.join("swamp")).unwrap();
+        fs::write(repo_config_path(&common), "[slots]\npool_size = 2\n").unwrap();
+
+        assert_eq!(slots_config(&common).unwrap().pool_size, 2);
+    }
+
+    #[test]
+    fn pool_size_zero_is_allowed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let user = base.join("swamp").join("config.toml");
+        fs::create_dir_all(user.parent().unwrap()).unwrap();
+        fs::write(&user, "[slots]\npool_size = 0\n").unwrap();
+        let common = base.join("repo.git");
+        fs::create_dir_all(&common).unwrap();
+
+        assert_eq!(slots_config(&common).unwrap().pool_size, 0);
+    }
+
+    #[test]
+    fn malformed_repo_config_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = tmp_dir();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        let common = base.join("repo.git");
+        fs::create_dir_all(common.join("swamp")).unwrap();
+        fs::write(repo_config_path(&common), "[slots]\npool_size = \"x\"\n").unwrap();
+
+        let err = slots_config(&common).unwrap_err();
+        assert!(err.to_string().contains("parse"), "{err}");
     }
 }

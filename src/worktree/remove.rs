@@ -176,11 +176,19 @@ pub fn removal_verdict(common_dir: &Path, name: &str, ctx: &VerdictContext) -> R
         return RemovalVerdict::Blocked(RemoveRefusedReason::Locked);
     }
 
-    let info = &ctx.git_info;
-    if info.is_dirty() {
+    if ctx.git_info.is_dirty() {
         return RemovalVerdict::Blocked(RemoveRefusedReason::Dirty);
     }
 
+    branch_safety(&repo, ctx)
+}
+
+/// Whether the committed work on `ctx.git_info.branch` exists somewhere other
+/// than that local branch, so that git cannot lose it when the branch goes
+/// away. Removal and slot release both use this check. It does not look at the
+/// working tree; callers check for dirty state first.
+pub(super) fn branch_safety(repo: &Repository, ctx: &VerdictContext) -> RemovalVerdict {
+    let info = &ctx.git_info;
     let Ok(branch) = repo.find_branch(&info.branch, BranchType::Local) else {
         // No local branch to protect (detached HEAD, unborn, or already
         // gone) — nothing more can block removal.
@@ -204,7 +212,7 @@ pub fn removal_verdict(common_dir: &Path, name: &str, ctx: &VerdictContext) -> R
     // No live upstream — either it was pruned (`upstream_gone`) or never
     // configured. Both cases mirror `git branch -d`: refuse unless the tip's
     // work is already merged somewhere, so it wouldn't be orphaned.
-    if is_merged(&repo, &info.branch, tip, ctx) {
+    if is_merged(repo, &info.branch, tip, ctx) {
         RemovalVerdict::Removable
     } else {
         RemovalVerdict::Blocked(RemoveRefusedReason::UnmergedCommits)

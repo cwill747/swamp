@@ -14,6 +14,7 @@ mod create;
 mod model;
 mod remove;
 mod repo;
+pub mod slots;
 mod status;
 
 pub use branches::{
@@ -22,8 +23,8 @@ pub use branches::{
 pub use clone::clone_repo;
 pub use create::{create_worktree, create_worktree_from_base};
 pub use model::{
-    BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, Worktree,
-    worktree_name_for_branch,
+    BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, SlotState, Worktree,
+    WorktreeKind, worktree_name_for_branch,
 };
 pub use remove::{check_worktree_removal, remove_worktree};
 pub use repo::{git_common_dir, resolve_git_dir};

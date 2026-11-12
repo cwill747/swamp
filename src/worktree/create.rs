@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// For the bare-repo layout (`project/.bare`, `project/main`, ...) this is the
 /// `project/` directory - the common ancestor of the git dir and any workdir.
 /// Adapted from git-workon-lib's `workon_root`.
-fn workon_root(repo: &Repository) -> Result<PathBuf> {
+pub(super) fn workon_root(repo: &Repository) -> Result<PathBuf> {
     let path = repo.path();
     if let Some(workdir) = repo.workdir()
         && workdir != path
@@ -26,7 +26,7 @@ fn workon_root(repo: &Repository) -> Result<PathBuf> {
 
 /// Find a remote-tracking branch `<remote>/<branch_name>` and return its
 /// `(remote, oid)`. Adapted from git-workon-lib.
-fn find_remote_tracking_branch(
+pub(super) fn find_remote_tracking_branch(
     repo: &Repository,
     branch_name: &str,
 ) -> Option<(String, git2::Oid)> {
@@ -145,8 +145,27 @@ fn add_worktree(
     reference: &git2::Reference,
     remote: Option<&str>,
 ) -> Result<Worktree> {
+    add_worktree_named(
+        repo,
+        &worktree_name_for_branch(branch),
+        branch,
+        reference,
+        remote,
+    )
+}
+
+/// Materialize a worktree directory named `wt_name` under the worktree root,
+/// checked out to `reference`. Slots pass `work<N>`; overflow and legacy
+/// worktrees pass the sanitized branch name.
+pub(super) fn add_worktree_named(
+    repo: &Repository,
+    wt_name: &str,
+    branch: &str,
+    reference: &git2::Reference,
+    remote: Option<&str>,
+) -> Result<Worktree> {
     let root = workon_root(repo)?;
-    let wt_name = worktree_name_for_branch(branch);
+    let wt_name = wt_name.to_string();
     // Check for an existing worktree with this name before libgit2 returns an
     // opaque error.
     if repo.find_worktree(&wt_name).is_ok() {
@@ -180,7 +199,7 @@ fn add_worktree(
 }
 
 /// The remote that local `branch` tracks (e.g. `origin`, `upstream`), if any.
-fn branch_remote(repo: &Repository, branch: &str) -> Option<String> {
+pub(super) fn branch_remote(repo: &Repository, branch: &str) -> Option<String> {
     let refname = format!("refs/heads/{branch}");
     repo.branch_upstream_remote(&refname)
         .ok()
@@ -231,7 +250,7 @@ fn base_remote(repo: &Repository, base: &str) -> Option<String> {
 /// Best-effort: a repo that doesn't use LFS, or a missing `git-lfs` install, is
 /// not an error - worktree creation must still succeed, so failures are only
 /// logged.
-fn inflate_lfs(path: &Path, remote: Option<&str>) {
+pub(super) fn inflate_lfs(path: &Path, remote: Option<&str>) {
     if !uses_lfs(path) {
         return;
     }

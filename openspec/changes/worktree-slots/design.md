@@ -42,9 +42,9 @@ The common dir is outside every worktree, so `git status` never shows these file
 Alternative: daemon-only. That fails for Claude hooks in repos with no running session.
 
 ### D4: Release reuses the removal checks
-Release needs the same facts as `removal_verdict`: dirty state, upstream containment, and PR state. Swamp extracts the shared part ("is this branch's work safe?") into one function that both removal and release call. The PR lookup uses the existing GitHub client (`src/github/`) and does not call the `gh` CLI. When no GitHub token or network exists, the PR check returns "unknown". Release then accepts only the pushed condition.
+Release needs the same facts as `removal_verdict`: dirty state, upstream containment, and PR state. Swamp extracts the shared part ("is this branch's work safe?") into one function that both removal and release call. The PR lookup uses the existing GitHub client (`src/github/`), which runs `gh` under the hood. The CLI looks up the PR before it takes the slot lock, because the lookup is a network call. When `gh` is missing, unauthenticated, or offline, the PR check returns "unknown". Release then accepts only the pushed condition.
 
-Branch deletion uses a force delete, because a squash merge leaves the branch unmerged in git's view.
+Branch deletion uses a force delete, because a squash merge leaves the branch unmerged in git's view. A merged or closed PR makes a release safe only when the PR head equals the local tip. If the slot has local commits after the PR head, release falls back to the git checks.
 
 ### D5: The TUI create path uses alloc
 The `c` picker keeps its UI. Its result goes to the slot allocator, not `create_worktree`. `create_worktree` and `create_worktree_from_base` become the overflow path and a "check out into an existing dir" variant for slots. The slot variant runs `checkout` in the existing worktree with `git2` (`set_head` plus `checkout_head`, with safe checkout), so ignored build output stays in place.

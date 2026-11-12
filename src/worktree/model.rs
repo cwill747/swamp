@@ -53,6 +53,31 @@ pub fn worktree_name_for_branch(branch: &str) -> String {
     branch.replace('/', "-")
 }
 
+/// What role a worktree plays in the slot pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeKind {
+    /// The worktree that holds the repository default branch.
+    Default,
+    /// A reusable pool worktree named `work<N>`.
+    Slot,
+    /// A dedicated branch-named worktree. It persists until the user removes it.
+    #[default]
+    Overflow,
+}
+
+/// Whether a slot can take a new allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotState {
+    /// Detached `HEAD`, clean tree, and no pin.
+    Free,
+    /// A branch is checked out, or the tree has changes.
+    Busy,
+    /// Detached and clean, but held by a pin.
+    Pinned,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GitInfo {
     pub branch: String,
