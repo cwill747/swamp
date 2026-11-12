@@ -204,13 +204,16 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Serializes tests that change the `XDG_RUNTIME_DIR`, `XDG_CACHE_HOME`, or
+/// `HOME` environment variables. Every test module that changes them must
+/// hold this lock, because tests in one binary run in parallel.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::base64_encode;
     use super::*;
-
-    // Serializes tests that mutate process-global environment variables.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn runtime_base_dir_uses_xdg_runtime_dir() {
