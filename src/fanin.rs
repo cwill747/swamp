@@ -151,31 +151,69 @@ async fn follow(sock: &Path, id: &str, registry: Option<&Path>, tx: &mpsc::Sende
 /// update fetches from the remote, so the limit is generous.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Why a one-shot request did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// The daemon answered with an error.
+    Rejected(String),
+    /// The daemon closed the connection with no answer. A daemon that does
+    /// not know the request does this.
+    Closed,
+    /// The request or the answer did not arrive: no connection, an I/O
+    /// error, or no answer in time. A later request can succeed.
+    Transport(String),
+}
+
+impl RequestError {
+    /// True when the daemon received the request and refused it.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, RequestError::Rejected(_) | RequestError::Closed)
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::Rejected(message) | RequestError::Transport(message) => {
+                f.write_str(message)
+            }
+            RequestError::Closed => f.write_str("the daemon closed the connection"),
+        }
+    }
+}
+
 /// Send one request to the daemon at `sock` on a new connection and wait for
 /// the result. Messages that are not a result, such as a broadcast, are
 /// skipped.
-pub async fn request(sock: &Path, msg: &ClientMsg, timeout: Duration) -> Result<(), String> {
+pub async fn request(sock: &Path, msg: &ClientMsg, timeout: Duration) -> Result<(), RequestError> {
     let exchange = async {
         let mut stream = discover::connect(sock)
             .await
-            .ok_or_else(|| "the daemon does not answer".to_string())?;
+            .ok_or_else(|| RequestError::Transport("the daemon does not answer".to_string()))?;
         write_client_msg(&mut stream, msg)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| RequestError::Transport(format!("{e:#}")))?;
         loop {
             match read_server_msg(&mut stream).await {
                 Ok(Some(ServerMsg::Ok | ServerMsg::RefreshDone { .. })) => return Ok(()),
-                Ok(Some(ServerMsg::Err { message })) => return Err(message),
-                Ok(Some(ServerMsg::ErrDirty { reason, .. })) => return Err(reason),
+                Ok(Some(ServerMsg::Err { message })) => {
+                    return Err(RequestError::Rejected(message));
+                }
+                Ok(Some(ServerMsg::ErrDirty { reason, .. })) => {
+                    return Err(RequestError::Rejected(reason));
+                }
                 Ok(Some(_)) => continue,
-                Ok(None) => return Err("the daemon closed the connection".to_string()),
-                Err(e) => return Err(format!("{e:#}")),
+                Ok(None) => return Err(RequestError::Closed),
+                Err(e) => return Err(RequestError::Transport(format!("{e:#}"))),
             }
         }
     };
     match tokio::time::timeout(timeout, exchange).await {
         Ok(result) => result,
-        Err(_) => Err(format!("no answer in {} seconds", timeout.as_secs())),
+        Err(_) => Err(RequestError::Transport(format!(
+            "no answer in {} seconds",
+            timeout.as_secs()
+        ))),
     }
 }
 
@@ -233,7 +271,7 @@ pub async fn update_default_all(
     while let Some(joined) = requests.join_next().await {
         match joined {
             Ok((_, Ok(()))) => report.updated += 1,
-            Ok((name, Err(error))) => report.failed.push((name, error)),
+            Ok((name, Err(error))) => report.failed.push((name, error.to_string())),
             Err(e) => report.failed.push(("?".to_string(), e.to_string())),
         }
     }
