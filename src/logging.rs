@@ -237,9 +237,9 @@ mod tests {
 
     #[test]
     fn log_path_is_under_runtime_dir() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Point XDG_RUNTIME_DIR at a real temp dir so runtime_base_dir() can
         // verify ownership and create the directory.
