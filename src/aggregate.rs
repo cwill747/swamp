@@ -95,8 +95,9 @@ struct Repo {
     waiting: usize,
     /// The count that the daemon acknowledged last.
     sent: Option<usize>,
-    /// False after the daemon rejected the message. An older daemon does not
-    /// know it, and the aggregator then stops sending to that daemon.
+    /// False after the daemon refused the message. An older daemon does not
+    /// know it, and the aggregator then stops sending to that daemon. A
+    /// request that did not arrive does not change this value.
     supported: bool,
 }
 
@@ -117,10 +118,13 @@ async fn send_counts(repos: &mut BTreeMap<String, Repo>, all: bool, timeout: Dur
         let msg = ClientMsg::ExternalAttention { count };
         match fanin::request(&repo.sock, &msg, timeout).await {
             Ok(()) => repo.sent = Some(count),
-            Err(e) => {
+            Err(e) if e.is_refusal() => {
                 tracing::debug!(repo = %id, "daemon does not accept the attention count: {e}");
                 repo.supported = false;
             }
+            // The daemon did not get the count. `sent` keeps its value, so
+            // the subsequent send tries again.
+            Err(e) => tracing::debug!(repo = %id, "attention count not delivered: {e}"),
         }
     }
 }
@@ -357,6 +361,63 @@ mod tests {
         wait_for("b receives zero", || counts(&log_b).last() == Some(&0)).await;
 
         aggregator.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_count_that_does_not_arrive_is_sent_again() {
+        let dir = temp_dir("agg-retry");
+        let sock = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let repo = |sock: &Path| Repo {
+            sock: sock.to_path_buf(),
+            waiting: 0,
+            sent: None,
+            supported: true,
+        };
+        let mut repos = BTreeMap::from([("a".to_string(), repo(&sock))]);
+        let wait = Duration::from_secs(5);
+
+        // Nothing listens: the request does not arrive.
+        send_counts(&mut repos, false, wait).await;
+        assert!(repos["a"].supported);
+        assert_eq!(repos["a"].sent, None);
+
+        // The daemon answers now, and the subsequent send delivers the count.
+        let log = RequestLog::default();
+        let daemon = spawn_recording_daemon(
+            &sock,
+            InfoReply::Reject,
+            vec![],
+            None,
+            Some(ServerMsg::Ok),
+            log.clone(),
+        );
+        send_counts(&mut repos, false, wait).await;
+        assert_eq!(repos["a"].sent, Some(0));
+        assert_eq!(counts(&log), [0]);
+        daemon.abort();
+
+        // A daemon that refuses the message gets no more messages.
+        for (name, reply) in [
+            ("bbbbbbbbbbbbbbbb.sock", None),
+            (
+                "cccccccccccccccc.sock",
+                Some(ServerMsg::Err {
+                    message: "unsupported request".into(),
+                }),
+            ),
+        ] {
+            let sock = dir.join(name);
+            let log = RequestLog::default();
+            let daemon =
+                spawn_recording_daemon(&sock, InfoReply::Reject, vec![], None, reply, log.clone());
+            let mut repos = BTreeMap::from([("a".to_string(), repo(&sock))]);
+            send_counts(&mut repos, true, wait).await;
+            send_counts(&mut repos, true, wait).await;
+            assert!(!repos["a"].supported, "{name}");
+            assert_eq!(counts(&log), [0], "{name}");
+            daemon.abort();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
