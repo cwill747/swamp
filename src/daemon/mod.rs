@@ -313,10 +313,25 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                 match result {
                     Ok(Ok(prs)) => {
                         let mut s = d.state.write().await;
+                        let titles = |snap: &crate::daemon::state::Snapshot| {
+                            snap.rows
+                                .iter()
+                                .map(|r| (r.name.clone(), r.title.clone()))
+                                .collect::<Vec<_>>()
+                        };
+                        let before = titles(&s.snapshot());
                         s.update_prs(prs);
                         let pr_snap = s.pr_snapshot();
+                        // Row titles can come from PR titles, so a PR change
+                        // can retitle rows: send the new rows at once rather
+                        // than at the next heartbeat.
+                        let snap = s.snapshot();
+                        let retitled = titles(&snap) != before;
                         drop(s);
                         let _ = d.tx.send(ServerMsg::PrStatus(pr_snap));
+                        if retitled {
+                            let _ = d.tx.send(ServerMsg::Snapshot(snap));
+                        }
                         delay = Duration::from_secs(60);
                     }
                     Ok(Err(e)) => {

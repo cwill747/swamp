@@ -400,6 +400,48 @@ mod tests {
         assert!(free_line.contains("free"), "{free_line}");
     }
 
+    /// In a narrow pane (the default dashboard gives the worktrees pane a
+    /// third of the terminal) the title and branch still show.
+    #[test]
+    fn narrow_worktrees_pane_keeps_title_and_branch() {
+        use crate::worktree::{SlotState, WorktreeKind};
+        let mut busy = row("work1", false);
+        busy.branch = "fix-ci".into();
+        busy.kind = WorktreeKind::Slot;
+        busy.slot_state = Some(SlotState::Busy);
+        busy.title = "Fix flaky CI retry logic".into();
+        let mut overflow = row("parser", false);
+        overflow.branch = "parser".into();
+        overflow.title = "Parser rewrite".into();
+        let mut app = app_with(vec![busy, overflow], "dashboard");
+
+        let width = 42;
+        let backend = ratatui::backend::TestBackend::new(width, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::view::render(f, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|line| line.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+
+        let busy_line = screen
+            .lines()
+            .find(|l| l.contains("work1"))
+            .unwrap_or_else(|| panic!("work1 not on screen:\n{screen}"));
+        assert!(busy_line.contains("Fix"), "{busy_line}");
+        assert!(busy_line.contains("fix-ci"), "{busy_line}");
+        let overflow_line = screen
+            .lines()
+            .find(|l| l.contains("Parser"))
+            .unwrap_or_else(|| panic!("overflow title not on screen:\n{screen}"));
+        assert!(overflow_line.contains("parser"), "{overflow_line}");
+    }
+
     /// The default-branch row is pinned to index 1, directly below the pinned
     /// current worktree at index 0.
     #[test]

@@ -536,7 +536,10 @@ pub(super) fn handle_input_key(
                 text.pop();
                 app.input = Some(InputMode::EditTitle { branch, text });
             }
-            KeyCode::Char(c) if text.chars().count() < 200 => {
+            // The daemon limits titles by UTF-8 bytes, so count bytes here.
+            KeyCode::Char(c)
+                if text.len() + c.len_utf8() <= crate::slot_service::MAX_TITLE_BYTES =>
+            {
                 text.push(c);
                 app.input = Some(InputMode::EditTitle { branch, text });
             }
@@ -907,6 +910,36 @@ mod tests {
         assert!(matches!(&app.input, Some(InputMode::EditTitle { text, .. }) if text.is_empty()));
         press(&mut app, key(KeyCode::Esc));
         assert!(app.input.is_none());
+    }
+
+    /// The editor stops at the daemon's byte limit, also for multibyte text.
+    #[test]
+    fn title_prompt_stops_at_the_byte_limit() {
+        let mut r = row("work1", None, false);
+        r.branch = "fix-ci".into();
+        r.title = String::new();
+        let mut app = app_with_row(r);
+        let (tx, _rx) = mpsc::channel(4);
+        let common = std::path::Path::new("/nonexistent");
+        app.input = Some(InputMode::EditTitle {
+            branch: "fix-ci".into(),
+            text: String::new(),
+        });
+        for _ in 0..100 {
+            let mode = app.input.take().expect("prompt open");
+            handle_input_key(&mut app, mode, key(KeyCode::Char('日')), &tx, common);
+        }
+        match &app.input {
+            Some(InputMode::EditTitle { text, .. }) => {
+                assert!(text.len() <= crate::slot_service::MAX_TITLE_BYTES);
+                assert_eq!(
+                    text.chars().count(),
+                    66,
+                    "3-byte chars: 66 fit in 200 bytes"
+                );
+            }
+            _ => panic!("title prompt should stay open"),
+        }
     }
 
     /// A free slot has no branch, so `t` reports that instead of prompting.

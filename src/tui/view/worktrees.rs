@@ -17,9 +17,13 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use std::time::{Duration, SystemTime};
 
 const EXPANDED_PR_COLUMNS_WIDTH: u16 = 100;
+/// Below this inner width the slot label joins the title cell, and the title
+/// and branch columns get minimum widths ahead of the status columns.
+const NARROW_WIDTH: u16 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorktreeTableLayout {
+    Narrow,
     Compact,
     Expanded,
 }
@@ -50,6 +54,19 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
         .map(|(i, r)| build_row(i, r, app, &ctx))
         .collect();
 
+    // The default dashboard gives this pane a third of the terminal, so it is
+    // often narrow. Min constraints win over Length ones, so the title and
+    // branch keep room and the git and age columns shrink first.
+    let narrow_constraints = [
+        Constraint::Length(3),  // # + caret
+        Constraint::Length(2),  // agent icon
+        Constraint::Length(1),  // PR icon
+        Constraint::Min(12),    // slot label + work title
+        Constraint::Min(8),     // branch
+        Constraint::Length(12), // git
+        Constraint::Length(5),  // age
+        Constraint::Length(1),  // harness override (C/X)
+    ];
     let compact_constraints = [
         Constraint::Length(3),  // # + caret
         Constraint::Length(2),  // agent icon
@@ -78,6 +95,7 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
     let table = Table::new(
         rows,
         match ctx.layout {
+            WorktreeTableLayout::Narrow => narrow_constraints.as_slice(),
             WorktreeTableLayout::Compact => compact_constraints.as_slice(),
             WorktreeTableLayout::Expanded => expanded_constraints.as_slice(),
         },
@@ -122,10 +140,10 @@ pub(super) fn render_worktree_table(f: &mut Frame, app: &mut AppState, area: Rec
 }
 
 fn worktree_table_layout(area: Rect) -> WorktreeTableLayout {
-    if bordered_inner(area).width >= EXPANDED_PR_COLUMNS_WIDTH {
-        WorktreeTableLayout::Expanded
-    } else {
-        WorktreeTableLayout::Compact
+    match bordered_inner(area).width {
+        w if w >= EXPANDED_PR_COLUMNS_WIDTH => WorktreeTableLayout::Expanded,
+        w if w >= NARROW_WIDTH => WorktreeTableLayout::Compact,
+        _ => WorktreeTableLayout::Narrow,
     }
 }
 
@@ -203,8 +221,17 @@ fn build_row<'a>(
     if idle_slot {
         name_style = name_style.fg(Theme::MUTED);
     }
-    let name_cell = Cell::from(Span::styled(row_title(r), name_style));
-    let label_cell = Cell::from(Span::styled(row_label(r), Theme::muted()));
+    let label = row_label(r);
+    let narrow = ctx.layout == WorktreeTableLayout::Narrow;
+    let name_cell = if narrow && !label.is_empty() {
+        Cell::from(Line::from(vec![
+            Span::styled(format!("{label} "), Theme::muted()),
+            Span::styled(row_title(r), name_style),
+        ]))
+    } else {
+        Cell::from(Span::styled(row_title(r), name_style))
+    };
+    let label_cell = Cell::from(Span::styled(label, Theme::muted()));
 
     let branch_color = if r.deleting {
         Theme::MUTED
@@ -297,14 +324,10 @@ fn build_row<'a>(
         ));
     }
 
-    cells.extend([
-        label_cell,
-        name_cell,
-        branch_cell,
-        git_cell,
-        age_cell,
-        harness_cell,
-    ]);
+    if !narrow {
+        cells.push(label_cell);
+    }
+    cells.extend([name_cell, branch_cell, git_cell, age_cell, harness_cell]);
     let row = Row::new(cells);
     if ctx.selected == Some(i) {
         row.style(Theme::selected())
