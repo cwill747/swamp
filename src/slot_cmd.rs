@@ -10,7 +10,7 @@ use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_
 use crate::slot_service;
 use crate::worktree::git_common_dir;
 use crate::worktree::slots::{
-    self, AllocOptions, Allocation, PoolEntry, PrFacts, Release, ReleaseOptions, ReleaseOutcome,
+    self, AllocOptions, Allocation, PoolEntry, Release, ReleaseOptions, ReleaseOutcome,
 };
 use crate::worktree::{SlotState, WorktreeKind};
 use anyhow::{Context, Result};
@@ -100,15 +100,14 @@ pub async fn alloc(common: &Path, branch: String, offline: bool) -> Result<Alloc
             fetch: !offline,
             ..AllocOptions::pool(config::slots_config(&common)?.pool_size)
         };
-        let (a, changes) = slot_service::alloc(&common, &branch, &opts)?;
-        slot_service::apply_to_status_file(&common, &changes)?;
-        Ok(a)
+        slot_service::alloc_with_status_file(&common, &branch, &opts)
     })
     .await?
 }
 
-/// Release through the daemon when one answers (it supplies PR facts from its
-/// own PR map); otherwise look the PR up here and release in-process.
+/// Release through the daemon when one answers, otherwise in-process. Either
+/// way the CLI looks the PR up first: the daemon's PR map stays empty while no
+/// TUI subscribes, and release must not depend on that.
 pub async fn release(
     common: &Path,
     target: Option<String>,
@@ -116,13 +115,22 @@ pub async fn release(
     force: bool,
     offline: bool,
 ) -> Result<Release> {
+    let pr = if offline {
+        None
+    } else {
+        let (common, target, cwd) = (common.to_path_buf(), target.clone(), cwd.clone());
+        tokio::task::spawn_blocking(move || {
+            slot_service::pr_facts(&common, target.as_deref(), &cwd)
+        })
+        .await?
+    };
     if let Some(mut stream) = connect_daemon(common).await {
         let msg = ClientMsg::SlotRelease {
             target,
             cwd,
             force,
             offline,
-            pr: None,
+            pr,
         };
         return match request(&mut stream, &msg).await? {
             ServerMsg::SlotReleased { release } => Ok(release),
@@ -131,20 +139,12 @@ pub async fn release(
     }
     let common = common.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let pr = if offline {
-            None
-        } else {
-            pr_facts(&common, target.as_deref(), &cwd)
-        };
         let opts = ReleaseOptions {
             force,
             fetch: !offline,
             pr,
         };
-        let agents = slot_service::load_agents(&common);
-        let (r, changes) = slot_service::release(&common, target.as_deref(), &cwd, &opts, &agents)?;
-        slot_service::apply_to_status_file(&common, &changes)?;
-        Ok(r)
+        slot_service::release_with_status_file(&common, target.as_deref(), &cwd, &opts)
     })
     .await?
 }
@@ -201,23 +201,6 @@ fn describe_alloc(a: &Allocation) -> String {
         ),
         _ => format!("allocated {} to {}", a.name, a.branch),
     }
-}
-
-/// Look up the PR for the branch that `target` resolves to, before release
-/// takes the slot lock: the lookup is a network call. Any failure (no `gh`, no
-/// auth, offline) yields `None`, and release then relies on git state only.
-fn pr_facts(common: &Path, target: Option<&str>, cwd: &Path) -> Option<PrFacts> {
-    let wt = slots::resolve_target(common, target, cwd).ok()?;
-    let branch = slots::checked_out_branch(&wt.path)?;
-    let mut prs = crate::github::list_prs_for_branches(&wt.path, std::slice::from_ref(&branch))
-        .map_err(|e| tracing::debug!("PR lookup for {branch} failed: {e:#}"))
-        .ok()?;
-    let pr = prs.remove(&branch)?;
-    Some(PrFacts {
-        branch,
-        state: pr.state,
-        head_oid: pr.head_oid.and_then(|o| o.parse().ok()),
-    })
 }
 
 fn describe_release(r: &Release) -> String {

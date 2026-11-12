@@ -140,6 +140,8 @@ pub struct AppState {
     pub view: TuiView,
     pub refreshing: bool,
     pub pending_delete: Option<String>,
+    /// Branch of a worktree this TUI just asked the daemon to create; its tab
+    /// opens when a snapshot row with that branch appears.
     pub pending_create: Option<String>,
     pub connected: bool,
     /// Active footer prompt (create/delete), if any.

@@ -749,7 +749,9 @@ impl Daemon {
     }
 
     /// Release a slot (see [`crate::slot_service::release`]). When the client
-    /// sent no PR facts, the daemon uses its own PR map.
+    /// sent no PR facts, the daemon uses its own PR map, and looks the PR up
+    /// when the map has no entry for the branch (the map stays empty while no
+    /// TUI subscribes).
     pub async fn slot_release(
         &self,
         target: Option<String>,
@@ -776,6 +778,10 @@ impl Daemon {
                     head_oid: summary.head_oid.and_then(|o| o.parse().ok()),
                 })
             });
+            let pr = match pr {
+                None if !offline => crate::slot_service::pr_facts(&common, target.as_deref(), &cwd),
+                pr => pr,
+            };
             let opts = crate::worktree::slots::ReleaseOptions {
                 force,
                 fetch: !offline,

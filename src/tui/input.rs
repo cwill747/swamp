@@ -4,7 +4,6 @@ use super::state::{AppState, CreateAction, CreateEntry, CreateStep, InputMode};
 use super::view;
 use crate::config::Harness;
 use crate::daemon::socket::ClientMsg;
-use crate::worktree::worktree_name_for_branch;
 use crate::zellij;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -642,7 +641,10 @@ fn start_create(
         }
         _ => String::new(),
     };
-    app.pending_create = Some(worktree_name_for_branch(&label).to_string());
+    // Match the new row by branch: a slot's name (`work<N>`) says nothing
+    // about the branch it holds.
+    app.pending_create =
+        Some(crate::worktree::slots::sanitize_branch_name(&label).unwrap_or(label.clone()));
     app.status_msg = Some(format!("Creating {label}…"));
     let tx = tx.clone();
     let common = common.to_path_buf();

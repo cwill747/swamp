@@ -407,7 +407,7 @@ mod tests {
 
         let wt = create_worktree_from_base(&bare, "feature/login", "main").unwrap();
         let dir_basename = wt.path.file_name().unwrap().to_string_lossy().into_owned();
-        let registry_name = crate::worktree::worktree_name_for_branch("feature/login");
+        let registry_name = crate::worktree::model::worktree_name_for_branch("feature/login");
 
         assert_eq!(
             dir_basename, registry_name,

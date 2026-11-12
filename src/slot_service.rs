@@ -17,8 +17,8 @@ use crate::config::Harness;
 use crate::daemon::state::{AgentRecord, AgentStatus};
 use crate::util::now_unix;
 use crate::worktree::slots::{
-    self, AllocOptions, Allocation, Release, ReleaseOptions, ReleaseOutcome, ReleaseRefused,
-    ReleaseRefusedReason,
+    self, AllocOptions, Allocation, PrFacts, Release, ReleaseOptions, ReleaseOutcome,
+    ReleaseRefused, ReleaseRefusedReason,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,30 @@ pub fn alloc(
     opts: &AllocOptions,
 ) -> Result<(Allocation, AgentChanges)> {
     let guard = slots::lock(common)?;
-    let a = slots::alloc_locked(&guard, common, branch, opts)?;
+    alloc_under(&guard, common, branch, opts)
+}
+
+/// [`alloc`] for the CLI when no daemon runs: it applies the agent changes to
+/// `.swamp-status.json` before it releases the slot lock, so a concurrent
+/// operation cannot reuse the slot between the two steps.
+pub fn alloc_with_status_file(
+    common: &Path,
+    branch: &str,
+    opts: &AllocOptions,
+) -> Result<Allocation> {
+    let guard = slots::lock(common)?;
+    let (a, changes) = alloc_under(&guard, common, branch, opts)?;
+    apply_to_status_file(common, &changes)?;
+    Ok(a)
+}
+
+fn alloc_under(
+    guard: &slots::SlotLock,
+    common: &Path,
+    branch: &str,
+    opts: &AllocOptions,
+) -> Result<(Allocation, AgentChanges)> {
+    let a = slots::alloc_locked(guard, common, branch, opts)?;
     let mut changes = AgentChanges::default();
     if !a.existing {
         match load_branches(common).get(&a.branch) {
@@ -133,6 +156,33 @@ pub fn release(
     agents: &HashMap<String, AgentRecord>,
 ) -> Result<(Release, AgentChanges)> {
     let guard = slots::lock(common)?;
+    release_under(&guard, common, target, cwd, opts, agents)
+}
+
+/// [`release`] for the CLI when no daemon runs: it reads the agent records
+/// and applies the changes to `.swamp-status.json` while it holds the slot
+/// lock, so a concurrent alloc cannot swap the slot's record in between.
+pub fn release_with_status_file(
+    common: &Path,
+    target: Option<&str>,
+    cwd: &Path,
+    opts: &ReleaseOptions,
+) -> Result<Release> {
+    let guard = slots::lock(common)?;
+    let agents = load_agents(common);
+    let (r, changes) = release_under(&guard, common, target, cwd, opts, &agents)?;
+    apply_to_status_file(common, &changes)?;
+    Ok(r)
+}
+
+fn release_under(
+    guard: &slots::SlotLock,
+    common: &Path,
+    target: Option<&str>,
+    cwd: &Path,
+    opts: &ReleaseOptions,
+    agents: &HashMap<String, AgentRecord>,
+) -> Result<(Release, AgentChanges)> {
     let wt = slots::resolve_target(common, target, cwd)?;
     let name = wt.name();
     let record = agents.get(&name);
@@ -150,7 +200,7 @@ pub fn release(
         .into());
     }
 
-    let r = slots::release_locked(&guard, common, &wt, opts)?;
+    let r = slots::release_locked(guard, common, &wt, opts)?;
     let mut changes = AgentChanges::default();
     if let (ReleaseOutcome::Detached { branch_deleted }, Some(branch)) = (r.outcome, &r.branch) {
         let mut mem = load_branches(common);
@@ -175,6 +225,23 @@ pub fn release(
         changes.clear.push(name);
     }
     Ok((r, changes))
+}
+
+/// Look up the PR for the branch that `target` resolves to, before release
+/// takes the slot lock: the lookup is a network call. Any failure (no `gh`, no
+/// auth, offline) yields `None`, and release then relies on git state only.
+pub fn pr_facts(common: &Path, target: Option<&str>, cwd: &Path) -> Option<PrFacts> {
+    let wt = slots::resolve_target(common, target, cwd).ok()?;
+    let branch = slots::checked_out_branch(&wt.path)?;
+    let mut prs = crate::github::list_prs_for_branches(&wt.path, std::slice::from_ref(&branch))
+        .map_err(|e| tracing::debug!("PR lookup for {branch} failed: {e:#}"))
+        .ok()?;
+    let pr = prs.remove(&branch)?;
+    Some(PrFacts {
+        branch,
+        state: pr.state,
+        head_oid: pr.head_oid.and_then(|o| o.parse().ok()),
+    })
 }
 
 fn path_contains(root: &Path, child: &Path) -> bool {
