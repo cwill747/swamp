@@ -102,7 +102,8 @@ pub async fn alloc(
             offline,
             no_hooks,
         };
-        return match request(&mut stream, &msg).await? {
+        let wait = reply_timeout(common, no_hooks, |h| &h.post_alloc);
+        return match request(&mut stream, &msg, wait).await? {
             ServerMsg::SlotAllocated { allocation } => Ok(allocation),
             other => Err(reply_error(other)),
         };
@@ -153,7 +154,8 @@ pub async fn release(
             no_hooks,
             pr,
         };
-        return match request(&mut stream, &msg).await? {
+        let wait = reply_timeout(common, no_hooks, |h| &h.pre_release);
+        return match request(&mut stream, &msg, wait).await? {
             ServerMsg::SlotReleased { release } => Ok(release),
             other => Err(reply_error(other)),
         };
@@ -190,13 +192,39 @@ async fn connect_daemon(common: &Path) -> Option<UnixStream> {
         .ok()
 }
 
-/// Send one request and wait for its reply. Slot operations fetch and check
-/// out, so the wait is long.
-async fn request(stream: &mut UnixStream, msg: &ClientMsg) -> Result<ServerMsg> {
+/// How long a slot operation may take without hooks: a fetch and a checkout.
+const BASE_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The reply deadline for a daemon slot operation: the base time plus the
+/// time limit of each hook the daemon runs for the event. The daemon reads the
+/// same config files, so the CLI can add up the same hooks.
+fn reply_timeout(
+    common: &Path,
+    no_hooks: bool,
+    event: impl Fn(&config::SlotHooks) -> &Vec<config::HookCommand>,
+) -> Duration {
+    if no_hooks {
+        return BASE_REPLY_TIMEOUT;
+    }
+    let hooks = config::slots_config(common)
+        .map(|c| event(&c.hooks).clone())
+        .unwrap_or_default();
+    BASE_REPLY_TIMEOUT + hooks_budget(&hooks)
+}
+
+fn hooks_budget(hooks: &[config::HookCommand]) -> Duration {
+    hooks
+        .iter()
+        .map(|h| Duration::from_secs(h.timeout_secs.unwrap_or(config::DEFAULT_HOOK_TIMEOUT_SECS)))
+        .sum()
+}
+
+/// Send one request and wait up to `wait` for its reply.
+async fn request(stream: &mut UnixStream, msg: &ClientMsg, wait: Duration) -> Result<ServerMsg> {
     write_client_msg(stream, msg)
         .await
         .context("send request to daemon")?;
-    tokio::time::timeout(Duration::from_secs(300), read_server_msg(stream))
+    tokio::time::timeout(wait, read_server_msg(stream))
         .await
         .context("daemon reply timed out")??
         .context("daemon closed the connection before it replied")
@@ -213,7 +241,7 @@ fn reply_error(reply: ServerMsg) -> anyhow::Error {
 /// effort: without a daemon there is nothing to refresh.
 async fn refresh_daemon(common: &Path) {
     if let Some(mut stream) = connect_daemon(common).await
-        && let Err(e) = request(&mut stream, &ClientMsg::Refresh).await
+        && let Err(e) = request(&mut stream, &ClientMsg::Refresh, BASE_REPLY_TIMEOUT).await
     {
         tracing::debug!("daemon refresh after pin change failed: {e:#}");
     }
@@ -273,6 +301,25 @@ fn format_list(entries: &[PoolEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_budget_adds_each_time_limit() {
+        let hooks = [
+            config::HookCommand {
+                run: "a".into(),
+                timeout_secs: Some(600),
+            },
+            config::HookCommand {
+                run: "b".into(),
+                timeout_secs: None,
+            },
+        ];
+        assert_eq!(
+            hooks_budget(&hooks),
+            Duration::from_secs(600 + config::DEFAULT_HOOK_TIMEOUT_SECS)
+        );
+        assert_eq!(hooks_budget(&[]), Duration::ZERO);
+    }
 
     fn entry(name: &str, kind: WorktreeKind, state: Option<SlotState>) -> PoolEntry {
         PoolEntry {
