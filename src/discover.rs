@@ -170,14 +170,29 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("swamp-{tag}-{}-{nanos}", std::process::id()));
+    /// Make a new temporary directory. `_tag` names the caller for the
+    /// reader only.
+    ///
+    /// The directory name is short because tests bind sockets in it, and
+    /// macOS limits a socket path to 104 bytes.
+    pub(crate) fn temp_dir(_tag: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sw-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Create a socket file that nothing listens on, as a daemon that died
+    /// leaves behind.
+    ///
+    /// The socket is a datagram socket, so a stream connection always fails.
+    /// A listener that is bound and then dropped is not sufficient: a child
+    /// process that a parallel test forks can hold a copy of the listener for
+    /// a moment, and a connection in that moment succeeds.
+    pub(crate) fn stale_socket(path: &Path) {
+        drop(std::os::unix::net::UnixDatagram::bind(path).unwrap());
     }
 
     /// How a fake daemon answers `GetInfo`.
@@ -367,7 +382,7 @@ mod tests {
     async fn probe_reports_a_stale_socket_as_not_live() {
         let dir = temp_dir("probe-stale");
         let sock = dir.join("2222222222222222.sock");
-        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        stale_socket(&sock);
         assert!(sock.exists());
         assert_eq!(probe(&sock, &[]).await, Probe::NotLive);
         assert_eq!(probe(&dir.join("missing.sock"), &[]).await, Probe::NotLive);
