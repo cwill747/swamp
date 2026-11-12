@@ -174,7 +174,7 @@ where
                         .snapshot
                         .rows
                         .iter()
-                        .find(|r| r.name == name)
+                        .find(|r| r.branch == name)
                         .map(|r| (r.path.clone(), r.name.clone()));
                     if let Some((path, name)) = created {
                         activate_worktree_tab(tx.clone(), path, name);

@@ -25,7 +25,7 @@ pub use clone::clone_repo;
 pub use create::create_worktree;
 pub use model::{
     BranchInfo, BranchKind, GitInfo, RemoveRefused, RemoveRefusedReason, SlotState, Worktree,
-    WorktreeKind, worktree_name_for_branch,
+    WorktreeKind,
 };
 pub use remove::{check_worktree_removal, remove_worktree};
 pub use repo::{git_common_dir, resolve_git_dir};
