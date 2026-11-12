@@ -199,15 +199,18 @@ impl UpdateReport {
         if self.failed.is_empty() {
             return format!("Updated {total} {repos}");
         }
-        let failures: Vec<String> = self
+        // The names come first, so that a long error text cannot hide them.
+        let names: Vec<&str> = self.failed.iter().map(|(name, _)| name.as_str()).collect();
+        let details: Vec<String> = self
             .failed
             .iter()
-            .map(|(name, error)| format!("{name} ({error})"))
+            .map(|(name, error)| format!("{name}: {error}"))
             .collect();
         format!(
-            "Updated {} of {total} {repos}. Failed: {}",
+            "Updated {} of {total} {repos}. Failed: {}. {}",
             self.updated,
-            failures.join(", ")
+            names.join(", "),
+            details.join("; ")
         )
     }
 }
@@ -292,7 +295,7 @@ mod tests {
         );
         assert_eq!(
             report.summary(),
-            "Updated 1 of 3 repos. Failed: beta (no default branch), gamma (the daemon does not answer)"
+            "Updated 1 of 3 repos. Failed: beta, gamma. beta: no default branch; gamma: the daemon does not answer"
         );
 
         let report = update_default_all(vec![("alpha".into(), good)], WAIT).await;
