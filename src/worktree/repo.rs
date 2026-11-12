@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// Resolve the effective directory for git operations.
 ///
-/// The git-wt bare-clone pattern creates a container dir with `.git -> .bare`
+/// Swamp's bare layout (see `swamp clone`) creates a container dir with `.git -> .bare`
 /// that libgit2 won't treat as a normal repo dir. When a `.bare/` subdirectory
 /// exists, prefer it so we open the bare repo directly.
 pub fn resolve_git_dir(dir: &Path) -> PathBuf {

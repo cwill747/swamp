@@ -136,8 +136,8 @@ pub fn default_branch(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Find the worktree tracking the default branch (the one `git wt update`
-/// syncs). Falls back to the first worktree if no match.
+/// Find the worktree tracking the default branch (the one the update action
+/// fast-forwards). Falls back to the first worktree if no match.
 pub fn find_default_worktree<'a>(worktrees: &'a [Worktree], dir: &Path) -> Option<&'a Worktree> {
     let default = default_branch(dir);
     if default.is_empty() {

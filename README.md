@@ -263,6 +263,30 @@ swamp kill
 swamp kill ~/code/myproject
 ```
 
+### `swamp clone`
+
+Clones a repository into swamp's bare layout and prints the path of the default
+branch worktree:
+
+```bash
+swamp clone git@github.com:org/app.git
+swamp clone https://github.com/org/app.git ~/code/app
+cd "$(swamp clone git@github.com:org/app.git)"
+```
+
+The layout keeps the git data in `.bare` and puts each worktree in a sibling
+directory:
+
+```text
+app/
+├── .bare/   git data (bare repository)
+├── .git     points to .bare
+└── main/    default branch worktree
+```
+
+swamp creates and removes worktrees in this layout itself. You do not need
+another worktree tool.
+
 ### `swamp completions`
 
 Prints shell completions:

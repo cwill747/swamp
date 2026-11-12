@@ -123,10 +123,26 @@ pub enum Cmd {
     Init,
 
     #[command(
+        about = "Clone a repo into swamp's bare layout",
+        long_about = "Clone a repository into swamp's bare layout: the git data in `.bare`, a `.git` file that points to it, and a worktree for the default branch. Prints the default branch worktree path on stdout."
+    )]
+    Clone(CloneArgs),
+
+    #[command(
         about = "Generate shell completions",
         long_about = "Generate shell completions for swamp. Packagers should use this command to install completions from the exact binary they ship."
     )]
     Completions(CompletionsArgs),
+}
+
+#[derive(Args)]
+pub struct CloneArgs {
+    /// Repository URL to clone.
+    #[arg(value_name = "URL")]
+    pub url: String,
+    /// Target directory (default: the repository name from the URL).
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -267,6 +283,7 @@ mod tests {
         assert!(help.contains("launch"));
         assert!(help.contains("init"));
         assert!(help.contains("completions"));
+        assert!(help.contains("clone"));
         assert!(!help.contains("codex-notify"));
         assert!(!help.contains("relaunch-tab"));
         assert!(!help.contains("confirm-delete"));

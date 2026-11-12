@@ -8,8 +8,8 @@ use std::fs;
 use std::path::Path;
 
 /// Remove the worktree named `name`: delete its directory, prune the git
-/// metadata, and (when `delete_branch`) delete its local branch. Mirrors
-/// `git wt remove`. Adapted from git-workon's `prune_worktree`.
+/// metadata, and (when `delete_branch`) delete its local branch. Adapted from
+/// git-workon's `prune_worktree`.
 ///
 /// Unless `force` is set, removal is refused (returning a [`RemoveRefused`]
 /// error) when any of the following are true:
