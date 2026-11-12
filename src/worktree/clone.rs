@@ -40,7 +40,8 @@ pub fn clone_repo(url: &str, dir: Option<&Path>) -> Result<PathBuf> {
     let created = !target.exists();
     std::fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
 
-    match clone_into(url, &target) {
+    let url = local_source(url, &std::env::current_dir()?);
+    match clone_into(&url, &target) {
         Ok(path) => Ok(path),
         Err(err) => {
             if created {
@@ -72,6 +73,24 @@ fn clone_into(url: &str, target: &Path) -> Result<PathBuf> {
     drop(repo);
     let wt = create_worktree(&bare, &default)?;
     Ok(wt.path)
+}
+
+/// `url` with a relative local path made absolute against `cwd`, as
+/// `git clone` does. Later fetches run from other dirs (a worktree, or the
+/// daemon with `-C <common dir>`), where a relative path would not resolve.
+/// URLs with a scheme and scp-like `host:path` sources stay as they are.
+fn local_source(url: &str, cwd: &Path) -> String {
+    let scp_like = url
+        .split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'));
+    if url.contains("://") || scp_like || Path::new(url).is_absolute() {
+        return url.to_string();
+    }
+    let abs = cwd.join(url);
+    abs.canonicalize()
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The directory name `git clone` would pick: the last path segment of the URL
@@ -153,6 +172,26 @@ mod tests {
         );
         assert_eq!(repo_name_from_url("file:///tmp/x/app/").unwrap(), "app");
         assert!(repo_name_from_url("/").is_err());
+    }
+
+    #[test]
+    fn local_source_makes_relative_paths_absolute() {
+        let cwd = temp_dir("cwd");
+        std::fs::create_dir_all(cwd.join("origin")).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        assert_eq!(
+            local_source("./origin", &cwd),
+            cwd.join("origin").to_string_lossy()
+        );
+        for url in [
+            "https://example.com/org/app.git",
+            "git@github.com:org/app.git",
+            "file:///tmp/app",
+            "/abs/app",
+        ] {
+            assert_eq!(local_source(url, &cwd), url);
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
