@@ -167,6 +167,7 @@ pub(crate) mod test_support {
             is_default: false,
             removal_block: None,
             deleting: false,
+            subagents: Vec::new(),
         }
     }
 
