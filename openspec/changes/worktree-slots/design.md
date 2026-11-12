@@ -79,7 +79,7 @@ The slot CLI can run outside the repo session (an agent in another session, or a
 
 Open leaves an existing tab alone and gives focus back to the tab that had it, so an agent's allocation does not take the user's view. The Claude `WorktreeCreate` path opens no tab, because Claude runs in that worktree itself and a tab would start a second agent there.
 
-Close runs detached (its own process group, cwd in the common dir), because the caller can be a pane in the tab being closed. It closes by stable tab id (`list-tabs --json` and `close-tab-by-id`), not with the focus-then-`close-tab` sequence, so it works with no attached client and cannot close the wrong tab.
+Close runs detached (its own process group, cwd in the common dir), because the caller can be a pane in the tab being closed. It closes by stable tab id (`list-tabs --json` and `close-tab-by-id`), not with the focus-then-`close-tab` sequence, so it works with no attached client and cannot close the wrong tab. Before the slot becomes free, release writes `<common>/swamp/tab-closing/<slot>` with the owner's PID, and the detached closer clears it. An open for that slot waits while a live process owns the mark (at most 30s), so a quick realloc neither keeps the old tab nor loses its new tab to the late close.
 
 The TUI `c` flow already opens the created worktree's tab. It now matches the new row by branch, because a slot's name says nothing about its branch.
 

@@ -67,11 +67,32 @@ pub async fn run(args: SlotArgs) -> Result<()> {
                 (None, true) => Some(hook_field(&read_hook_payload()?, "worktree_path")?),
                 (target, _) => target,
             };
-            let r = release(&common, target, start, force, offline, no_hooks).await?;
-            crate::slot_hooks::print_runs("pre-release", &r.hooks);
-            if !no_tab && matches!(r.outcome, ReleaseOutcome::Detached { .. }) {
-                close_tab(&common, &r);
+            // Mark the slot's tab as closing before the slot becomes free, so
+            // an alloc that reuses the slot waits for the old tab to go.
+            let closing = if no_tab {
+                None
+            } else {
+                slots::resolve_target(&common, target.as_deref(), &start)
+                    .ok()
+                    .map(|wt| wt.name())
+                    .filter(|n| slots::slot_number(n).is_some())
+            };
+            if let Some(n) = &closing {
+                crate::launch::mark_tab_closing(&common, n, std::process::id());
             }
+            let result = release(&common, target, start, force, offline, no_hooks).await;
+            let detached =
+                matches!(&result, Ok(r) if matches!(r.outcome, ReleaseOutcome::Detached { .. }));
+            match &result {
+                Ok(r) if !no_tab && detached => close_tab(&common, r),
+                _ => {
+                    if let Some(n) = &closing {
+                        crate::launch::clear_tab_closing(&common, n);
+                    }
+                }
+            }
+            let r = result?;
+            crate::slot_hooks::print_runs("pre-release", &r.hooks);
             if args.json {
                 println!("{}", serde_json::to_string(&r)?);
             } else {
@@ -321,6 +342,7 @@ async fn open_tab(common: &Path, a: &Allocation) {
 fn close_tab(common: &Path, r: &Release) {
     if let Err(e) = crate::launch::spawn_slot_tab(common, SlotTabOp::Close, &r.name, &r.path, false)
     {
+        crate::launch::clear_tab_closing(common, &r.name);
         eprintln!("swamp: could not close the tab for {}: {e:#}", r.name);
     }
 }
