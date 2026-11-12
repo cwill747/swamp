@@ -359,8 +359,12 @@ pub fn slot_tab(op: crate::cli::SlotTabOp, name: &str, path: &Path) -> Result<()
         let log_cfg = config::load_config().map(|c| c.logging).unwrap_or_default();
         crate::logging::init(&common, false, false, &log_cfg);
     }
+    let common = git_common_dir(&resolve_git_dir(path)).ok();
     match op {
         crate::cli::SlotTabOp::Open => {
+            if let Some(common) = &common {
+                wait_for_pending_close(common, name);
+            }
             if zellij::list_tab_names()?.iter().any(|t| t == name) {
                 return Ok(());
             }
@@ -374,9 +378,63 @@ pub fn slot_tab(op: crate::cli::SlotTabOp, name: &str, path: &Path) -> Result<()
         }
         crate::cli::SlotTabOp::Close => {
             tracing::info!(worktree = %name, "closing slot tab");
-            zellij::close_tab_by_name(name)
+            let res = zellij::close_tab_by_name(name);
+            if let Some(common) = &common {
+                clear_tab_closing(common, name);
+            }
+            res
         }
     }
+}
+
+// A pending tab close for a released slot. A release marks the slot before it
+// frees it, and the detached closer clears the mark when the old tab is gone.
+// An open for the same slot waits for the mark, so it neither keeps the old
+// tab nor loses its new tab to the late close.
+
+fn tab_closing_path(common: &Path, name: &str) -> PathBuf {
+    common.join("swamp").join("tab-closing").join(name)
+}
+
+/// Mark the tab of slot `name` as closing, owned by process `pid`.
+pub fn mark_tab_closing(common: &Path, name: &str, pid: u32) {
+    let path = tab_closing_path(common, name);
+    let res = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, pid.to_string()));
+    if let Err(e) = res {
+        tracing::debug!(worktree = %name, "could not mark tab close: {e}");
+    }
+}
+
+pub fn clear_tab_closing(common: &Path, name: &str) {
+    let _ = std::fs::remove_file(tab_closing_path(common, name));
+}
+
+/// The owner of a pending close for `name`, when that process still runs.
+fn pending_close_owner(common: &Path, name: &str) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(tab_closing_path(common, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: signal 0 only checks that the process exists.
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    alive.then_some(pid)
+}
+
+/// Wait (at most 30s) until no live process owns a pending close for `name`.
+fn wait_for_pending_close(common: &Path, name: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while pending_close_owner(common, name).is_some() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(worktree = %name, "pending tab close did not finish; opening anyway");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    clear_tab_closing(common, name);
 }
 
 /// Spawn `swamp slot-tab <op>` against the repo session for `common_dir`.
@@ -394,6 +452,9 @@ pub fn spawn_slot_tab(
     let session = crate::util::session_name_for(common_dir);
     if !zellij::session_is_live(&session).unwrap_or(false) {
         tracing::debug!(%session, worktree = %name, "repo session not running; no slot tab change");
+        if matches!(op, crate::cli::SlotTabOp::Close) {
+            clear_tab_closing(common_dir, name);
+        }
         return Ok(());
     }
     let exe = std::env::current_exe().context("locate swamp executable")?;
@@ -420,7 +481,11 @@ pub fn spawn_slot_tab(
             anyhow::bail!("swamp slot-tab {op} {name} exited {status}");
         }
     } else {
-        cmd.spawn().context("spawn swamp slot-tab")?;
+        let child = cmd.spawn().context("spawn swamp slot-tab")?;
+        if op == "close" {
+            // The detached closer now owns the pending close.
+            mark_tab_closing(common_dir, name, child.id());
+        }
     }
     Ok(())
 }
@@ -737,6 +802,33 @@ pub(super) fn is_safe_session_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_tab_close_blocks_only_while_its_owner_runs() {
+        let common = std::env::temp_dir().join(format!(
+            "swamp-tab-closing-{}-{}",
+            std::process::id(),
+            crate::util::now_unix()
+        ));
+        assert_eq!(pending_close_owner(&common, "work1"), None);
+
+        mark_tab_closing(&common, "work1", std::process::id());
+        assert_eq!(
+            pending_close_owner(&common, "work1"),
+            Some(std::process::id())
+        );
+
+        // A finished owner leaves a stale mark that an open ignores and clears.
+        let mut done = std::process::Command::new("true").spawn().unwrap();
+        let dead = done.id();
+        done.wait().unwrap();
+        mark_tab_closing(&common, "work1", dead);
+        let started = std::time::Instant::now();
+        wait_for_pending_close(&common, "work1");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!tab_closing_path(&common, "work1").exists());
+        let _ = std::fs::remove_dir_all(&common);
+    }
 
     #[test]
     fn version_is_stale_same_version() {
