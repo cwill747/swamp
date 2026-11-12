@@ -1198,6 +1198,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Exercise the real request framing as well as hook capture: verbose
+    /// setup must return the allocated path, not exceed the client frame cap.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn verbose_slot_hook_and_relative_release_round_trip_over_socket() {
+        let _env = crate::util::test_env_lock();
+        if !crate::worktree::test_support::git_available() {
+            return;
+        }
+        let (root, bare) = crate::worktree::test_support::setup();
+        // SAFETY: the crate test env lock serializes env changes.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", root.join("config")) };
+        std::fs::create_dir_all(bare.join("swamp")).unwrap();
+        std::fs::write(
+            crate::config::repo_config_path(&bare),
+            "[[slots.hooks.post-alloc]]\nrun = 'head -c 17000000 /dev/zero'\n",
+        )
+        .unwrap();
+        let daemon = build_daemon(&bare).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(socket::handle_client(daemon.clone(), server));
+        socket::write_client_msg(
+            &mut client,
+            &ClientMsg::SlotAlloc {
+                branch: "verbose".into(),
+                base: None,
+                offline: true,
+                no_hooks: false,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = socket::read_server_msg(&mut client).await.unwrap().unwrap();
+        let ServerMsg::SlotAllocated { allocation } = reply else {
+            panic!("expected successful allocation");
+        };
+        assert!(allocation.hooks[0].success);
+        assert!(allocation.hooks[0].output.contains("hook output truncated"));
+        assert!(allocation.path.is_dir());
+
+        socket::write_client_msg(
+            &mut client,
+            &ClientMsg::SlotRelease {
+                target: Some("./".into()),
+                cwd: allocation.path.clone(),
+                force: false,
+                offline: true,
+                no_hooks: false,
+                pr: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            socket::read_server_msg(&mut client).await.unwrap(),
+            Some(ServerMsg::SlotReleased { .. })
+        ));
+        assert!(crate::worktree::slots::checked_out_branch(&allocation.path).is_none());
+        drop(client);
+        task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn make_row(name: &str) -> crate::daemon::state::WorktreeRow {
         crate::daemon::state::WorktreeRow {
             name: name.to_string(),

@@ -499,7 +499,14 @@ Hooks run with `sh -c` in the worktree and get `SWAMP_WORKTREE`, `SWAMP_NAME`,
 `SWAMP_KIND`, `SWAMP_BRANCH`, and `SWAMP_REPO_ROOT`. A failed `pre-release` hook
 stops the release unless you pass `--force`; a failed `post-alloc` hook only
 prints a warning. Each hook has a 300-second limit by default. Pass `--no-hooks`
-to skip them.
+to skip them. Captured output shares a 256 KiB budget across the hook chain;
+excess output is drained and discarded, with an explicit truncation notice.
+
+Release rechecks git safety after the hooks run. If a hook creates unpushed
+commits or leaves the tree dirty, a normal release refuses and keeps those
+changes in place. `--force` can override those checks, but never a hook that
+switches or detaches the branch. A hook's new commits are not covered by stale
+merged/closed PR facts and do not trigger deletion of their branch.
 
 A repository can set its own `pool_size` and add hooks in
 `<git-common-dir>/swamp/config.toml` (for the bare layout,
