@@ -10,6 +10,11 @@
 use crate::daemon::socket::ClientMsg;
 use crate::daemon::state::{AgentStatus, Snapshot};
 use crate::fanin;
+use crate::workspace::{
+    self,
+    broker::StateHub,
+    protocol::{ResourceState, WorkspaceState},
+};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
@@ -18,6 +23,31 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const LOCK_FILE: &str = "aggregator.lock";
+
+struct OwnedTask<T>(Option<tokio::task::JoinHandle<T>>);
+impl<T> OwnedTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        let result = self.0.as_mut().expect("owned task is present").await;
+        self.0.take();
+        result
+    }
+    async fn abort_and_join(mut self) {
+        if let Some(mut task) = self.0.take() {
+            task.abort();
+            let _ = (&mut task).await;
+        }
+    }
+}
+impl<T> Drop for OwnedTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
@@ -90,6 +120,7 @@ pub fn external_counts(waiting: &BTreeMap<String, usize>) -> BTreeMap<String, us
 }
 
 /// One live daemon.
+#[derive(Clone)]
 struct Repo {
     sock: PathBuf,
     waiting: usize,
@@ -129,6 +160,34 @@ async fn send_counts(repos: &mut BTreeMap<String, Repo>, all: bool, timeout: Dur
     }
 }
 
+async fn attention_worker(
+    mut updates: tokio::sync::watch::Receiver<BTreeMap<String, Repo>>,
+    interval: Duration,
+    timeout: Duration,
+) {
+    let mut resend = tokio::time::interval(interval);
+    let mut repos = BTreeMap::new();
+    loop {
+        tokio::select! {
+            _ = resend.tick() => send_counts(&mut repos, true, timeout).await,
+            changed = updates.changed() => {
+                if changed.is_err() { return; }
+                let incoming = updates.borrow_and_update().clone();
+                repos.retain(|id, _| incoming.contains_key(id));
+                for (id, fresh) in incoming {
+                    if let Some(current) = repos.get_mut(&id) {
+                        current.sock = fresh.sock;
+                        current.waiting = fresh.waiting;
+                    } else {
+                        repos.insert(id, fresh);
+                    }
+                }
+                send_counts(&mut repos, false, timeout).await;
+            }
+        }
+    }
+}
+
 /// Run the aggregator for the daemons in `runtime_dir`.
 pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     std::fs::create_dir_all(&runtime_dir)
@@ -137,26 +196,87 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
         return Ok(Exit::AlreadyRunning);
     };
 
+    // Establish the endpoint before discovery starts. The aggregator lock is
+    // held above, so any existing socket is stale and safe to replace.
+    let listener = workspace::broker::bind_owned(&runtime_dir)?;
+    let _endpoint_guard =
+        workspace::broker::EndpointGuard::capture(&workspace::protocol::socket_path(&runtime_dir));
+    let initial = WorkspaceState {
+        version: workspace::protocol::VERSION,
+        revision: 0,
+        repositories: Vec::new(),
+        selected_repo: None,
+        resource: ResourceState::Loading {
+            repo_id: String::new(),
+            generation: 0,
+            snapshot: None,
+        },
+    };
+    let hub = StateHub::new(initial);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let broker = OwnedTask::new(tokio::spawn(workspace::broker::serve(
+        listener,
+        hub.clone(),
+        shutdown_rx,
+    )));
+
+    // Registry I/O is kept off the broker/event loop. Each refresh is bounded
+    // to one blocking task and the latest complete result is coalesced.
+    let registry_path = crate::registry::registry_path().ok();
+    let registry_refresh_path = registry_path.clone();
+    let (registry_tx, mut registry_rx) = tokio::sync::watch::channel(Vec::new());
+    let registry_task = OwnedTask::new(tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            refresh.tick().await;
+            if let Some(path) = registry_refresh_path.clone()
+                && let Ok(entries) =
+                    tokio::task::spawn_blocking(move || crate::registry::load_at(&path)).await
+            {
+                registry_tx.send_replace(entries);
+            }
+        }
+    }));
+
     let (tx, mut rx) = mpsc::channel(256);
-    let scan = fanin::spawn(
+    let scan = OwnedTask::new(fanin::spawn(
         fanin::Config {
             runtime_dir,
             // The aggregator needs no repository identity.
-            registry: None,
+            registry: registry_path.clone(),
             scan_interval: timing.scan_interval,
         },
-        tx,
-    );
+        tx.clone(),
+    ));
     let mut repos: BTreeMap<String, Repo> = BTreeMap::new();
-    let mut resend = tokio::time::interval(timing.resend_interval);
+    let (attention_tx, attention_rx) = tokio::sync::watch::channel(BTreeMap::new());
+    let attention = OwnedTask::new(tokio::spawn(attention_worker(
+        attention_rx,
+        timing.resend_interval,
+        timing.request_timeout,
+    )));
+    let mut model = workspace::Workspace::default();
+    let mut generations = BTreeMap::<String, u64>::new();
+    let mut resource_deadlines = BTreeMap::<String, Instant>::new();
+    let mut revision = 0_u64;
     let mut idle_since = Instant::now();
+    let mut resource_check = tokio::time::interval(Duration::from_millis(500));
     let exit = loop {
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break Exit::Idle };
-                match event {
+                match &event {
                     fanin::Event::Up { id, sock, .. } => {
-                        repos.entry(id).or_insert(Repo {
+                        let id = id.clone();
+                        let sock = sock.clone();
+                        if !repos.contains_key(&id) {
+                            let generation = generations.entry(id.clone()).or_default();
+                            *generation = generation.wrapping_add(1);
+                            let state = ResourceState::Loading { repo_id: id.clone(), generation: *generation, snapshot: None };
+                            resource_deadlines.insert(id.clone(), Instant::now() + Duration::from_secs(3));
+                            hub.publish_resource(id.clone(), state).await;
+                        }
+                        repos.entry(id).and_modify(|repo| repo.sock = sock.clone()).or_insert(Repo {
                             sock,
                             waiting: 0,
                             sent: None,
@@ -164,19 +284,54 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
                         });
                     }
                     fanin::Event::Snapshot { id, snapshot } => {
-                        if let Some(repo) = repos.get_mut(&id) {
-                            repo.waiting = waiting_count(&snapshot);
+                        if let Some(repo) = repos.get_mut(id) {
+                            repo.waiting = waiting_count(snapshot);
+                        }
+                    }
+                    fanin::Event::Resources { id, resources } => {
+                        if repos.contains_key(id) {
+                            let generation = *generations.get(id).unwrap_or(&0);
+                            let state = ResourceState::Ready { repo_id: id.clone(), generation, snapshot: resources.clone() };
+                            resource_deadlines.remove(id);
+                            hub.publish_resource(id.clone(), state).await;
                         }
                     }
                     fanin::Event::Down { id } => {
-                        repos.remove(&id);
+                        repos.remove(id);
+                        let generation = *generations.get(id).unwrap_or(&0);
+                        let state = ResourceState::Disconnected { repo_id: id.clone(), generation, snapshot: None };
+                        resource_deadlines.remove(id);
+                        hub.publish_resource(id.clone(), state).await;
                     }
-                    fanin::Event::PrStatus { .. } => continue,
+                    fanin::Event::PrStatus { .. } => {}
                 }
-                send_counts(&mut repos, false, timing.request_timeout).await;
+                model.apply(event);
+                let waiting = repos.iter().map(|(id, repo)| (id.clone(), Repo { sock: repo.sock.clone(), waiting: repo.waiting, sent: None, supported: true })).collect();
+                attention_tx.send_replace(waiting);
+                revision = revision.wrapping_add(1);
+                hub.publish(WorkspaceState {
+                    version: workspace::protocol::VERSION,
+                    revision,
+                    repositories: model.repositories(),
+                    selected_repo: None,
+                    resource: ResourceState::Loading { repo_id: String::new(), generation: 0, snapshot: None },
+                });
             }
-            _ = resend.tick() => {
-                send_counts(&mut repos, true, timing.request_timeout).await;
+            changed = registry_rx.changed() => {
+                if changed.is_ok() {
+                    model.set_registry(registry_rx.borrow_and_update().clone());
+                    revision = revision.wrapping_add(1);
+                    hub.publish(WorkspaceState { version: workspace::protocol::VERSION, revision, repositories: model.repositories(), selected_repo: None, resource: ResourceState::Loading { repo_id: String::new(), generation: 0, snapshot: None } });
+                }
+            }
+            _ = resource_check.tick() => {
+                let expired: Vec<_> = resource_deadlines.iter().filter(|(_, deadline)| **deadline <= Instant::now()).map(|(id, _)| id.clone()).collect();
+                for id in expired {
+                    resource_deadlines.remove(&id);
+                    let generation = *generations.get(&id).unwrap_or(&0);
+                    let state = ResourceState::Unavailable { repo_id: id.clone(), generation, snapshot: None };
+                    hub.publish_resource(id, state).await;
+                }
             }
         }
         if !repos.is_empty() {
@@ -185,7 +340,13 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
             break Exit::Idle;
         }
     };
-    scan.abort();
+    attention.abort_and_join().await;
+    registry_task.abort_and_join().await;
+    drop(tx);
+    drop(rx);
+    scan.join().await.context("fan-in scanner task")?;
+    shutdown_tx.send_replace(true);
+    broker.join().await.context("workspace broker task")??;
     Ok(exit)
 }
 
@@ -418,6 +579,184 @@ mod tests {
             assert_eq!(counts(&log), [0], "{name}");
             daemon.abort();
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stalled_attention_request_does_not_block_inventory_publication() {
+        let dir = temp_dir("agg-attention-stall");
+        let sock = dir.join("slow.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = crate::daemon::socket::read_msg(&mut stream).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let repo = Repo {
+            sock,
+            waiting: 0,
+            sent: None,
+            supported: true,
+        };
+        let repos = BTreeMap::from([("slow".to_string(), repo)]);
+        let (updates_tx, updates_rx) = tokio::sync::watch::channel(BTreeMap::new());
+        let worker = tokio::spawn(attention_worker(
+            updates_rx,
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+        ));
+        updates_tx.send_replace(repos);
+
+        let hub = crate::workspace::broker::StateHub::new(WorkspaceState {
+            version: crate::workspace::protocol::VERSION,
+            revision: 0,
+            repositories: Vec::new(),
+            selected_repo: None,
+            resource: ResourceState::Loading {
+                repo_id: String::new(),
+                generation: 0,
+                snapshot: None,
+            },
+        });
+        let mut client = hub.subscribe_inventory();
+        let start = Instant::now();
+        hub.publish(WorkspaceState {
+            version: crate::workspace::protocol::VERSION,
+            revision: 1,
+            repositories: Vec::new(),
+            selected_repo: None,
+            resource: ResourceState::Loading {
+                repo_id: String::new(),
+                generation: 0,
+                snapshot: None,
+            },
+        });
+        assert!(client.changed().await.is_ok());
+        assert!(start.elapsed() < Duration::from_millis(100));
+
+        drop(updates_tx);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn aborting_aggregator_closes_follower_and_removes_only_its_broker_socket() {
+        let dir = temp_dir("aggregate-cancel");
+        let daemon_path = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let listener = tokio::net::UnixListener::bind(&daemon_path).unwrap();
+        let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                crate::daemon::socket::read_msg(&mut stream).await.unwrap(),
+                Some(ClientMsg::GetInfo)
+            ));
+            crate::daemon::socket::write_msg(
+                &mut stream,
+                &crate::daemon::socket::ServerMsg::Info {
+                    common_dir: "/repo/.bare".into(),
+                    session_name: "repo-session".into(),
+                    version: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                crate::daemon::socket::read_msg(&mut stream).await.unwrap(),
+                Some(ClientMsg::Subscribe)
+            ));
+            crate::daemon::socket::write_msg(
+                &mut stream,
+                &crate::daemon::socket::ServerMsg::Snapshot(Snapshot::default()),
+            )
+            .await
+            .unwrap();
+            let _ = subscribed_tx.send(());
+            let mut byte = [0];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut byte).await;
+            let _ = closed_tx.send(());
+        });
+        let aggregator = tokio::spawn(run_at(
+            dir.clone(),
+            Timing {
+                idle_exit: Duration::from_secs(30),
+                ..timing()
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), subscribed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let endpoint = workspace::protocol::socket_path(&dir);
+        assert!(endpoint.exists());
+        aggregator.abort();
+        let _ = aggregator.await;
+        tokio::time::timeout(Duration::from_secs(3), closed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!endpoint.exists());
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multiple_workspace_clients_share_one_upstream_subscription() {
+        let dir = temp_dir("aggregate-shared-sub");
+        let log = RequestLog::default();
+        let daemon = spawn_recording_daemon(
+            &dir.join("aaaaaaaaaaaaaaaa.sock"),
+            InfoReply::Answer(crate::discover::RepoIdentity {
+                common_dir: "/repo/.bare".into(),
+                session_name: "repo-session".into(),
+                version: Some("test".into()),
+            }),
+            rows(1, 1),
+            None,
+            Some(ServerMsg::Ok),
+            log.clone(),
+        );
+        let aggregator = tokio::spawn(run_at(dir.clone(), timing()));
+        let clients: Vec<_> = (0..4)
+            .map(|_| crate::workspace::client::WorkspaceClient::start(dir.clone(), None))
+            .collect();
+        for client in &clients {
+            let mut state = client.state();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if state.borrow().as_ref().is_some_and(|state| {
+                        state
+                            .repositories
+                            .iter()
+                            .any(|repo| repo.snapshot.is_some())
+                    }) {
+                        break;
+                    }
+                    state.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|msg| matches!(msg, ClientMsg::Subscribe))
+                .count(),
+            1
+        );
+        for client in clients {
+            client.close().await;
+        }
+        aggregator.abort();
+        let _ = aggregator.await;
+        daemon.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,6 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+static NEXT_AGENT_REVISION: AtomicUsize = AtomicUsize::new(0);
+
+fn new_agent_revision(now: u64) -> String {
+    // Timestamp + PID + counter stays unique across restarts and concurrent hooks.
+    format!(
+        "{now}-{}-{}",
+        std::process::id(),
+        NEXT_AGENT_REVISION.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -25,6 +36,12 @@ pub enum AgentStatus {
 pub struct AgentRecord {
     pub status: AgentStatus,
     pub ts: u64,
+    /// Stable identity of the current or most recently completed conversation turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_id: Option<String>,
+    /// Identity of the most recently completed active turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     /// Claude Code session id (UUID) for this worktree's active conversation.
@@ -119,6 +136,11 @@ pub struct WorktreeRow {
     pub rebase: bool,
     pub agent: AgentStatus,
     pub agent_ts: u64,
+    /// Optional completion metadata; absent on snapshots from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     #[serde(default)]
@@ -353,6 +375,17 @@ impl DaemonState {
             .or_else(|| existing.and_then(|r| r.session_id.clone()));
         // Preserve any per-worktree harness override across status pings.
         let harness = existing.and_then(|r| r.harness);
+        let was_active = existing.is_some_and(|r| {
+            r.status != AgentStatus::Idle && r.activity_id.is_some() && r.completion_id.is_none()
+        });
+        let mut activity_id = existing.and_then(|r| r.activity_id.clone());
+        let mut completion_id = existing.and_then(|r| r.completion_id.clone());
+        if agent_status == AgentStatus::Working && !was_active {
+            activity_id = Some(new_agent_revision(now_unix()));
+            completion_id = None;
+        } else if agent_status == AgentStatus::Idle && was_active {
+            completion_id = Some(new_agent_revision(now_unix()));
+        }
         // The timestamp always moves; "changed" means anything else did. The
         // harness is carried over verbatim, so it can never be a diff source.
         let changed = match existing {
@@ -361,11 +394,15 @@ impl DaemonState {
                 prev.status != agent_status
                     || prev.session_name != session
                     || prev.session_id != sid
+                    || prev.activity_id != activity_id
+                    || prev.completion_id != completion_id
             }
         };
         let rec = AgentRecord {
             status: agent_status,
             ts: now_unix(),
+            activity_id,
+            completion_id,
             session_name: session,
             session_id: sid,
             harness,
@@ -374,6 +411,8 @@ impl DaemonState {
         if let Some(row) = self.rows.get_mut(wt_name) {
             row.agent = rec.status;
             row.agent_ts = rec.ts;
+            row.activity_id = rec.activity_id.clone();
+            row.completion_id = rec.completion_id.clone();
             row.session_name = rec.session_name;
         }
         Ok(changed)
@@ -821,6 +860,8 @@ fn build_row(
         rebase: info.rebase,
         agent: agent.status,
         agent_ts: agent.ts,
+        activity_id: agent.activity_id.clone(),
+        completion_id: agent.completion_id.clone(),
         session_name: agent.session_name.clone(),
         head_ts: info.head_ts,
         harness: agent.harness,
@@ -880,6 +921,8 @@ mod tests {
             rebase: false,
             agent: AgentStatus::Idle,
             agent_ts: 0,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts,
             harness: None,
@@ -1025,6 +1068,59 @@ mod tests {
         assert_eq!(row.kind, WorktreeKind::Overflow);
         assert_eq!(row.slot_state, None);
         assert_eq!(row.pin, None);
+        assert_eq!(row.activity_id, None);
+        assert_eq!(row.completion_id, None);
+    }
+
+    #[test]
+    fn agent_record_completion_metadata_is_backward_compatible() {
+        let old: AgentRecord = serde_json::from_str(r#"{"status":"idle","ts":7}"#).unwrap();
+        assert_eq!(old.status, AgentStatus::Idle);
+        assert_eq!(old.activity_id, None);
+        assert_eq!(old.completion_id, None);
+        let current = AgentRecord {
+            status: AgentStatus::Idle,
+            ts: 8,
+            activity_id: Some("activity".into()),
+            completion_id: Some("completion".into()),
+            ..Default::default()
+        };
+        let back: AgentRecord =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(back.activity_id.as_deref(), Some("activity"));
+        assert_eq!(back.completion_id.as_deref(), Some("completion"));
+    }
+
+    #[test]
+    fn snapshot_completion_metadata_roundtrips_with_existing_row_fields() {
+        let mut row = make_row("work1");
+        row.agent = AgentStatus::Idle;
+        row.agent_ts = 9;
+        row.activity_id = Some("activity-42".into());
+        row.completion_id = Some("completion-42".into());
+        row.kind = WorktreeKind::Slot;
+        row.title = "Review parser".into();
+        row.subagents.push(SubagentRow {
+            id: "sub-1".into(),
+            agent_type: "Explore".into(),
+            description: Some("Inspect tests".into()),
+            status: SubagentStatus::Done,
+            started_ts: 3,
+            last_ts: 5,
+            finished_ts: Some(5),
+        });
+        let snap = Snapshot {
+            rows: vec![row],
+            default_known: true,
+        };
+        let decoded: Snapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        let back = &decoded.rows[0];
+        assert_eq!(back.activity_id.as_deref(), Some("activity-42"));
+        assert_eq!(back.completion_id.as_deref(), Some("completion-42"));
+        assert_eq!(back.kind, WorktreeKind::Slot);
+        assert_eq!(back.title, "Review parser");
+        assert_eq!(back.subagents, snap.rows[0].subagents);
     }
 
     /// Slot rows carry their kind and state; a pin turns a free slot pinned.
@@ -1216,6 +1312,45 @@ mod tests {
         let snap = state.snapshot();
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].agent, AgentStatus::Working);
+        assert!(snap.rows[0].activity_id.is_some());
+    }
+
+    #[test]
+    fn active_turn_transitions_create_one_stable_completion() {
+        let mut state = DaemonState::default();
+        state.apply_hook("main", "idle", None, None).unwrap();
+        assert!(state.agents["main"].completion_id.is_none());
+        state.apply_hook("main", "waiting", None, None).unwrap();
+        assert!(state.agents["main"].activity_id.is_none());
+        state.apply_hook("main", "working", None, None).unwrap();
+        let activity = state.agents["main"].activity_id.clone().unwrap();
+        state.apply_hook("main", "waiting", None, None).unwrap();
+        assert_eq!(
+            state.agents["main"].activity_id.as_deref(),
+            Some(activity.as_str())
+        );
+        state.apply_hook("main", "working", None, None).unwrap();
+        assert_eq!(
+            state.agents["main"].activity_id.as_deref(),
+            Some(activity.as_str())
+        );
+        state.apply_hook("main", "idle", None, None).unwrap();
+        let completion = state.agents["main"].completion_id.clone().unwrap();
+        assert_eq!(
+            state.agents["main"].activity_id.as_deref(),
+            Some(activity.as_str())
+        );
+        state.apply_hook("main", "idle", None, None).unwrap();
+        assert_eq!(
+            state.agents["main"].completion_id.as_deref(),
+            Some(completion.as_str())
+        );
+        state.apply_hook("main", "working", None, None).unwrap();
+        assert_ne!(
+            state.agents["main"].activity_id.as_deref(),
+            Some(activity.as_str())
+        );
+        assert!(state.agents["main"].completion_id.is_none());
     }
 
     /// `apply_hook` with an unknown worktree name must still succeed (the agent
@@ -1854,7 +1989,14 @@ mod tests {
             Some(&sub(SubagentEventKind::Start, Some("agent-xyz"), "Plan")),
             100,
         );
+        state.apply_hook("main", "idle", None, None).unwrap();
+        let completion = state.agents["main"].completion_id.clone().unwrap();
         state.persist(&dir).await.unwrap();
+        let restored = load_agents(&dir).await;
+        assert_eq!(
+            restored["main"].completion_id.as_deref(),
+            Some(completion.as_str())
+        );
         let text = std::fs::read_to_string(dir.join(".swamp-status.json")).unwrap();
         assert!(!text.contains("agent-xyz"));
         assert!(!text.contains("secret plan"));

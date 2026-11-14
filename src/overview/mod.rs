@@ -2,8 +2,8 @@
 //! the user and moves the user to the correct repo session and worktree tab.
 
 mod app;
-mod attention;
-mod jump;
+pub(crate) mod attention;
+pub(crate) mod jump;
 mod view;
 
 use crate::daemon::socket::ClientMsg;
@@ -83,7 +83,11 @@ fn run_jump(target: jump::Target, inside_zellij: bool) -> Result<Finished> {
         });
     }
     Ok(Finished::Moved(match jump::jump(&jump::Zellij, &target)? {
-        jump::Outcome::Tab => None,
+        jump::Outcome::AgentFocused => None,
+        jump::Outcome::TabOnly { reason } => Some(format!(
+            "Moved to {}, but could not focus the agent pane for {}: {reason}",
+            target.session, target.worktree
+        )),
         jump::Outcome::SessionOnly { reason } => Some(format!(
             "Moved to {}, but not to the tab of {}: {reason}",
             target.session, target.worktree
@@ -150,6 +154,8 @@ fn attach_outside(attach: Attach) -> Result<()> {
         std::thread::spawn(move || {
             if let Err(e) = jump::focus_tab(&jump::Zellij, &target) {
                 tracing::debug!("focus worktree tab after attach: {e:#}");
+            } else if let Err(e) = jump::focus_target_in_session(&target) {
+                tracing::debug!("focus worktree agent after attach: {e:#}");
             }
         });
     }

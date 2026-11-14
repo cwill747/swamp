@@ -16,6 +16,25 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 pub use resources::max_resource_scroll;
 
+pub(super) fn render_overlay(f: &mut Frame, app: &mut AppState) {
+    if matches!(app.input, Some(InputMode::Create(_))) && f.area().width > 0 && f.area().height > 0
+    {
+        picker::render_create_picker(f, app);
+    } else {
+        let area = f.area();
+        render_footer(
+            f,
+            app,
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                area.height.min(1),
+            ),
+        );
+    }
+}
+
 pub fn render(f: &mut Frame, app: &mut AppState) {
     // Hit regions are rebuilt each frame; panels not drawn this frame stay None.
     app.regions = super::HitRegions::default();
@@ -47,7 +66,7 @@ fn render_single_panel(f: &mut Frame, app: &mut AppState) {
         TuiView::AiStatus => ai::render_ai_status(f, app, chunks[0]),
         TuiView::Resources => resources::render_resources(f, app, chunks[0]),
         TuiView::PrStatus => pr::render_pr_status(f, app, chunks[0]),
-        TuiView::All => unreachable!(),
+        TuiView::All | TuiView::Workspace | TuiView::Sidebar | TuiView::Details => unreachable!(),
     }
 
     render_footer(f, app, chunks[1]);
@@ -198,6 +217,9 @@ fn footer_hint(view: TuiView) -> &'static str {
         TuiView::Resources => "j/k scroll · r refresh · q quit",
         TuiView::AiStatus => "dbl-click jump · r refresh · q quit",
         TuiView::PrStatus => "click copies PR url · r refresh · q quit",
+        TuiView::Workspace | TuiView::Sidebar | TuiView::Details => {
+            "/ search · Enter open · v Mark Seen · ? help"
+        }
     }
 }
 

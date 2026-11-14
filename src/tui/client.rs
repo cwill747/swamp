@@ -47,6 +47,12 @@ pub(super) async fn send_action(
     msg: ClientMsg,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
+    let expected_branch = match &msg {
+        ClientMsg::RemoveWorktree {
+            expected_branch, ..
+        } => expected_branch.clone(),
+        _ => None,
+    };
     let sock = daemon::socket_path(common)?;
     let mut stream = UnixStream::connect(&sock).await?;
     write_client_msg(&mut stream, &msg).await?;
@@ -56,7 +62,13 @@ pub(super) async fn send_action(
             let _ = tx.send(AppEvent::ActionError(message)).await;
         }
         Some(ServerMsg::ErrDirty { name, reason }) => {
-            let _ = tx.send(AppEvent::DeleteNeedsForce(name, reason)).await;
+            let _ = tx
+                .send(AppEvent::DeleteNeedsForce {
+                    name,
+                    reason,
+                    expected_branch,
+                })
+                .await;
         }
         Some(other) => anyhow::bail!("unexpected action reply: {other:?}"),
         None => anyhow::bail!("daemon closed before action reply"),

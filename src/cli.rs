@@ -8,7 +8,7 @@ use std::path::PathBuf;
     name = "swamp",
     version,
     about = "Zellij worktree dashboard",
-    long_about = "swamp launches a Zellij session for a git repo, with one tab per worktree plus panes for lazygit, an agent harness, a shell, and live repo status."
+    long_about = "swamp launches a Zellij repository session with a Spaces/Agents sidebar, selected-destination details, a real shell, and on-demand worktree tabs for lazygit and your agent harness."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -17,8 +17,14 @@ pub struct Cli {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum TuiView {
-    /// Show all panels (default for worktree tabs).
+    /// Spaces and Agents with selected-destination details.
     #[default]
+    Workspace,
+    /// Spaces and Agents navigation rail for generated Zellij tabs.
+    Sidebar,
+    /// Selected destination, synchronized with this session's sidebar.
+    Details,
+    /// Show all legacy status panels.
     All,
     /// Worktree list only.
     Worktrees,
@@ -65,8 +71,8 @@ pub enum Cmd {
     Serve(ServeArgs),
 
     #[command(
-        about = "Render the status TUI",
-        long_about = "Render the long-running status TUI in the current terminal pane. swamp launch embeds this in generated Zellij layouts, but it can also be run directly."
+        about = "Render the workspace or a legacy status panel",
+        long_about = "Render Spaces/Agents navigation and selected-destination details in the current terminal. Generated Zellij layouts use sidebar and details views; explicit legacy views preserve the original panels. Outside Zellij, workspace shows paths with terminal-opening actions disabled."
     )]
     Tui(TuiArgs),
 
@@ -126,7 +132,7 @@ pub enum Cmd {
     #[command(
         hide = true,
         about = "Run the cross-repo attention aggregator",
-        long_about = "Tell each repo daemon how many worktrees wait for the user in the other repos, so that each dashboard tab can show the count. `swamp launch` and the daemon start this process; a second instance exits at once. It is not intended for interactive use."
+        long_about = "Share workspace inventory and selected-repository resources with local TUI clients, and tell each repo daemon how many worktrees wait in other repos. Launch, daemons, and workspace views start this singleton; a second instance exits at once. It is not intended for interactive use."
     )]
     Aggregate,
 
@@ -312,15 +318,18 @@ pub struct ServeArgs {
 
 #[derive(Args)]
 pub struct TuiArgs {
-    /// Path inside the repo to inspect (default: current directory).
+    /// Repository for local actions (default: current directory).
     #[arg(value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// Panel to render.
-    #[arg(long, value_enum, default_value_t = TuiView::All)]
+    #[arg(long, value_enum, default_value_t = TuiView::Workspace)]
     pub view: TuiView,
-    /// Pin the worktree matching this pane's cwd to the top.
+    /// Mark this pane's worktree active (also pins it in the legacy worktrees view).
     #[arg(long)]
     pub pin_cwd: bool,
+    /// Use the native split gutter in a generated sidebar pane.
+    #[arg(long, hide = true)]
+    pub embedded: bool,
 }
 
 #[derive(Args)]
@@ -368,6 +377,9 @@ pub struct ConfirmDeleteArgs {
     /// changes". Rendered as given — never re-computed by this command.
     #[arg(value_name = "REASON")]
     pub reason: String,
+    /// Branch identity captured when the confirmation pane was opened.
+    #[arg(long)]
+    pub expected_branch: Option<String>,
     /// Also close this worktree's Zellij tab once the removal is forced
     /// through.
     #[arg(long)]
@@ -382,6 +394,9 @@ pub struct DeleteTabArgs {
     /// Worktree path to remove.
     #[arg(value_name = "DIR")]
     pub dir: PathBuf,
+    /// Branch identity captured by the confirming Swamp pane.
+    #[arg(long)]
+    pub expected_branch: Option<String>,
     /// Skip the removal safety checks.
     #[arg(long)]
     pub force: bool,
@@ -459,7 +474,7 @@ pub struct CompletionsArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Cmd, TuiArgs, TuiView};
     use clap::{CommandFactory, Parser};
 
     fn top_level_help() -> String {
@@ -506,6 +521,49 @@ mod tests {
         assert!(help.contains("bash"));
         assert!(help.contains("fish"));
         assert!(help.contains("zsh"));
+    }
+
+    #[test]
+    fn workspace_default_and_all_explicit_views_parse_and_complete() {
+        let cli = Cli::try_parse_from(["swamp", "tui"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Tui(TuiArgs {
+                view: TuiView::Workspace,
+                ..
+            }))
+        ));
+        for name in [
+            "workspace",
+            "sidebar",
+            "details",
+            "all",
+            "worktrees",
+            "ai-status",
+            "resources",
+            "pr-status",
+        ] {
+            assert!(Cli::try_parse_from(["swamp", "tui", "--view", name]).is_ok());
+        }
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tui")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("workspace"));
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Zsh,
+        ] {
+            let mut generated = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "swamp", &mut generated);
+            let text = String::from_utf8(generated).unwrap();
+            for name in ["workspace", "sidebar", "details", "worktrees"] {
+                assert!(text.contains(name));
+            }
+        }
     }
 
     #[test]

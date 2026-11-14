@@ -304,6 +304,8 @@ mod tests {
             rebase: false,
             agent: AgentStatus::Idle,
             agent_ts: 0,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts: 0,
             harness: None,

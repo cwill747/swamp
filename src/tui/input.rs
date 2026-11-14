@@ -378,6 +378,7 @@ pub(super) fn spawn_confirm_delete_pane(
     path: &std::path::Path,
     reason: &str,
     close_tab: bool,
+    expected_branch: Option<&str>,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -392,6 +393,10 @@ pub(super) fn spawn_confirm_delete_pane(
     ];
     if close_tab {
         cmd.push("--close-tab");
+    }
+    if let Some(branch) = expected_branch {
+        cmd.push("--expected-branch");
+        cmd.push(branch);
     }
     zellij::new_floating_pane(common, &format!("delete {name}"), &cmd)
 }
@@ -419,12 +424,13 @@ pub(super) fn handle_input_key(
             close_tab,
         } => match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let row_path = app
+                let row_target = app
                     .snapshot
                     .rows
                     .iter()
                     .find(|r| r.name == name)
-                    .map(|r| r.path.clone());
+                    .map(|r| (r.path.clone(), r.branch.clone()));
+                let expected_branch = row_target.as_ref().map(|(_, branch)| branch.clone());
 
                 // A blocked deletion inside Zellij opens a floating pane —
                 // narrow sidebars can't show the work at risk. The pane owns
@@ -433,9 +439,16 @@ pub(super) fn handle_input_key(
                 // failure, falls back below.
                 let opened_pane = force_reason.as_deref().is_some_and(|reason| {
                     zellij::in_zellij()
-                        && row_path.as_ref().is_some_and(|path| {
-                            spawn_confirm_delete_pane(common, &name, path, reason, close_tab)
-                                .is_ok()
+                        && row_target.as_ref().is_some_and(|(path, branch)| {
+                            spawn_confirm_delete_pane(
+                                common,
+                                &name,
+                                path,
+                                reason,
+                                close_tab,
+                                Some(branch),
+                            )
+                            .is_ok()
                         })
                 });
                 if opened_pane {
@@ -454,9 +467,15 @@ pub(super) fn handle_input_key(
                 }
 
                 if close_tab {
-                    if let Some(path) = row_path {
+                    if let Some((path, branch)) = row_target {
                         if force_reason.is_some() {
-                            crate::launch::spawn_delete_tab(&name, &path, common, true);
+                            crate::launch::spawn_delete_tab(
+                                &name,
+                                &path,
+                                common,
+                                true,
+                                expected_branch.as_deref(),
+                            );
                         } else {
                             // `D` must know whether removal is allowed before
                             // closing its own tab. Run the expensive check only
@@ -469,7 +488,12 @@ pub(super) fn handle_input_key(
                                     .await
                                     .map_err(|error| error.to_string());
                                 let _ = tx
-                                    .send(AppEvent::DeleteTabCheckDone { name, path, result })
+                                    .send(AppEvent::DeleteTabCheckDone {
+                                        name,
+                                        path,
+                                        branch,
+                                        result,
+                                    })
                                     .await;
                             });
                         }
@@ -495,7 +519,11 @@ pub(super) fn handle_input_key(
                 tokio::spawn(async move {
                     if let Err(e) = send_action(
                         &common,
-                        ClientMsg::RemoveWorktree { name, force },
+                        ClientMsg::RemoveWorktree {
+                            name,
+                            force,
+                            expected_branch,
+                        },
                         tx.clone(),
                     )
                     .await
@@ -811,6 +839,8 @@ mod tests {
             rebase: false,
             agent: AgentStatus::Idle,
             agent_ts: 0,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts: 0,
             harness: None,

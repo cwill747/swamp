@@ -29,6 +29,12 @@ use std::path::{Path, PathBuf};
 /// Swamp state that belongs to a branch rather than to the worktree it sits in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
+    /// Activity/completion revisions belong to a branch session and must
+    /// follow it when a reusable slot is allocated to a different branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,12 +183,19 @@ fn alloc_under(
     let mut changes = AgentChanges::default();
     if !a.existing {
         match load_branches(common).get(&a.branch) {
-            Some(mem) if mem.session_id.is_some() || mem.harness.is_some() => {
+            Some(mem)
+                if mem.session_id.is_some()
+                    || mem.harness.is_some()
+                    || mem.activity_id.is_some()
+                    || mem.completion_id.is_some() =>
+            {
                 changes.set.push((
                     a.name.clone(),
                     AgentRecord {
                         status: AgentStatus::Idle,
                         ts: now_unix(),
+                        activity_id: mem.activity_id.clone(),
+                        completion_id: mem.completion_id.clone(),
                         session_name: mem.session_name.clone(),
                         session_id: mem.session_id.clone(),
                         harness: mem.harness,
@@ -318,6 +331,8 @@ fn release_under(
             if rec.harness.is_some() {
                 entry.harness = rec.harness;
             }
+            entry.activity_id = rec.activity_id.clone();
+            entry.completion_id = rec.completion_id.clone();
             if entry.is_empty() {
                 mem.remove(branch);
             }
@@ -397,6 +412,8 @@ mod tests {
         AgentRecord {
             status,
             ts: 1,
+            activity_id: None,
+            completion_id: None,
             session_name: Some(format!("{session} name")),
             session_id: Some(session.to_string()),
             harness: None,
@@ -412,7 +429,10 @@ mod tests {
         let opts = AllocOptions::pool(5);
         let (a, _) = alloc(&bare, "fix-ci", &opts, &[]).unwrap();
         // `fix-ci` equals main, so release finds its work safe.
-        let mut agents = HashMap::from([(a.name.clone(), record("abc-123", AgentStatus::Idle))]);
+        let mut completed = record("abc-123", AgentStatus::Idle);
+        completed.activity_id = Some("turn-1".into());
+        completed.completion_id = Some("done-1".into());
+        let mut agents = HashMap::from([(a.name.clone(), completed)]);
         let (_, changes) = release(
             &bare,
             Some("work1"),
@@ -433,6 +453,8 @@ mod tests {
         assert_eq!(changes.set.len(), 1);
         assert_eq!(changes.set[0].0, "work2");
         assert_eq!(changes.set[0].1.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(changes.set[0].1.activity_id.as_deref(), Some("turn-1"));
+        assert_eq!(changes.set[0].1.completion_id.as_deref(), Some("done-1"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

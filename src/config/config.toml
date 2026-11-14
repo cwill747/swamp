@@ -5,8 +5,14 @@
 # defaults shown below.
 
 [dashboard]
-# The dashboard is three side-by-side columns. These set each column's width as
-# a percentage of the terminal; they should sum to roughly 100.
+# New sessions use the workspace layout: a 32-cell Spaces/Agents sidebar beside
+# details and a real shell. Set layout = "classic" to use the legacy panel grid.
+# sidebar_width accepts 16 through 60 cells.
+#
+# Classic-only percentage settings are retained for backwards compatibility;
+# existing values do not opt a config into the classic layout.
+# layout = "workspace"
+# sidebar_width = 32
 #
 #   worktrees_column — left column: worktrees + resources panes
 #   ai_column        — middle column: ai-status + pr-status panes

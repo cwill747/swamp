@@ -41,6 +41,9 @@ pub fn load_config() -> Result<SwampConfig> {
         Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
         Err(_) => SwampConfig::default(),
     };
+    cfg.dashboard
+        .validate()
+        .with_context(|| format!("invalid [dashboard] settings in {}", path.display()))?;
     // A bad `[logging] filter` directive is rejected here, alongside other
     // malformed config, rather than being silently dropped at subscriber init.
     if let Some(filter) = &cfg.logging.filter {

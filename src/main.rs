@@ -19,6 +19,7 @@ mod slot_service;
 mod titles;
 mod tui;
 mod util;
+pub mod workspace;
 mod worktree;
 mod zellij;
 
@@ -33,7 +34,9 @@ async fn main() -> Result<()> {
         None => launch::run(None),
         Some(cli::Cmd::Launch(args)) => launch::run(args.dir),
         Some(cli::Cmd::Serve(args)) => daemon::serve(args.dir, args.foreground).await,
-        Some(cli::Cmd::Tui(args)) => tui::run(args.dir, args.view, args.pin_cwd).await,
+        Some(cli::Cmd::Tui(args)) => {
+            tui::run(args.dir, args.view, args.pin_cwd, args.embedded).await
+        }
         Some(cli::Cmd::Hook(cli::HookArgs {
             status,
             dir,
@@ -46,11 +49,24 @@ async fn main() -> Result<()> {
         Some(cli::Cmd::CodexNotify(args)) => codex_notify::run(args.payload).await,
         Some(cli::Cmd::RelaunchTab(args)) => launch::relaunch_worktree_tab(&args.name, &args.dir),
         Some(cli::Cmd::ConfirmDelete(args)) => {
-            launch::confirm_delete(&args.name, &args.dir, &args.reason, args.close_tab).await
+            launch::confirm_delete(
+                &args.name,
+                &args.dir,
+                &args.reason,
+                args.close_tab,
+                args.expected_branch.as_deref(),
+            )
+            .await
         }
         Some(cli::Cmd::SlotTab(args)) => launch::slot_tab(args.op, &args.name, &args.dir),
         Some(cli::Cmd::DeleteTab(args)) => {
-            launch::delete_tab(&args.name, &args.dir, args.force).await
+            launch::delete_tab(
+                &args.name,
+                &args.dir,
+                args.force,
+                args.expected_branch.as_deref(),
+            )
+            .await
         }
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
         Some(cli::Cmd::Aggregate) => aggregate::run().await,

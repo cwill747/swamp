@@ -1,0 +1,29 @@
+capture120  !1
+capture120 / Live
+/tmp/swamp-herdr-final/capture120/.git/
+
+Resources (selected repository)
+CPU 4.1% / RSS 165M / load 2.66
+3314858 1.4% 20M swamp
+3314856 1.3% 19M swamp
+3314831 1.2% 90M zellij
+3314827 0.1% 24M zellij
+3314872 0.1% 11M fish
+
+Enter Open agent   g Go To   c Create   m More
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/ search  g Go To  l details  ? help

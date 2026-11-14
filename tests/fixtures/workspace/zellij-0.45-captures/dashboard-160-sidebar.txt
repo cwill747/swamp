@@ -1,0 +1,47 @@
+Spaces >  !1 ~1 +0 -0
+>v capture120  !1
+   Live
+ ! * Fixture agent
+   main / trunk / Waiting
+ v capture160
+   Live
+ ~ * Build agent
+   main / trunk / Working
+Agents  !1 ~1 +0 -0
+ ! * Fixture agent
+   capture120 / main / trunk /
+ ~ *   Explore
+     capture120 / subagent → pa
+ ~ * Build agent
+   capture160 / main / trunk /
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/ search  g Go To  l details  ?

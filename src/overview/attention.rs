@@ -175,6 +175,8 @@ mod tests {
         WorktreeRow {
             agent: AgentStatus::Waiting,
             agent_ts: ts,
+            activity_id: None,
+            completion_id: None,
             ..wt(name)
         }
     }
@@ -183,6 +185,8 @@ mod tests {
         WorktreeRow {
             unstaged: 1,
             agent_ts: ts,
+            activity_id: None,
+            completion_id: None,
             ..wt(name)
         }
     }
