@@ -24,9 +24,11 @@ The temporary fixture at `/tmp/swamp-herdr-e2e-completion` used private repo sta
 
 ## Final verification
 
-- `nix develop --command cargo test`: 454 passed.
+- `nix develop --command cargo test`: 457 passed.
 - `nix develop --command cargo fmt --all --check`: passed.
 - `nix develop --command cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `nix build .#dev`: passed.
 - `openspec validate herdr-style-dashboard --strict`: passed.
 - `git diff --check`: passed.
+- Fresh launch smoke test with a temporary repository and isolated Zellij stub: verified `swamp launch` started the repository daemon, waited for its Ping/Pong response, and generated the dashboard session.
+- Regression tests verify that registered disconnected repositories reconcile to Stopped without stale worktree rows, both when disconnect and registry refresh arrive in either order.

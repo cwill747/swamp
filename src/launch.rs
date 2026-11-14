@@ -5,8 +5,9 @@ use crate::util::session_name_for;
 use crate::worktree::{Worktree, git_common_dir, list_worktrees, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
@@ -112,6 +113,9 @@ fn spawn_new_session(
         Ok(c) => Some(acquire_launch_lock(c)?),
         Err(_) => None,
     };
+    if let Ok(common) = &common {
+        ensure_repository_daemon(common)?;
+    }
 
     // Reuse an existing session if one already matches this repo's name —
     // but first check whether the running daemon is stale.
@@ -234,6 +238,68 @@ fn acquire_launch_lock(common_dir: &Path) -> Result<std::fs::File> {
         }
         std::thread::sleep(Duration::from_millis(50));
         waited_ms += 50;
+    }
+}
+
+/// Start the local daemon when an explicit launch path opens or reuses a
+/// repository session. Workspace discovery stays passive; only an explicit
+/// launch/activation calls this helper.
+fn ensure_repository_daemon(common_dir: &Path) -> Result<()> {
+    let socket = daemon::socket_path(common_dir)?;
+    if probe_daemon_socket(&socket).is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("resolve swamp executable")?;
+    let mut parent = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(common_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn repository daemon")?;
+    let _ = parent.wait();
+
+    for _ in 0..40 {
+        if probe_daemon_socket(&socket).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("repository daemon did not start within 2s")
+}
+
+/// Synchronous Ping for launch paths that also run from `spawn_blocking`.
+fn probe_daemon_socket(socket: &Path) -> Result<()> {
+    use crate::daemon::socket::{ClientMsg, ServerMsg};
+
+    let mut stream = StdUnixStream::connect(socket)
+        .with_context(|| format!("connect daemon socket {}", socket.display()))?;
+    let timeout = Some(Duration::from_secs(2));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+
+    let payload = serde_json::to_vec(&ClientMsg::Ping)?;
+    let frame_len = 4usize + payload.len();
+    stream.write_all(&(frame_len as u32).to_be_bytes())?;
+    stream.write_all(b"SWP1")?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header)?;
+    let frame_len = u32::from_be_bytes(header) as usize;
+    anyhow::ensure!(
+        (4..=64 * 1024).contains(&frame_len),
+        "invalid daemon frame length"
+    );
+    let mut frame = vec![0; frame_len];
+    stream.read_exact(&mut frame)?;
+    let json = frame.strip_prefix(b"SWP1").unwrap_or(&frame);
+    match serde_json::from_slice::<ServerMsg>(json)? {
+        ServerMsg::Pong => Ok(()),
+        other => anyhow::bail!("unexpected daemon probe response: {other:?}"),
     }
 }
 
@@ -361,12 +427,13 @@ pub fn ensure_background_session(common_dir: &Path) -> Result<String> {
     }
     let session = session_name_for(common_dir);
     let _lock = acquire_launch_lock(common_dir)?;
+    crate::registry::record_launch(common_dir);
+    ensure_repository_daemon(common_dir)?;
     let state = zellij::session_state(&session)?;
     if state == Some(zellij::SessionState::Live) {
         return Ok(session);
     }
     let cfg = config::ensure_configs()?;
-    crate::registry::record_launch(common_dir);
     let cwd = common_dir.parent().unwrap_or(common_dir);
     if state == Some(zellij::SessionState::Exited) {
         zellij::create_background_session(&session, None, cwd)?;
@@ -924,6 +991,43 @@ pub(super) fn is_safe_session_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_socket_probe_requires_a_pong() {
+        use crate::daemon::socket::{ClientMsg, ServerMsg};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-launch-probe-{}-{}",
+            std::process::id(),
+            crate::util::now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_be_bytes(header) as usize;
+            let mut frame = vec![0; len];
+            stream.read_exact(&mut frame).unwrap();
+            assert_eq!(&frame[..4], b"SWP1");
+            assert!(matches!(
+                serde_json::from_slice::<ClientMsg>(&frame[4..]).unwrap(),
+                ClientMsg::Ping
+            ));
+            let payload = serde_json::to_vec(&ServerMsg::Pong).unwrap();
+            let len = 4 + payload.len();
+            stream.write_all(&(len as u32).to_be_bytes()).unwrap();
+            stream.write_all(b"SWP1").unwrap();
+            stream.write_all(&payload).unwrap();
+        });
+
+        probe_daemon_socket(&socket).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn worktree_tab_open_lock_serializes_competing_openers() {

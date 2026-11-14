@@ -156,6 +156,13 @@ impl Workspace {
             .into_iter()
             .map(|e| (repo_id(&e.common_dir), e))
             .collect();
+        // A registry entry is the durable identity for a launched repo. If
+        // its live follower already ended, expose it as Stopped so explicit
+        // activation can relaunch it; do not preserve its old rows as live.
+        let registry = &self.registry;
+        self.peers.retain(|id, peer| {
+            peer.connection != Connection::Disconnected || !registry.contains_key(id)
+        });
     }
 
     pub fn apply(&mut self, event: Event) {
@@ -202,7 +209,11 @@ impl Workspace {
                 }
             }
             Event::Down { id } => {
-                if let Some(peer) = self.peers.get_mut(&id) {
+                if self.registry.contains_key(&id) {
+                    // The registry will project this repository as Stopped
+                    // and activatable, without surfacing cached rows as live.
+                    self.peers.remove(&id);
+                } else if let Some(peer) = self.peers.get_mut(&id) {
                     peer.connection = Connection::Disconnected;
                 }
             }
@@ -436,6 +447,48 @@ mod tests {
         );
         snapshot(&mut model, "a", vec![]);
         assert_eq!(model.repositories()[0].connection, Connection::Live);
+    }
+
+    #[test]
+    fn registered_disconnected_repo_reconciles_to_stopped_without_cached_rows() {
+        let entry = RepoEntry {
+            common_dir: "/repo/.git".into(),
+            session_name: "repo-session".into(),
+            last_launched: 1,
+        };
+        let id = repo_id(&entry.common_dir);
+        let mut model = Workspace::default();
+        model.set_registry(vec![entry]);
+        up(&mut model, &id, Some("/repo"));
+        snapshot(&mut model, &id, vec![wt("feature")]);
+        model.apply(Event::Down { id: id.clone() });
+
+        let repos = model.repositories();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].connection, Connection::Stopped);
+        assert!(repos[0].can_activate());
+        assert!(repos[0].destinations().is_empty());
+    }
+
+    #[test]
+    fn late_registry_refresh_reconciles_an_already_disconnected_repo() {
+        let entry = RepoEntry {
+            common_dir: "/repo/.git".into(),
+            session_name: "repo-session".into(),
+            last_launched: 1,
+        };
+        let id = repo_id(&entry.common_dir);
+        let mut model = Workspace::default();
+        up(&mut model, &id, Some("/repo"));
+        snapshot(&mut model, &id, vec![wt("stale-feature")]);
+        model.apply(Event::Down { id: id.clone() });
+        model.set_registry(vec![entry]);
+
+        let repos = model.repositories();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].connection, Connection::Stopped);
+        assert!(repos[0].can_activate());
+        assert!(repos[0].destinations().is_empty());
     }
 
     #[test]
