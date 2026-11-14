@@ -32,3 +32,4 @@ The temporary fixture at `/tmp/swamp-herdr-e2e-completion` used private repo sta
 - `git diff --check`: passed.
 - Fresh launch smoke test with a temporary repository and isolated Zellij stub: verified `swamp launch` started the repository daemon, waited for its Ping/Pong response, and generated the dashboard session.
 - Regression tests verify that registered disconnected repositories reconcile to Stopped without stale worktree rows, both when disconnect and registry refresh arrive in either order.
+- Workspace client reconnect coverage verifies that a lost broker connection requests aggregator restart, with retries throttled while the endpoint is unavailable. The stale-version relaunch path also starts and probes the replacement daemon after teardown.

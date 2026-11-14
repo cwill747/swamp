@@ -155,6 +155,12 @@ fn spawn_new_session(
 
         if do_restart {
             crate::kill::run(Some(target.to_path_buf()))?;
+            if let Ok(common) = &common {
+                // The initial daemon probe may have verified the old daemon.
+                // Restart teardown kills it, so start and verify the
+                // replacement before the new workspace panes attach.
+                ensure_repository_daemon(common)?;
+            }
             // Fall through to fresh launch below.
         } else if std::env::var("ZELLIJ_SESSION_NAME").as_deref() == Ok(session) {
             // The repo session is already active. Attaching it inside itself

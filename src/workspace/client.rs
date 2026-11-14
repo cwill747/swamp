@@ -9,6 +9,15 @@ use tokio::{
     task::JoinHandle,
 };
 
+const AGGREGATOR_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+fn restart_aggregator_if_due(last_attempt: &mut tokio::time::Instant, restart: &mut impl FnMut()) {
+    if last_attempt.elapsed() >= AGGREGATOR_RESTART_BACKOFF {
+        restart();
+        *last_attempt = tokio::time::Instant::now();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ClientStatus {
     Connecting,
@@ -43,6 +52,14 @@ impl Drop for AbortOnDrop {
 
 impl WorkspaceClient {
     pub fn start(runtime_dir: PathBuf, selected_repo: Option<String>) -> Self {
+        Self::start_with_aggregator(runtime_dir, selected_repo, crate::aggregate::spawn_detached)
+    }
+
+    fn start_with_aggregator(
+        runtime_dir: PathBuf,
+        selected_repo: Option<String>,
+        mut restart_aggregator: impl FnMut() + Send + 'static,
+    ) -> Self {
         let (state_tx, state) = watch::channel(None);
         let (status_tx, status) = watch::channel(ClientStatus::Connecting);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -50,6 +67,8 @@ impl WorkspaceClient {
         let task = tokio::spawn(async move {
             let mut selected = selected_repo;
             let mut delay = Duration::from_millis(100);
+            let mut last_aggregator_restart =
+                tokio::time::Instant::now() - AGGREGATOR_RESTART_BACKOFF;
             loop {
                 let path = protocol::socket_path(&runtime_dir);
                 let connected = tokio::select! {
@@ -59,6 +78,10 @@ impl WorkspaceClient {
                 let stream = match connected {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) => {
+                        restart_aggregator_if_due(
+                            &mut last_aggregator_restart,
+                            &mut restart_aggregator,
+                        );
                         let _ = status_tx.send(ClientStatus::Unavailable(format!(
                             "{}: {e}",
                             path.display()
@@ -68,6 +91,10 @@ impl WorkspaceClient {
                         continue;
                     }
                     Err(_) => {
+                        restart_aggregator_if_due(
+                            &mut last_aggregator_restart,
+                            &mut restart_aggregator,
+                        );
                         let _ = status_tx.send(ClientStatus::Unavailable(
                             "workspace broker connection timed out".into(),
                         ));
@@ -90,6 +117,10 @@ impl WorkspaceClient {
                 )
                 .await;
                 if !matches!(subscribe, Ok(Ok(()))) {
+                    restart_aggregator_if_due(
+                        &mut last_aggregator_restart,
+                        &mut restart_aggregator,
+                    );
                     tokio::select! { _ = tokio::time::sleep(delay) => {}, changed = cancel_rx.changed() => if changed.is_err() || *cancel_rx.borrow() { return; } }
                     continue;
                 }
@@ -133,6 +164,7 @@ impl WorkspaceClient {
                 if *cancel_rx.borrow() {
                     break;
                 }
+                restart_aggregator_if_due(&mut last_aggregator_restart, &mut restart_aggregator);
                 tokio::select! { _ = tokio::time::sleep(delay) => {}, changed = select_rx.changed() => if changed.is_ok() { selected = select_rx.borrow_and_update().clone(); }, canceled = cancel_rx.changed() => if canceled.is_err() || *cancel_rx.borrow() { break; } }
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
@@ -278,7 +310,11 @@ mod tests {
                 .unwrap();
             let _: Option<ClientMessage> = protocol::read(&mut restarted).await.unwrap();
         });
-        let client = WorkspaceClient::start(runtime.clone(), None);
+        let restart_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count_in_task = restart_count.clone();
+        let client = WorkspaceClient::start_with_aggregator(runtime.clone(), None, move || {
+            restart_count_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         let mut state = client.state();
         tokio::time::timeout(Duration::from_secs(4), async {
             loop {
@@ -294,6 +330,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(restart_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         client.close().await;
         tokio::time::timeout(Duration::from_secs(2), peer)
             .await
