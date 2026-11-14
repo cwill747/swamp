@@ -13,7 +13,7 @@ use crate::workspace::{
     protocol::ResourceState,
     seen::SeenLedger,
     selection,
-    ui::{self, Action, App, Mode, Section},
+    ui::{self, Action, App, Filter, Mode, Section},
 };
 use anyhow::Result;
 use crossterm::{
@@ -608,6 +608,7 @@ pub async fn run(
                         app.selected = Some((repo.id.clone(), Some(d.key)));
                         app.section = Section::Spaces;
                         app.query.clear();
+                        app.filter = Filter::All;
                         app.collapsed.remove(&repo.id);
                         app.reconcile();
                         activate(&mut app, &mut tasks);
