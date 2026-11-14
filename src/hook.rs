@@ -1,10 +1,9 @@
 use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
-use crate::daemon::state::{SubagentEvent, SubagentEventKind};
+use crate::daemon::state::{AgentRecord, SubagentEvent, SubagentEventKind, apply_hook_record};
 use crate::daemon::{self};
 use crate::util::now_unix;
 use crate::worktree::{git_common_dir, list_worktrees};
 use anyhow::{Context, Result};
-use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -93,38 +92,20 @@ async fn write_status_file(
     // omits them, so transient `working`/`idle` pings don't erase data we need
     // later: the session id to resume Claude (#33), and the per-worktree harness
     // override the user picked with `h`. Mirrors DaemonState::apply_hook.
-    let prior = map.get(&wt_name).cloned();
-    let prior_field = |key: &str| {
-        prior
-            .as_ref()
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    };
-    let session_name = session_name
-        .filter(|s| !s.is_empty())
-        .or_else(|| prior_field("session_name"));
-    let session_id = session_id
-        .filter(|s| !s.is_empty())
-        .or_else(|| prior_field("session_id"));
-    // A hook never carries the harness override; always preserve the saved one,
-    // otherwise this fallback silently reverts `choose` repos to Claude.
-    let harness = prior_field("harness");
-
-    let mut entry = serde_json::Map::new();
-    entry.insert("status".into(), json!(status.to_lowercase()));
-    entry.insert("ts".into(), json!(now_unix()));
-    if let Some(ref name) = session_name {
-        entry.insert("session_name".into(), json!(name));
-    }
-    if let Some(ref id) = session_id {
-        entry.insert("session_id".into(), json!(id));
-    }
-    if let Some(ref h) = harness {
-        entry.insert("harness".into(), json!(h));
-    }
-    map.insert(wt_name, json!(entry));
+    // Use the same status transition as the daemon, including activity and
+    // completion revisions, so hooks received during an outage remain visible
+    // as Done after the daemon restarts.
+    let prior = map
+        .get(&wt_name)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AgentRecord>(value).ok());
+    let (record, _) = apply_hook_record(
+        prior.as_ref(),
+        status,
+        session_name.as_deref(),
+        session_id.as_deref(),
+    )?;
+    map.insert(wt_name, serde_json::to_value(record)?);
     let tmp = path.with_extension("json.tmp");
     tokio::fs::write(&tmp, serde_json::to_vec_pretty(&map)?).await?;
     tokio::fs::rename(&tmp, &path).await?;
@@ -524,11 +505,30 @@ mod tests {
         let map: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(map["main"]["status"], "working");
+        assert!(map["main"]["activity_id"].is_string());
         assert!(
             !String::from_utf8(std::fs::read(&file).unwrap())
                 .unwrap()
                 .contains("Look")
         );
+
+        // A Stop hook received while the daemon is down retains the same turn
+        // revision so loading the status file still surfaces an unseen Done.
+        write_status_file(
+            &dir,
+            "main".into(),
+            "idle",
+            None,
+            None,
+            &HookPayload::default(),
+        )
+        .await
+        .unwrap();
+        let map: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(map["main"]["status"], "idle");
+        assert!(map["main"]["activity_id"].is_string());
+        assert!(map["main"]["completion_id"].is_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

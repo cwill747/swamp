@@ -56,6 +56,64 @@ pub struct AgentRecord {
     pub harness: Option<Harness>,
 }
 
+/// Apply the status and turn-revision transition used by both daemon-backed
+/// and offline hook recording.
+pub(crate) fn apply_hook_record(
+    existing: Option<&AgentRecord>,
+    status: &str,
+    session_name: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(AgentRecord, bool)> {
+    let agent_status = match status.to_lowercase().as_str() {
+        "working" => AgentStatus::Working,
+        "waiting" => AgentStatus::Waiting,
+        "idle" | "done" | "stop" => AgentStatus::Idle,
+        other => anyhow::bail!("unknown status: {}", other),
+    };
+    let session = session_name
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|r| r.session_name.clone()));
+    let sid = session_id
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|r| r.session_id.clone()));
+    let harness = existing.and_then(|r| r.harness);
+    let was_active = existing.is_some_and(|r| {
+        r.status != AgentStatus::Idle && r.activity_id.is_some() && r.completion_id.is_none()
+    });
+    let mut activity_id = existing.and_then(|r| r.activity_id.clone());
+    let mut completion_id = existing.and_then(|r| r.completion_id.clone());
+    if agent_status == AgentStatus::Working && !was_active {
+        activity_id = Some(new_agent_revision(now_unix()));
+        completion_id = None;
+    } else if agent_status == AgentStatus::Idle && was_active {
+        completion_id = Some(new_agent_revision(now_unix()));
+    }
+    let changed = match existing {
+        None => true,
+        Some(prev) => {
+            prev.status != agent_status
+                || prev.session_name != session
+                || prev.session_id != sid
+                || prev.activity_id != activity_id
+                || prev.completion_id != completion_id
+        }
+    };
+    Ok((
+        AgentRecord {
+            status: agent_status,
+            ts: now_unix(),
+            activity_id,
+            completion_id,
+            session_name: session,
+            session_id: sid,
+            harness,
+        },
+        changed,
+    ))
+}
+
 /// How long a done subagent stays visible before the daemon drops it.
 pub const SUBAGENT_DONE_GRACE_SECS: u64 = 60;
 /// How long a running subagent may go without any event before the daemon
@@ -356,57 +414,8 @@ impl DaemonState {
         session_name: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<bool> {
-        let agent_status = match status.to_lowercase().as_str() {
-            "working" => AgentStatus::Working,
-            "waiting" => AgentStatus::Waiting,
-            "idle" | "done" | "stop" => AgentStatus::Idle,
-            other => anyhow::bail!("unknown status: {}", other),
-        };
-        let existing = self.agents.get(wt_name);
-        let session = session_name
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| existing.and_then(|r| r.session_name.clone()));
-        // Like session_name, a missing/empty session id preserves the previously
-        // recorded one rather than clearing it — most hooks don't carry it.
-        let sid = session_id
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| existing.and_then(|r| r.session_id.clone()));
-        // Preserve any per-worktree harness override across status pings.
-        let harness = existing.and_then(|r| r.harness);
-        let was_active = existing.is_some_and(|r| {
-            r.status != AgentStatus::Idle && r.activity_id.is_some() && r.completion_id.is_none()
-        });
-        let mut activity_id = existing.and_then(|r| r.activity_id.clone());
-        let mut completion_id = existing.and_then(|r| r.completion_id.clone());
-        if agent_status == AgentStatus::Working && !was_active {
-            activity_id = Some(new_agent_revision(now_unix()));
-            completion_id = None;
-        } else if agent_status == AgentStatus::Idle && was_active {
-            completion_id = Some(new_agent_revision(now_unix()));
-        }
-        // The timestamp always moves; "changed" means anything else did. The
-        // harness is carried over verbatim, so it can never be a diff source.
-        let changed = match existing {
-            None => true,
-            Some(prev) => {
-                prev.status != agent_status
-                    || prev.session_name != session
-                    || prev.session_id != sid
-                    || prev.activity_id != activity_id
-                    || prev.completion_id != completion_id
-            }
-        };
-        let rec = AgentRecord {
-            status: agent_status,
-            ts: now_unix(),
-            activity_id,
-            completion_id,
-            session_name: session,
-            session_id: sid,
-            harness,
-        };
+        let (rec, changed) =
+            apply_hook_record(self.agents.get(wt_name), status, session_name, session_id)?;
         self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
             row.agent = rec.status;

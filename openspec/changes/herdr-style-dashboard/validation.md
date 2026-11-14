@@ -24,7 +24,7 @@ The temporary fixture at `/tmp/swamp-herdr-e2e-completion` used private repo sta
 
 ## Final verification
 
-- `nix develop --command cargo test`: 459 passed, including legacy aggregator lock handoff coverage.
+- `nix develop --command cargo test`: 459 passed, including legacy aggregator lock handoff and offline hook completion coverage.
 - `nix develop --command cargo fmt --all --check`: passed.
 - `nix develop --command cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `nix build .#dev`: passed.
