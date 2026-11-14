@@ -135,6 +135,23 @@ fn apply_shared_update(
     true
 }
 
+fn apply_inventory_selection(
+    app: &mut App,
+    shared: selection::SharedSelection,
+    applied_shared: &mut Option<selection::SharedSelection>,
+    last_shared: &mut Option<selection::SharedSelection>,
+    selection_generation: &mut u64,
+) {
+    if applied_shared.as_ref() != Some(&shared) {
+        app.apply_shared(shared.clone());
+        *applied_shared = Some(shared.clone());
+        *last_shared = Some(shared);
+        *selection_generation = selection_generation.wrapping_add(1);
+    } else {
+        app.reconcile();
+    }
+}
+
 fn apply_metadata_selection(
     app: &mut App,
     shared: selection::SharedSelection,
@@ -364,14 +381,13 @@ pub async fn run(
                     app.repositories = state.repositories;
                     have_inventory = true;
                     if let Some(shared) = last_shared.clone().or_else(|| saved_selection.take()) {
-                        if applied_shared.as_ref() != Some(&shared) {
-                            app.apply_shared(shared.clone());
-                            applied_shared = Some(shared.clone());
-                            last_shared = Some(shared);
-                            selection_generation = selection_generation.wrapping_add(1);
-                        } else {
-                            app.reconcile();
-                        }
+                        apply_inventory_selection(
+                            &mut app,
+                            shared,
+                            &mut applied_shared,
+                            &mut last_shared,
+                            &mut selection_generation,
+                        );
                     } else {
                         app.reconcile();
                     }
@@ -656,6 +672,9 @@ pub async fn run(
                 let shared = app.shared();
                 if last_shared.as_ref() != Some(&shared) {
                     last_shared = Some(shared.clone());
+                    // Inventory broadcasts must not re-apply this snapshot
+                    // after newer local input has already changed the app.
+                    applied_shared = Some(shared.clone());
                     selection_generation = selection_generation.wrapping_add(1);
                     shared_write_pending = true;
                     tasks.spawn(async move {
@@ -1254,6 +1273,32 @@ mod tests {
             8,
         ));
         assert_eq!(app.query, "my newer local query");
+    }
+
+    #[test]
+    fn inventory_update_does_not_reapply_a_locally_published_selection() {
+        let mut app = App {
+            query: "newer local query".into(),
+            ..Default::default()
+        };
+        let published = selection::SharedSelection {
+            query: "selection being written".into(),
+            ..Default::default()
+        };
+        let mut applied_shared = Some(published.clone());
+        let mut last_shared = Some(published.clone());
+        let mut generation = 0;
+
+        apply_inventory_selection(
+            &mut app,
+            published,
+            &mut applied_shared,
+            &mut last_shared,
+            &mut generation,
+        );
+
+        assert_eq!(app.query, "newer local query");
+        assert_eq!(generation, 0);
     }
 
     #[test]
