@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const LOCK_FILE: &str = "aggregator.lock";
+const BROKER_LOCK_FILE: &str = "workspace.lock";
 
 struct OwnedTask<T>(Option<tokio::task::JoinHandle<T>>);
 impl<T> OwnedTask<T> {
@@ -164,12 +165,19 @@ async fn attention_worker(
     mut updates: tokio::sync::watch::Receiver<BTreeMap<String, Repo>>,
     interval: Duration,
     timeout: Duration,
+    lock_path: PathBuf,
 ) {
     let mut resend = tokio::time::interval(interval);
     let mut repos = BTreeMap::new();
+    let mut attention_lock = None;
     loop {
         tokio::select! {
-            _ = resend.tick() => send_counts(&mut repos, true, timeout).await,
+            _ = resend.tick() => {
+                acquire_attention_lock(&mut attention_lock, &lock_path);
+                if attention_lock.is_some() {
+                    send_counts(&mut repos, true, timeout).await;
+                }
+            },
             changed = updates.changed() => {
                 if changed.is_err() { return; }
                 let incoming = updates.borrow_and_update().clone();
@@ -182,8 +190,21 @@ async fn attention_worker(
                         repos.insert(id, fresh);
                     }
                 }
-                send_counts(&mut repos, false, timeout).await;
+                acquire_attention_lock(&mut attention_lock, &lock_path);
+                if attention_lock.is_some() {
+                    send_counts(&mut repos, false, timeout).await;
+                }
             }
+        }
+    }
+}
+
+fn acquire_attention_lock(lock: &mut Option<std::fs::File>, path: &Path) {
+    if lock.is_none() {
+        match try_lock(path) {
+            Ok(Some(file)) => *lock = Some(file),
+            Ok(None) => {}
+            Err(error) => tracing::warn!("could not acquire attention lock: {error:#}"),
         }
     }
 }
@@ -192,12 +213,16 @@ async fn attention_worker(
 pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("create {}", runtime_dir.display()))?;
-    let Some(_lock) = try_lock(&runtime_dir.join(LOCK_FILE))? else {
+    // Older Swamp versions hold `aggregator.lock` while serving attention
+    // counts but do not own a workspace broker. Keep this broker lock separate
+    // so the new workspace endpoint starts during upgrades; the attention
+    // worker acquires the legacy lock when it becomes available.
+    let Some(_broker_lock) = try_lock(&runtime_dir.join(BROKER_LOCK_FILE))? else {
         return Ok(Exit::AlreadyRunning);
     };
 
-    // Establish the endpoint before discovery starts. The aggregator lock is
-    // held above, so any existing socket is stale and safe to replace.
+    // Establish the endpoint before discovery starts. The broker lock is held
+    // above, so an existing workspace socket is stale and safe to replace.
     let listener = workspace::broker::bind_owned(&runtime_dir)?;
     let _endpoint_guard =
         workspace::broker::EndpointGuard::capture(&workspace::protocol::socket_path(&runtime_dir));
@@ -241,7 +266,7 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     let (tx, mut rx) = mpsc::channel(256);
     let scan = OwnedTask::new(fanin::spawn(
         fanin::Config {
-            runtime_dir,
+            runtime_dir: runtime_dir.clone(),
             // The aggregator needs no repository identity.
             registry: registry_path.clone(),
             scan_interval: timing.scan_interval,
@@ -254,6 +279,7 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
         attention_rx,
         timing.resend_interval,
         timing.request_timeout,
+        runtime_dir.join(LOCK_FILE),
     )));
     let mut model = workspace::Workspace::default();
     let mut generations = BTreeMap::<String, u64>::new();
@@ -604,6 +630,7 @@ mod tests {
             updates_rx,
             Duration::from_secs(30),
             Duration::from_millis(300),
+            dir.join(LOCK_FILE),
         ));
         updates_tx.send_replace(repos);
 
@@ -641,6 +668,73 @@ mod tests {
             .unwrap();
         daemon.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn attention_takes_over_the_legacy_lock_after_an_old_aggregator_exits() {
+        let dir = temp_dir("agg-attention-upgrade");
+        let legacy_lock = dir.join(LOCK_FILE);
+        let held = try_lock(&legacy_lock)
+            .unwrap()
+            .expect("legacy lock is free");
+        let sock = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let log = RequestLog::default();
+        let daemon = spawn_recording_daemon(
+            &sock,
+            InfoReply::Reject,
+            rows(0, 1),
+            None,
+            Some(ServerMsg::Ok),
+            log.clone(),
+        );
+        let repo = Repo {
+            sock,
+            waiting: 0,
+            sent: None,
+            supported: true,
+        };
+        let (updates_tx, updates_rx) = tokio::sync::watch::channel(BTreeMap::new());
+        let worker = tokio::spawn(attention_worker(
+            updates_rx,
+            Duration::from_millis(30),
+            Duration::from_secs(2),
+            legacy_lock,
+        ));
+        updates_tx.send_replace(BTreeMap::from([("repo".into(), repo)]));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(counts(&log).is_empty(), "do not compete with the old owner");
+
+        drop(held);
+        wait_for("attention lock handoff", || !counts(&log).is_empty()).await;
+        worker.abort();
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_attention_lock_does_not_block_the_workspace_broker() {
+        let dir = temp_dir("aggregate-upgrade-broker");
+        let legacy = try_lock(&dir.join(LOCK_FILE))
+            .unwrap()
+            .expect("legacy attention lock is free");
+        let endpoint = workspace::protocol::socket_path(&dir);
+        let task = tokio::spawn(run_at(
+            dir.clone(),
+            Timing {
+                idle_exit: Duration::from_secs(30),
+                ..timing()
+            },
+        ));
+        wait_for("workspace broker beside legacy aggregator", || {
+            endpoint.exists()
+        })
+        .await;
+        assert!(!task.is_finished());
+        task.abort();
+        let _ = task.await;
+        drop(legacy);
+        assert!(!endpoint.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -763,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_instance_exits_with_success_and_an_idle_one_exits() {
         let dir = temp_dir("aggregate-lock");
-        let lock = dir.join(LOCK_FILE);
+        let lock = dir.join(BROKER_LOCK_FILE);
 
         // The test holds the lock, as a first instance does. A probe of the
         // lock of a real first instance can take the lock before it does.

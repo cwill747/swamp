@@ -597,7 +597,8 @@ never runs commands that someone else chose. User hooks run first.
 | `<git-common-dir>/swamp/slots.lock`   | Lock for slot operations             |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`     | Daemon PID file                      |
-| `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Single-instance lock of `swamp aggregate` |
+| `$XDG_RUNTIME_DIR/swamp/workspace.lock` | Single-instance workspace broker lock |
+| `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Attention-count owner lock; retained for upgrade handoff |
 
 ## Contributing
 
