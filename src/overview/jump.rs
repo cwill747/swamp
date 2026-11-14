@@ -1,7 +1,7 @@
 //! Move the user to the Zellij session of a repository, with the tab of one
 //! worktree in focus.
 
-use crate::zellij::{self, SessionState, TabInfo};
+use crate::zellij::{self, GeneratedPaneRole, SessionState, TabInfo};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,12 +12,18 @@ pub struct Target {
     pub session: String,
     pub worktree: String,
     pub path: PathBuf,
+    /// Captured branch identity from the selected snapshot. Slot paths can be
+    /// reused while activation is waiting for Zellij, so validate it again.
+    pub expected_branch: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The worktree tab has the focus in the target session.
-    Tab,
+    /// The target tab and its generated agent terminal have focus.
+    AgentFocused,
+    /// The target tab is active, but its agent pane was unavailable or unsafe
+    /// to resolve. Callers must not treat this as a confirmed agent visit.
+    TabOnly { reason: String },
     /// The session is the target, but the tab could not be found or opened.
     SessionOnly { reason: String },
 }
@@ -34,6 +40,15 @@ pub trait Ops {
     /// Move the client of this pane to `session`.
     fn switch_session(&self, session: &str, tab_position: Option<usize>) -> Result<()>;
     fn go_to_tab(&self, session: &str, tab_id: u32) -> Result<()>;
+    /// Focus the generated agent terminal in `tab_id` for this client. False
+    /// means discovery could not identify exactly one safe target.
+    fn focus_agent(&self, session: &str, tab_id: u32) -> Result<bool>;
+    /// Check that the selected path still belongs to this repository/branch.
+    /// Implementations may use a captured snapshot in tests; production checks
+    /// git only during an explicit activation.
+    fn validate_target(&self, _target: &Target) -> Result<bool> {
+        Ok(true)
+    }
     /// Wait for Zellij to apply a change. Tests do not wait.
     fn settle(&self) {
         std::thread::sleep(Duration::from_millis(100));
@@ -64,6 +79,59 @@ impl Ops for Zellij {
     fn go_to_tab(&self, session: &str, tab_id: u32) -> Result<()> {
         zellij::go_to_tab_by_id(session, tab_id)
     }
+    fn focus_agent(&self, session: &str, tab_id: u32) -> Result<bool> {
+        let Some(pane) = zellij::resolve_generated_pane(session, tab_id, GeneratedPaneRole::Agent)?
+        else {
+            return Ok(false);
+        };
+        let origin = std::env::var("ZELLIJ_SESSION_NAME").ok();
+        match zellij::pane_focus_target(origin.as_deref(), session, pane.pane_id()) {
+            zellij::PaneFocusTarget::CurrentClient(pane_id) => {
+                zellij::focus_pane_here(pane_id)?;
+                Ok(true)
+            }
+            zellij::PaneFocusTarget::TargetSession { session, .. }
+                if zellij::client_count(&session)? != 1 =>
+            {
+                Ok(false)
+            }
+            zellij::PaneFocusTarget::TargetSession { session, .. } => {
+                zellij::focus_role_in_session(&session, tab_id, GeneratedPaneRole::Agent)?;
+                Ok(true)
+            }
+        }
+    }
+    fn validate_target(&self, target: &Target) -> Result<bool> {
+        let expected_common = target
+            .common_dir
+            .canonicalize()
+            .unwrap_or_else(|_| target.common_dir.clone());
+        let worktrees = match crate::worktree::list_worktrees(&target.common_dir) {
+            Ok(worktrees) => worktrees,
+            Err(_) => return Ok(false),
+        };
+        let expected_path = target
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| target.path.clone());
+        Ok(worktrees.into_iter().any(|worktree| {
+            let path = worktree
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| worktree.path.clone());
+            path == expected_path
+                && worktree.branch
+                    == target
+                        .expected_branch
+                        .as_deref()
+                        .unwrap_or(&worktree.branch)
+                && crate::worktree::git_common_dir(&worktree.path)
+                    .ok()
+                    .map(|dir| dir.canonicalize().unwrap_or(dir))
+                    .as_ref()
+                    == Some(&expected_common)
+        }))
+    }
 }
 
 /// Bring the worktree tab into focus for the client that is attached to the
@@ -84,6 +152,9 @@ pub fn focus_tab(ops: &dyn Ops, target: &Target) -> Result<()> {
     if !attached {
         anyhow::bail!("no client is attached to {}", target.session);
     }
+    if !ops.validate_target(target)? {
+        anyhow::bail!("selected worktree changed before activation");
+    }
 
     let tabs = ops.list_tabs(&target.session)?;
     let mut tab = zellij::find_tab(&tabs, &target.worktree).cloned();
@@ -101,6 +172,9 @@ pub fn focus_tab(ops: &dyn Ops, target: &Target) -> Result<()> {
     let Some(tab) = tab else {
         anyhow::bail!("the tab of {} did not open", target.worktree);
     };
+    if !ops.validate_target(target)? {
+        anyhow::bail!("selected worktree changed before tab focus");
+    }
     ops.go_to_tab(&target.session, tab.tab_id)
 }
 
@@ -122,6 +196,11 @@ pub fn ensure_session(ops: &dyn Ops, target: &Target) -> Result<()> {
 /// both steps. When the tab is absent, the client moves first and the tab
 /// opens second (see [`focus_tab`]).
 pub fn jump(ops: &dyn Ops, target: &Target) -> Result<Outcome> {
+    if !ops.validate_target(target)? {
+        return Ok(Outcome::SessionOnly {
+            reason: "selected worktree changed before activation".into(),
+        });
+    }
     ensure_session(ops, target)?;
     let open_tab = ops
         .list_tabs(&target.session)
@@ -129,7 +208,7 @@ pub fn jump(ops: &dyn Ops, target: &Target) -> Result<Outcome> {
         .and_then(|tabs| zellij::find_tab(&tabs, &target.worktree).cloned());
     if let Some(tab) = open_tab {
         return match ops.switch_session(&target.session, Some(tab.position)) {
-            Ok(()) => Ok(Outcome::Tab),
+            Ok(()) => Ok(focus_agent_after_tab(ops, target, tab.tab_id)),
             Err(e) => {
                 ops.switch_session(&target.session, None)?;
                 Ok(Outcome::SessionOnly {
@@ -140,17 +219,86 @@ pub fn jump(ops: &dyn Ops, target: &Target) -> Result<Outcome> {
     }
     ops.switch_session(&target.session, None)?;
     Ok(match focus_tab(ops, target) {
-        Ok(()) => Outcome::Tab,
+        Ok(()) => focus_target(ops, target),
         Err(e) => Outcome::SessionOnly {
             reason: format!("{e:#}"),
         },
     })
 }
 
+pub fn focus_target(ops: &dyn Ops, target: &Target) -> Outcome {
+    match ops
+        .list_tabs(&target.session)
+        .ok()
+        .and_then(|tabs| zellij::find_tab(&tabs, &target.worktree).map(|tab| tab.tab_id))
+    {
+        Some(tab_id) => focus_agent_after_tab(ops, target, tab_id),
+        None => Outcome::TabOnly {
+            reason: "target tab could not be resolved".into(),
+        },
+    }
+}
+
+pub fn focus_target_in_session(target: &Target) -> Result<Outcome> {
+    if !Zellij.validate_target(target)? {
+        return Ok(Outcome::TabOnly {
+            reason: "selected worktree changed after attaching".into(),
+        });
+    }
+    let tabs = zellij::list_tabs(&target.session)?;
+    let tab = zellij::find_tab(&tabs, &target.worktree)
+        .ok_or_else(|| anyhow::anyhow!("target tab could not be resolved"))?;
+    match zellij::focus_role_in_session(&target.session, tab.tab_id, GeneratedPaneRole::Agent) {
+        Ok(()) if Zellij.validate_target(target)? => Ok(Outcome::TabOnly {
+            reason: "session-targeted focus cannot confirm which attached client received focus"
+                .into(),
+        }),
+        Ok(()) => Ok(Outcome::TabOnly {
+            reason: "selected worktree changed during agent focus".into(),
+        }),
+        Err(error) => Ok(Outcome::TabOnly {
+            reason: format!("could not focus agent pane: {error:#}"),
+        }),
+    }
+}
+
+fn focus_agent_after_tab(ops: &dyn Ops, target: &Target, tab_id: u32) -> Outcome {
+    match ops.validate_target(target) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Outcome::TabOnly {
+                reason: "selected worktree changed before agent focus".into(),
+            };
+        }
+        Err(error) => {
+            return Outcome::TabOnly {
+                reason: format!("could not verify selected worktree: {error:#}"),
+            };
+        }
+    }
+    match ops.focus_agent(&target.session, tab_id) {
+        Ok(true) => match ops.validate_target(target) {
+            Ok(true) => Outcome::AgentFocused,
+            Ok(false) => Outcome::TabOnly {
+                reason: "selected worktree changed during agent focus".into(),
+            },
+            Err(error) => Outcome::TabOnly {
+                reason: format!("could not verify selected worktree after focus: {error:#}"),
+            },
+        },
+        Ok(false) => Outcome::TabOnly {
+            reason: "agent pane is missing, exited, or ambiguous".into(),
+        },
+        Err(error) => Outcome::TabOnly {
+            reason: format!("could not focus agent pane: {error:#}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Default)]
     struct Fake {
@@ -159,7 +307,10 @@ mod tests {
         tabs: RefCell<Vec<TabInfo>>,
         list_fails: bool,
         open_fails: bool,
+        agent_missing: bool,
         positioned_switch_fails: bool,
+        branch_valid: Cell<bool>,
+        invalidate_after_focus: bool,
         calls: RefCell<Vec<String>>,
     }
 
@@ -167,6 +318,7 @@ mod tests {
         fn live(names: &[&str]) -> Self {
             Fake {
                 live: RefCell::new(true),
+                branch_valid: Cell::new(true),
                 tabs: RefCell::new(
                     names
                         .iter()
@@ -242,6 +394,18 @@ mod tests {
                 .push(format!("focus {session} {tab_id}"));
             Ok(())
         }
+        fn focus_agent(&self, session: &str, tab_id: u32) -> Result<bool> {
+            self.calls
+                .borrow_mut()
+                .push(format!("agent {session} {tab_id}"));
+            if self.invalidate_after_focus {
+                self.branch_valid.set(false);
+            }
+            Ok(!self.agent_missing)
+        }
+        fn validate_target(&self, _: &Target) -> Result<bool> {
+            Ok(self.branch_valid.get())
+        }
         fn settle(&self) {}
     }
 
@@ -251,26 +415,54 @@ mod tests {
             session: "demo-1a2b".into(),
             worktree: "feature".into(),
             path: PathBuf::from("/repos/demo/feature"),
+            expected_branch: Some("feature".into()),
         }
     }
 
     #[test]
     fn an_open_tab_gets_the_focus_by_position() {
         let ops = Fake::live(&["dashboard", "main", "feature"]);
-        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::Tab);
-        assert_eq!(ops.calls(), ["switch demo-1a2b Some(2)"]);
+        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::AgentFocused);
+        assert_eq!(
+            ops.calls(),
+            ["switch demo-1a2b Some(2)", "agent demo-1a2b 12"]
+        );
+    }
+
+    #[test]
+    fn a_slot_reassigned_before_activation_is_not_opened_or_acknowledged() {
+        let ops = Fake::live(&["dashboard", "feature"]);
+        ops.branch_valid.set(false);
+        assert!(matches!(
+            jump(&ops, &target()).unwrap(),
+            Outcome::SessionOnly { .. }
+        ));
+        assert!(ops.calls().is_empty());
+    }
+
+    #[test]
+    fn a_slot_reassigned_during_focus_is_a_partial_visit() {
+        let ops = Fake {
+            invalidate_after_focus: true,
+            ..Fake::live(&["dashboard", "feature"])
+        };
+        assert!(matches!(
+            jump(&ops, &target()).unwrap(),
+            Outcome::TabOnly { .. }
+        ));
     }
 
     #[test]
     fn a_missing_tab_is_opened_after_the_client_moves() {
         let ops = Fake::live(&["dashboard"]);
-        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::Tab);
+        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::AgentFocused);
         assert_eq!(
             ops.calls(),
             [
                 "switch demo-1a2b None",
                 "open demo-1a2b /repos/demo/feature feature",
                 "focus demo-1a2b 11",
+                "agent demo-1a2b 11",
             ]
         );
     }
@@ -309,15 +501,35 @@ mod tests {
     }
 
     #[test]
+    fn renamed_or_ambiguous_agent_role_is_tab_only_not_a_confirmed_visit() {
+        let ops = Fake {
+            agent_missing: true,
+            ..Fake::live(&["dashboard", "feature"])
+        };
+        assert!(matches!(
+            jump(&ops, &target()).unwrap(),
+            Outcome::TabOnly { .. }
+        ));
+        assert_eq!(
+            ops.calls(),
+            ["switch demo-1a2b Some(1)", "agent demo-1a2b 11"]
+        );
+    }
+
+    #[test]
     fn a_session_that_does_not_run_is_started_before_the_jump() {
         let ops = Fake {
             live: RefCell::new(false),
             ..Fake::live(&["dashboard", "feature"])
         };
-        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::Tab);
+        assert_eq!(jump(&ops, &target()).unwrap(), Outcome::AgentFocused);
         assert_eq!(
             ops.calls(),
-            ["start /repos/demo/.bare", "switch demo-1a2b Some(1)"]
+            [
+                "start /repos/demo/.bare",
+                "switch demo-1a2b Some(1)",
+                "agent demo-1a2b 11"
+            ]
         );
     }
 

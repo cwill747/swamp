@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -35,6 +36,10 @@ pub enum Event {
         id: String,
         prs: PrSnapshot,
     },
+    Resources {
+        id: String,
+        resources: crate::daemon::resources::Snapshot,
+    },
     /// The connection to the daemon closed.
     Down {
         id: String,
@@ -54,13 +59,23 @@ pub struct Config {
 pub fn spawn(cfg: Config, tx: mpsc::Sender<Event>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let active: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let mut followers = JoinSet::new();
         let mut interval = tokio::time::interval(cfg.scan_interval);
         loop {
-            interval.tick().await;
-            if tx.is_closed() {
-                return;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = interval.tick() => {},
+                _ = followers.join_next(), if !followers.is_empty() => continue,
             }
             for sock in discover::socket_files(&cfg.runtime_dir) {
+                // The workspace broker is a reserved runtime endpoint, not a
+                // repo daemon. Never recursively subscribe to our own socket.
+                if sock
+                    .file_name()
+                    .is_some_and(|name| name == "workspace.sock")
+                {
+                    continue;
+                }
                 let Some(id) = sock.file_stem().and_then(|s| s.to_str()).map(String::from) else {
                     continue;
                 };
@@ -70,32 +85,34 @@ pub fn spawn(cfg: Config, tx: mpsc::Sender<Event>) -> tokio::task::JoinHandle<()
                 let active = active.clone();
                 let registry = cfg.registry.clone();
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                followers.spawn(async move {
                     follow(&sock, &id, registry.as_deref(), &tx).await;
                     active.lock().unwrap().remove(&id);
                 });
             }
         }
+        followers.abort_all();
+        while followers.join_next().await.is_some() {}
     })
 }
 
 /// Follow one daemon until its connection closes.
 async fn follow(sock: &Path, id: &str, registry: Option<&Path>, tx: &mpsc::Sender<Event>) {
-    let Some(mut stream) = discover::connect(sock).await else {
+    let Some(mut stream) =
+        (tokio::select! { _ = tx.closed() => return, s = discover::connect(sock) => s })
+    else {
         return;
     };
-    let mut identity = discover::get_info(&mut stream).await;
+    let mut identity = tokio::select! { _ = tx.closed() => return, identity = discover::get_info(&mut stream) => identity };
     if identity.is_none() {
         // A daemon that predates `GetInfo` closes the connection.
-        let Some(fresh) = discover::connect(sock).await else {
+        let Some(fresh) = (tokio::select! { _ = tx.closed() => return, fresh = discover::connect(sock) => fresh })
+        else {
             return;
         };
         stream = fresh;
     }
-    if write_client_msg(&mut stream, &ClientMsg::Subscribe)
-        .await
-        .is_err()
-    {
+    if tokio::select! { _ = tx.closed() => return, result = write_client_msg(&mut stream, &ClientMsg::Subscribe) => result }.is_err() {
         return;
     }
 
@@ -112,7 +129,8 @@ async fn follow(sock: &Path, id: &str, registry: Option<&Path>, tx: &mpsc::Sende
         }
     }
 
-    while let Ok(Some(msg)) = read_server_msg(&mut stream).await {
+    loop {
+        let msg = tokio::select! { _ = tx.closed() => return, msg = read_server_msg(&mut stream) => match msg { Ok(Some(msg)) => msg, _ => break } };
         let event = match msg {
             ServerMsg::Snapshot(snapshot) => {
                 if identity.is_none() {
@@ -135,6 +153,10 @@ async fn follow(sock: &Path, id: &str, registry: Option<&Path>, tx: &mpsc::Sende
             ServerMsg::PrStatus(prs) => Event::PrStatus {
                 id: id.to_string(),
                 prs,
+            },
+            ServerMsg::Resources(resources) => Event::Resources {
+                id: id.to_string(),
+                resources,
             },
             _ => continue,
         };
@@ -463,6 +485,94 @@ mod tests {
         );
 
         task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dropping_receiver_cancels_and_joins_a_silent_follower() {
+        let dir = temp_dir("fanin-close");
+        let daemon = spawn_fake_daemon(
+            &dir.join("aaaaaaaaaaaaaaaa.sock"),
+            InfoReply::Answer(identity("a")),
+            Vec::new(),
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        let scan = spawn(config(&dir, None), tx);
+        let _ = wait_up(&mut rx, "aaaaaaaaaaaaaaaa").await;
+        while !matches!(next(&mut rx).await, Event::Snapshot { .. }) {}
+        drop(rx);
+        tokio::time::timeout(WAIT, scan)
+            .await
+            .expect("scanner observes receiver closure")
+            .expect("scanner joins its followers");
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn forwards_resources_without_waiting_for_pr_status() {
+        use crate::daemon::resources::Snapshot as ResourceSnapshot;
+        use crate::daemon::socket::{read_msg, write_msg};
+        let dir = temp_dir("fanin-resources");
+        let sock = dir.join("aaaaaaaaaaaaaaaa.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_msg(&mut stream).await.unwrap(),
+                Some(ClientMsg::GetInfo)
+            ));
+            write_msg(
+                &mut stream,
+                &ServerMsg::Info {
+                    common_dir: "/repos/a/.bare".into(),
+                    session_name: "a-session".into(),
+                    version: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_msg(&mut stream).await.unwrap(),
+                Some(ClientMsg::Subscribe)
+            ));
+            write_msg(&mut stream, &ServerMsg::Snapshot(Snapshot::default()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut stream,
+                &ServerMsg::Resources(ResourceSnapshot::default()),
+            )
+            .await
+            .unwrap();
+            // No PR update: local snapshot and resources remain independently available.
+            let mut byte = [0];
+            let _ =
+                tokio::time::timeout(WAIT, tokio::io::AsyncReadExt::read(&mut stream, &mut byte))
+                    .await;
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let scan = spawn(config(&dir, None), tx);
+        let mut got_snapshot = false;
+        let mut got_resources = false;
+        while !got_snapshot || !got_resources {
+            match next(&mut rx).await {
+                Event::Snapshot { id, .. } => {
+                    assert_eq!(id, "aaaaaaaaaaaaaaaa");
+                    got_snapshot = true;
+                }
+                Event::Resources { id, resources } => {
+                    assert_eq!(id, "aaaaaaaaaaaaaaaa");
+                    assert!(resources.procs.is_empty());
+                    got_resources = true;
+                }
+                Event::Up { .. } | Event::PrStatus { .. } => {}
+                event => panic!("unexpected fan-in event {event:?}"),
+            }
+        }
+        drop(rx);
+        tokio::time::timeout(WAIT, scan).await.unwrap().unwrap();
+        daemon.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

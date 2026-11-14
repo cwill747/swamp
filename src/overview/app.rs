@@ -138,6 +138,7 @@ impl App {
             fanin::Event::Down { id } => {
                 self.repos.remove(&id);
             }
+            fanin::Event::Resources { .. } => return,
         }
         self.recompute();
     }
@@ -208,10 +209,8 @@ impl App {
 
     fn activate(&mut self) -> Action {
         if let Some(item) = self.items.get(self.selected) {
-            let identity = self
-                .repos
-                .get(&item.repo_id)
-                .and_then(|repo| repo.identity.as_ref());
+            let repo = self.repos.get(&item.repo_id);
+            let identity = repo.and_then(|repo| repo.identity.as_ref());
             let Some(identity) = identity else {
                 self.error(RESTART_HINT);
                 return Action::None;
@@ -221,6 +220,13 @@ impl App {
                 session: identity.session_name.clone(),
                 worktree: item.worktree.clone(),
                 path: item.path.clone(),
+                expected_branch: repo.and_then(|repo| {
+                    repo.snapshot
+                        .rows
+                        .iter()
+                        .find(|row| row.name == item.worktree)
+                        .map(|row| row.branch.clone())
+                }),
             });
         }
         match self.cold.get(self.selected - self.items.len()) {
@@ -277,6 +283,8 @@ pub(crate) mod test_support {
         WorktreeRow {
             agent: AgentStatus::Waiting,
             agent_ts: ts,
+            activity_id: None,
+            completion_id: None,
             ..row(name, &Path::new("/repos").join(repo).join(name))
         }
     }
@@ -377,6 +385,7 @@ mod tests {
                 session: "alpha-0000".into(),
                 worktree: "one".into(),
                 path: PathBuf::from("/repos/alpha/one"),
+                expected_branch: Some("one".into()),
             })
         );
     }

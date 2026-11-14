@@ -5,8 +5,9 @@ use crate::util::session_name_for;
 use crate::worktree::{Worktree, git_common_dir, list_worktrees, resolve_git_dir};
 use crate::zellij;
 use anyhow::{Context, Result};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
@@ -112,6 +113,9 @@ fn spawn_new_session(
         Ok(c) => Some(acquire_launch_lock(c)?),
         Err(_) => None,
     };
+    if let Ok(common) = &common {
+        ensure_repository_daemon(common)?;
+    }
 
     // Reuse an existing session if one already matches this repo's name —
     // but first check whether the running daemon is stale.
@@ -151,6 +155,12 @@ fn spawn_new_session(
 
         if do_restart {
             crate::kill::run(Some(target.to_path_buf()))?;
+            if let Ok(common) = &common {
+                // The initial daemon probe may have verified the old daemon.
+                // Restart teardown kills it, so start and verify the
+                // replacement before the new workspace panes attach.
+                ensure_repository_daemon(common)?;
+            }
             // Fall through to fresh launch below.
         } else if std::env::var("ZELLIJ_SESSION_NAME").as_deref() == Ok(session) {
             // The repo session is already active. Attaching it inside itself
@@ -237,6 +247,68 @@ fn acquire_launch_lock(common_dir: &Path) -> Result<std::fs::File> {
     }
 }
 
+/// Start the local daemon when an explicit launch path opens or reuses a
+/// repository session. Workspace discovery stays passive; only an explicit
+/// launch/activation calls this helper.
+fn ensure_repository_daemon(common_dir: &Path) -> Result<()> {
+    let socket = daemon::socket_path(common_dir)?;
+    if probe_daemon_socket(&socket).is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("resolve swamp executable")?;
+    let mut parent = std::process::Command::new(exe)
+        .arg("serve")
+        .arg(common_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn repository daemon")?;
+    let _ = parent.wait();
+
+    for _ in 0..40 {
+        if probe_daemon_socket(&socket).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("repository daemon did not start within 2s")
+}
+
+/// Synchronous Ping for launch paths that also run from `spawn_blocking`.
+fn probe_daemon_socket(socket: &Path) -> Result<()> {
+    use crate::daemon::socket::{ClientMsg, ServerMsg};
+
+    let mut stream = StdUnixStream::connect(socket)
+        .with_context(|| format!("connect daemon socket {}", socket.display()))?;
+    let timeout = Some(Duration::from_secs(2));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+
+    let payload = serde_json::to_vec(&ClientMsg::Ping)?;
+    let frame_len = 4usize + payload.len();
+    stream.write_all(&(frame_len as u32).to_be_bytes())?;
+    stream.write_all(b"SWP1")?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header)?;
+    let frame_len = u32::from_be_bytes(header) as usize;
+    anyhow::ensure!(
+        (4..=64 * 1024).contains(&frame_len),
+        "invalid daemon frame length"
+    );
+    let mut frame = vec![0; frame_len];
+    stream.read_exact(&mut frame)?;
+    let json = frame.strip_prefix(b"SWP1").unwrap_or(&frame);
+    match serde_json::from_slice::<ServerMsg>(json)? {
+        ServerMsg::Pong => Ok(()),
+        other => anyhow::bail!("unexpected daemon probe response: {other:?}"),
+    }
+}
+
 /// Open a new zellij tab for a worktree, using a freshly generated,
 /// `$SHELL`-aware layout rather than an externally-installed one.
 pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
@@ -247,6 +319,11 @@ pub fn open_worktree_tab(path: &Path, name: &str) -> Result<()> {
 /// The cross-repo overview uses this to open a tab in a session that is not
 /// the one that contains the caller.
 pub fn open_worktree_tab_in(session: Option<&str>, path: &Path, name: &str) -> Result<()> {
+    let _tab_lock = acquire_worktree_tab_lock(path)?;
+    if zellij::worktree_tab_exists(session, name)? {
+        tracing::debug!(worktree = %name, ?session, "worktree tab already exists after serialized open");
+        return Ok(());
+    }
     let cfg = config::ensure_configs()?;
     let common = git_common_dir(&resolve_git_dir(path)).ok();
     // Resolve this worktree's harness: the repo setting, plus its persisted
@@ -270,10 +347,55 @@ pub fn open_worktree_tab_in(session: Option<&str>, path: &Path, name: &str) -> R
         resume = resume.is_some(),
         "wrote worktree tab layout"
     );
-    match session {
+    let open_result = match session {
         Some(session) => zellij::new_tab_in(session, &layout.to_string_lossy(), path, name),
         None => zellij::new_tab(&layout.to_string_lossy(), path, name),
+    };
+    // A concurrent opener outside this lock (for example a native/manual path)
+    // may have won the race. Treat that as success after reconciling the
+    // canonical tab identity, never open a second agent tab deliberately.
+    if let Err(error) = open_result {
+        if zellij::worktree_tab_exists(session, name).unwrap_or(false) {
+            tracing::debug!(worktree = %name, "tab creation raced with another opener; reusing canonical tab");
+            return Ok(());
+        }
+        return Err(error);
     }
+    for _ in 0..40 {
+        if zellij::worktree_tab_exists(session, name)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("worktree tab {name} did not appear after creation")
+}
+
+fn worktree_tab_lock_path(path: &Path) -> Result<PathBuf> {
+    Ok(crate::util::runtime_base_dir()?
+        .join(format!("{}.tab-open.lock", crate::util::repo_id(path))))
+}
+
+fn acquire_worktree_tab_lock(path: &Path) -> Result<std::fs::File> {
+    let lock_path = worktree_tab_lock_path(path)?;
+    acquire_file_lock(&lock_path)
+}
+
+fn acquire_file_lock(lock_path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("open worktree tab lock {}", lock_path.display()))?;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("lock worktree tab open");
+    }
+    Ok(file)
 }
 
 /// Wait until `session` is live and, with `tab`, until it has a tab with
@@ -311,12 +433,13 @@ pub fn ensure_background_session(common_dir: &Path) -> Result<String> {
     }
     let session = session_name_for(common_dir);
     let _lock = acquire_launch_lock(common_dir)?;
+    crate::registry::record_launch(common_dir);
+    ensure_repository_daemon(common_dir)?;
     let state = zellij::session_state(&session)?;
     if state == Some(zellij::SessionState::Live) {
         return Ok(session);
     }
     let cfg = config::ensure_configs()?;
-    crate::registry::record_launch(common_dir);
     let cwd = common_dir.parent().unwrap_or(common_dir);
     if state == Some(zellij::SessionState::Exited) {
         zellij::create_background_session(&session, None, cwd)?;
@@ -535,7 +658,13 @@ pub fn relaunch_worktree_tab(name: &str, path: &Path) -> Result<()> {
 /// close its own tab" problem. Shared by the `D` key and by
 /// `confirm-delete`'s force path when `--close-tab` was set, so the detached
 /// process is spawned identically from both.
-pub fn spawn_delete_tab(name: &str, path: &Path, common_dir: &Path, force: bool) {
+pub fn spawn_delete_tab(
+    name: &str,
+    path: &Path,
+    common_dir: &Path,
+    force: bool,
+    expected_branch: Option<&str>,
+) {
     use std::os::unix::process::CommandExt;
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -544,6 +673,9 @@ pub fn spawn_delete_tab(name: &str, path: &Path, common_dir: &Path, force: bool)
     cmd.arg("delete-tab").arg(name).arg(path);
     if force {
         cmd.arg("--force");
+    }
+    if let Some(branch) = expected_branch {
+        cmd.arg("--expected-branch").arg(branch);
     }
     let _ = cmd
         .current_dir(common_dir)
@@ -564,12 +696,26 @@ pub fn spawn_delete_tab(name: &str, path: &Path, common_dir: &Path, force: bool)
 /// Linux but leaves lazygit and the agent writing into an unlinked tree, and
 /// an agent mid-write can recreate paths under a directory being removed.
 /// Closing the tab terminates those processes first.
-pub async fn delete_tab(name: &str, path: &Path, force: bool) -> Result<()> {
+pub async fn delete_tab(
+    name: &str,
+    path: &Path,
+    force: bool,
+    expected_branch: Option<&str>,
+) -> Result<()> {
     if let Ok(common) = git_common_dir(&resolve_git_dir(path)) {
         let log_cfg = config::load_config().map(|c| c.logging).unwrap_or_default();
         crate::logging::init(&common, false, false, &log_cfg);
     }
     tracing::info!(worktree = %name, "delete-tab: closing tab and removing worktree");
+
+    if let Some(expected) = expected_branch {
+        let actual = worktree_branch_for_path(path)?;
+        if actual != expected {
+            anyhow::bail!(
+                "worktree {name} changed branch from {expected} to {actual}; refusing delete"
+            );
+        }
+    }
 
     if zellij::in_zellij()
         && let Err(e) = zellij::close_tab_by_name(name)
@@ -577,7 +723,7 @@ pub async fn delete_tab(name: &str, path: &Path, force: bool) -> Result<()> {
         tracing::warn!(worktree = %name, "delete-tab: close tab failed: {e:?}");
     }
 
-    if let Err(e) = send_remove_worktree(name, path, force).await {
+    if let Err(e) = send_remove_worktree(name, path, force, expected_branch).await {
         tracing::warn!(worktree = %name, "delete-tab: remove worktree failed: {e:?}");
     }
     Ok(())
@@ -585,12 +731,22 @@ pub async fn delete_tab(name: &str, path: &Path, force: bool) -> Result<()> {
 
 /// Send `RemoveWorktree` for `name` (whose common dir is resolved from
 /// `path`) to the daemon and wait for the reply.
-async fn send_remove_worktree(name: &str, path: &Path, force: bool) -> Result<()> {
+async fn send_remove_worktree(
+    name: &str,
+    path: &Path,
+    force: bool,
+    expected_branch: Option<&str>,
+) -> Result<()> {
     let common = git_common_dir(&resolve_git_dir(path))?;
-    send_remove_worktree_at(&common, name, force).await
+    send_remove_worktree_at(&common, name, force, expected_branch).await
 }
 
-async fn send_remove_worktree_at(common_dir: &Path, name: &str, force: bool) -> Result<()> {
+async fn send_remove_worktree_at(
+    common_dir: &Path,
+    name: &str,
+    force: bool,
+    expected_branch: Option<&str>,
+) -> Result<()> {
     use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
     use tokio::net::UnixStream;
 
@@ -603,6 +759,7 @@ async fn send_remove_worktree_at(common_dir: &Path, name: &str, force: bool) -> 
         &ClientMsg::RemoveWorktree {
             name: name.to_string(),
             force,
+            expected_branch: expected_branch.map(str::to_owned),
         },
     )
     .await?;
@@ -624,11 +781,26 @@ async fn send_remove_worktree_at(common_dir: &Path, name: &str, force: bool) -> 
 ///
 /// No daemon round-trip happens before the prompt appears: everything shown
 /// is read directly from the worktree, not fetched from the daemon.
-pub async fn confirm_delete(name: &str, path: &Path, reason: &str, close_tab: bool) -> Result<()> {
+pub async fn confirm_delete(
+    name: &str,
+    path: &Path,
+    reason: &str,
+    close_tab: bool,
+    expected_branch: Option<&str>,
+) -> Result<()> {
     let common = git_common_dir(&resolve_git_dir(path))
         .with_context(|| format!("resolve git common dir for {}", path.display()))?;
     let log_cfg = config::load_config().map(|c| c.logging).unwrap_or_default();
     crate::logging::init(&common, false, false, &log_cfg);
+
+    if let Some(expected) = expected_branch {
+        let actual = worktree_branch_for_path(path)?;
+        if actual != expected {
+            anyhow::bail!(
+                "worktree {name} changed branch from {expected} to {actual}; refusing confirmation"
+            );
+        }
+    }
 
     println!("Worktree '{name}' {reason}.\n");
     print_git_status(path);
@@ -646,13 +818,36 @@ pub async fn confirm_delete(name: &str, path: &Path, reason: &str, close_tab: bo
         return Ok(());
     }
 
+    if let Some(expected) = expected_branch {
+        let actual = worktree_branch_for_path(path)?;
+        if actual != expected {
+            anyhow::bail!(
+                "worktree {name} changed branch from {expected} to {actual}; refusing delete"
+            );
+        }
+    }
+
     if close_tab {
-        spawn_delete_tab(name, path, &common, true);
-    } else if let Err(e) = send_remove_worktree_at(&common, name, true).await {
+        spawn_delete_tab(name, path, &common, true, expected_branch);
+    } else if let Err(e) = send_remove_worktree_at(&common, name, true, expected_branch).await {
         tracing::warn!(worktree = %name, "confirm-delete: force remove failed: {e:?}");
         println!("Delete failed: {e}");
     }
     Ok(())
+}
+
+fn worktree_branch_for_path(path: &Path) -> Result<String> {
+    let common = git_common_dir(&resolve_git_dir(path))?;
+    let info = crate::worktree::git_info(path)?;
+    if !info.branch.is_empty() && info.branch != "(detached)" {
+        return Ok(info.branch);
+    }
+    let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    crate::worktree::list_worktrees(&common)?
+        .into_iter()
+        .find(|wt| wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()) == wanted)
+        .map(|wt| wt.branch)
+        .with_context(|| format!("cannot identify worktree branch for {}", path.display()))
 }
 
 /// Print `git status --short` and `git diff --stat HEAD` for `path` — the
@@ -802,6 +997,72 @@ pub(super) fn is_safe_session_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_socket_probe_requires_a_pong() {
+        use crate::daemon::socket::{ClientMsg, ServerMsg};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-launch-probe-{}-{}",
+            std::process::id(),
+            crate::util::now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_be_bytes(header) as usize;
+            let mut frame = vec![0; len];
+            stream.read_exact(&mut frame).unwrap();
+            assert_eq!(&frame[..4], b"SWP1");
+            assert!(matches!(
+                serde_json::from_slice::<ClientMsg>(&frame[4..]).unwrap(),
+                ClientMsg::Ping
+            ));
+            let payload = serde_json::to_vec(&ServerMsg::Pong).unwrap();
+            let len = 4 + payload.len();
+            stream.write_all(&(len as u32).to_be_bytes()).unwrap();
+            stream.write_all(b"SWP1").unwrap();
+            stream.write_all(&payload).unwrap();
+        });
+
+        probe_daemon_socket(&socket).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worktree_tab_open_lock_serializes_competing_openers() {
+        let dir = std::env::temp_dir().join(format!(
+            "swamp-tab-lock-{}-{}",
+            std::process::id(),
+            crate::util::now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("target.lock");
+        let held = acquire_file_lock(&lock_path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter_path = lock_path.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = acquire_file_lock(&waiter_path).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "second tab open must wait for first creation/reconciliation"
+        );
+        drop(held);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn pending_tab_close_blocks_only_while_its_owner_runs() {

@@ -18,7 +18,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepoIdentity {
     pub common_dir: PathBuf,
     pub session_name: String,
@@ -169,6 +169,8 @@ pub(crate) mod test_support {
             rebase: false,
             agent: AgentStatus::Idle,
             agent_ts: 0,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts: 0,
             harness: None,
@@ -197,6 +199,8 @@ pub(crate) mod test_support {
         let dir = std::env::temp_dir().join(format!("sw-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
 
@@ -282,6 +286,7 @@ pub(crate) mod test_support {
                                 let _ = write_msg(&mut stream, &reply).await;
                             }
                             (ClientMsg::Subscribe, _) => {
+                                log.lock().unwrap().push(ClientMsg::Subscribe);
                                 let snap = Snapshot {
                                     rows: rows.clone(),
                                     default_known: true,

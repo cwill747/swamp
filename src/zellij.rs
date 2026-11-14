@@ -77,6 +77,225 @@ pub struct TabInfo {
     pub name: String,
 }
 
+/// Pane IDs are namespaced by Zellij: terminal and plugin panes may both have
+/// numeric ID 0, so keeping the kind is required for `focus-pane-id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PaneId {
+    Terminal(u32),
+    Plugin(u32),
+}
+
+impl PaneId {
+    fn action_id(self) -> String {
+        match self {
+            Self::Terminal(id) => format!("terminal_{id}"),
+            Self::Plugin(id) => format!("plugin_{id}"),
+        }
+    }
+}
+
+/// The subset of `list-panes --all --json` used for safe destination focus.
+/// Optional fields keep the decoder tolerant of supported-version additions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct PaneInfo {
+    pub id: u32,
+    pub is_plugin: bool,
+    #[serde(default)]
+    pub title: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub is_focused: bool,
+    #[serde(default)]
+    pub tab_name: String,
+    #[serde(default)]
+    pub terminal_command: Option<String>,
+    #[serde(default)]
+    pub pane_command: Option<String>,
+    #[serde(default)]
+    pub exited: bool,
+}
+
+impl PaneInfo {
+    pub fn pane_id(&self) -> PaneId {
+        if self.is_plugin {
+            PaneId::Plugin(self.id)
+        } else {
+            PaneId::Terminal(self.id)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedPaneRole {
+    Sidebar,
+    Details,
+    Agent,
+    Shell,
+    Lazygit,
+}
+
+/// Which Zellij command scope owns a freshly discovered pane ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneFocusTarget {
+    CurrentClient(PaneId),
+    TargetSession { session: String, pane: PaneId },
+}
+
+pub fn pane_focus_target(
+    origin_session: Option<&str>,
+    target_session: &str,
+    pane: PaneId,
+) -> PaneFocusTarget {
+    if origin_session == Some(target_session) {
+        PaneFocusTarget::CurrentClient(pane)
+    } else {
+        PaneFocusTarget::TargetSession {
+            session: target_session.to_string(),
+            pane,
+        }
+    }
+}
+
+/// Decode panes from Zellij 0.45's typed pane list. The `--all` flag includes
+/// tab identity and the plugin/terminal discriminator; terminal IDs alone are
+/// not unique across those two kinds.
+pub fn parse_panes_json(stdout: &str) -> Result<Vec<PaneInfo>> {
+    serde_json::from_str(stdout.trim())
+        .context("parse `zellij action list-panes --all --json` output")
+}
+
+pub fn list_panes(session: &str) -> Result<Vec<PaneInfo>> {
+    parse_panes_json(&in_session(
+        session,
+        &["action", "list-panes", "--all", "--json"],
+    )?)
+}
+
+fn role_matches(pane: &PaneInfo, role: GeneratedPaneRole) -> bool {
+    identify_generated_role(pane) == Some(role)
+}
+
+fn identify_generated_role(pane: &PaneInfo) -> Option<GeneratedPaneRole> {
+    if pane.is_plugin || pane.exited {
+        return None;
+    }
+    // Zellij exposes a user-renamable title, not a separate immutable role
+    // field. Never infer an agent from its harness process; ambiguous or
+    // renamed panes safely fall back to tab-only navigation.
+    match pane.title.as_str() {
+        "sidebar" => Some(GeneratedPaneRole::Sidebar),
+        "details" => Some(GeneratedPaneRole::Details),
+        "agent" => Some(GeneratedPaneRole::Agent),
+        "shell" => Some(GeneratedPaneRole::Shell),
+        "lazygit" => Some(GeneratedPaneRole::Lazygit),
+        _ => None,
+    }
+}
+
+/// Resolve one generated role within its tab only. Ambiguous roles are
+/// deliberately left unresolved and callers retain safe tab-only navigation.
+pub fn resolve_generated_pane(
+    session: &str,
+    tab_id: u32,
+    role: GeneratedPaneRole,
+) -> Result<Option<PaneInfo>> {
+    if !session_is_live(session)? {
+        return Ok(None);
+    }
+    let matches: Vec<_> = list_panes(session)?
+        .into_iter()
+        .filter(|pane| pane.tab_id == tab_id && role_matches(pane, role))
+        .collect();
+    Ok((matches.len() == 1).then(|| matches[0].clone()))
+}
+
+/// Focus a pane ID if it still exists and belongs to the requested tab.
+/// Focus a pane in the session containing this process. Use after switching
+/// this Zellij client to the target session so other attached clients are not
+/// deliberately moved by a session-scoped action.
+pub fn focus_pane_here(pane: PaneId) -> Result<()> {
+    action(&["focus-pane-id", &pane.action_id()])?;
+    let focused = list_panes_here()?
+        .into_iter()
+        .any(|candidate| candidate.pane_id() == pane && candidate.is_focused && !candidate.exited);
+    if !focused {
+        anyhow::bail!("Zellij did not confirm focus of pane {}", pane.action_id());
+    }
+    Ok(())
+}
+
+/// Return focus from a Swamp navigation pane to the generated terminal in the
+/// currently active repository tab. The dashboard returns to its shell; a
+/// worktree tab returns to its suspended/running agent. Refuse to guess when
+/// pane roles are ambiguous or the selected pane has exited.
+pub fn focus_active_terminal(session: &str, dashboard_tab: &str) -> Result<()> {
+    if std::env::var("ZELLIJ_SESSION_NAME").as_deref() != Ok(session) {
+        anyhow::bail!("current Zellij client is not attached to session {session}");
+    }
+    let Some(tab_id) = active_tab_id()? else {
+        anyhow::bail!("active tab is unavailable");
+    };
+    let tabs = list_tabs_here()?;
+    let tab = tabs
+        .into_iter()
+        .find(|tab| tab.tab_id == tab_id)
+        .ok_or_else(|| anyhow::anyhow!("active tab {tab_id} is unavailable"))?;
+    let role = if crate::badge::canonical_tab_name(&tab.name) == dashboard_tab {
+        GeneratedPaneRole::Shell
+    } else {
+        GeneratedPaneRole::Agent
+    };
+    let pane = resolve_generated_pane(session, tab_id, role)?.ok_or_else(|| {
+        anyhow::anyhow!("generated terminal role is missing, exited, or ambiguous")
+    })?;
+    focus_pane_here(pane.pane_id())
+}
+
+/// Focus the agent terminal for a known destination after a clientless attach.
+/// This uses Zellij's session-targeted action because the caller is not yet a
+/// pane in that session.
+pub fn focus_role_in_session(session: &str, tab_id: u32, role: GeneratedPaneRole) -> Result<()> {
+    if client_count(session)? != 1 {
+        anyhow::bail!(
+            "cannot confirm a client-specific pane focus while multiple clients are attached to {session}"
+        );
+    }
+    let pane = resolve_generated_pane(session, tab_id, role)?
+        .ok_or_else(|| anyhow::anyhow!("generated pane role is missing, exited, or ambiguous"))?;
+    focus_pane_in_session(session, tab_id, pane.pane_id())
+}
+
+/// Focus a freshly discovered pane through a target-session action and verify
+/// Zellij reports that exact target pane focused in that session. Callers must
+/// only use this when the destination has one client, since `--session` does
+/// not address a particular client.
+pub fn focus_pane_in_session(session: &str, tab_id: u32, pane: PaneId) -> Result<()> {
+    if !session_is_live(session)? {
+        anyhow::bail!("session {session} is not live");
+    }
+    if !list_panes(session)?.iter().any(|candidate| {
+        candidate.tab_id == tab_id && candidate.pane_id() == pane && !candidate.exited
+    }) {
+        anyhow::bail!(
+            "pane {} is no longer present in tab {tab_id}",
+            pane.action_id()
+        );
+    }
+    in_session(session, &["action", "focus-pane-id", &pane.action_id()]).map(drop)?;
+    if !list_panes(session)?.iter().any(|candidate| {
+        candidate.tab_id == tab_id
+            && candidate.pane_id() == pane
+            && candidate.is_focused
+            && !candidate.exited
+    }) {
+        anyhow::bail!(
+            "Zellij did not confirm focus of pane {} in session {session}",
+            pane.action_id()
+        );
+    }
+    Ok(())
+}
+
 fn parse_tabs_json(stdout: &str) -> Result<Vec<TabInfo>> {
     serde_json::from_str(stdout.trim()).context("parse `zellij action list-tabs --json` output")
 }
@@ -115,6 +334,16 @@ fn in_session(session: &str, args: &[&str]) -> Result<String> {
 /// The tabs of `session`, which can be a session other than the current one.
 pub fn list_tabs(session: &str) -> Result<Vec<TabInfo>> {
     parse_tabs_json(&in_session(session, &["action", "list-tabs", "--json"])?)
+}
+
+/// Whether a canonical worktree tab is already present. Attention badges are
+/// display-only and do not alter the identity check.
+pub fn worktree_tab_exists(session: Option<&str>, name: &str) -> Result<bool> {
+    let tabs = match session {
+        Some(session) => list_tabs(session)?,
+        None => list_tabs_here()?,
+    };
+    Ok(find_tab(&tabs, name).is_some())
 }
 
 fn parse_client_count(stdout: &str) -> usize {
@@ -239,6 +468,21 @@ fn list_tabs_here() -> Result<Vec<TabInfo>> {
         );
     }
     parse_tabs_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn list_panes_here() -> Result<Vec<PaneInfo>> {
+    let out = Command::new("zellij")
+        .args(["action", "list-panes", "--all", "--json"])
+        .output()
+        .context("zellij action list-panes")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "zellij action list-panes exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_panes_json(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// The ID of the active tab in the current session, from the `active` field
@@ -447,6 +691,81 @@ mod exec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PANE_FIXTURE_045: &str =
+        include_str!("../tests/fixtures/zellij-0.45-list-panes-all.json");
+
+    #[test]
+    fn typed_pane_fixture_preserves_kind_tab_and_treats_renamed_roles_as_unknown() {
+        let panes = parse_panes_json(PANE_FIXTURE_045).unwrap();
+        let plugin = panes.iter().find(|pane| pane.is_plugin).unwrap();
+        let sidebar = panes
+            .iter()
+            .find(|pane| pane.id == 0 && !pane.is_plugin)
+            .unwrap();
+        assert_eq!(plugin.pane_id(), PaneId::Plugin(0));
+        assert_eq!(sidebar.pane_id(), PaneId::Terminal(0));
+        assert_eq!(sidebar.tab_name, "feature");
+        assert!(!role_matches(sidebar, GeneratedPaneRole::Sidebar));
+        assert!(!role_matches(&panes[2], GeneratedPaneRole::Agent));
+        assert!(role_matches(&panes[3], GeneratedPaneRole::Agent));
+        assert!(!role_matches(&panes[0], GeneratedPaneRole::Agent));
+    }
+
+    #[test]
+    fn generated_role_resolution_is_tab_scoped_and_ambiguity_safe() {
+        let panes = parse_panes_json(PANE_FIXTURE_045).unwrap();
+        let matches: Vec<_> = panes
+            .iter()
+            .filter(|pane| pane.tab_id == 3 && role_matches(pane, GeneratedPaneRole::Agent))
+            .collect();
+        assert!(
+            matches.is_empty(),
+            "renamed pane must use safe tab-only fallback"
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .filter(|pane| pane.tab_id == 4 && role_matches(pane, GeneratedPaneRole::Agent))
+                .count(),
+            1
+        );
+        let mut ambiguous = panes.clone();
+        let mut duplicate = ambiguous[3].clone();
+        duplicate.id = 9;
+        ambiguous.push(duplicate);
+        assert_eq!(
+            ambiguous
+                .iter()
+                .filter(|p| p.tab_id == 4 && role_matches(p, GeneratedPaneRole::Agent))
+                .count(),
+            2
+        );
+        assert!(!role_matches(
+            &PaneInfo {
+                exited: true,
+                ..panes[3].clone()
+            },
+            GeneratedPaneRole::Agent
+        ));
+    }
+
+    #[test]
+    fn foreign_session_pane_id_is_never_sent_to_the_originating_client_scope() {
+        let pane = PaneId::Terminal(1);
+        assert_eq!(
+            pane_focus_target(Some("source"), "destination", pane),
+            PaneFocusTarget::TargetSession {
+                session: "destination".into(),
+                pane
+            },
+            "equal numeric pane IDs in two sessions still require destination-scoped actions",
+        );
+        assert_eq!(
+            pane_focus_target(Some("destination"), "destination", pane),
+            PaneFocusTarget::CurrentClient(pane)
+        );
+    }
 
     #[test]
     fn parse_tabs_json_reads_id_position_and_name() {

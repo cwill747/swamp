@@ -1,0 +1,60 @@
+[
+  {
+    "id": 0,
+    "is_plugin": true,
+    "is_focused": false,
+    "is_fullscreen": false,
+    "is_floating": false,
+    "is_suppressed": true,
+    "title": "room plugin",
+    "exited": false,
+    "tab_id": 3,
+    "tab_position": 1,
+    "tab_name": "feature"
+  },
+  {
+    "id": 0,
+    "is_plugin": false,
+    "is_focused": false,
+    "is_fullscreen": false,
+    "is_floating": false,
+    "is_suppressed": false,
+    "title": "sidebar renamed",
+    "exited": false,
+    "terminal_command": "/usr/bin/swamp tui --view sidebar",
+    "pane_command": "swamp tui --view sidebar",
+    "tab_id": 3,
+    "tab_position": 1,
+    "tab_name": "feature"
+  },
+  {
+    "id": 1,
+    "is_plugin": false,
+    "is_focused": true,
+    "is_fullscreen": false,
+    "is_floating": false,
+    "is_suppressed": false,
+    "title": "agent renamed",
+    "exited": false,
+    "terminal_command": "/bin/fish -C 'codex --resume abc'",
+    "pane_command": "codex --resume abc",
+    "tab_id": 3,
+    "tab_position": 1,
+    "tab_name": "feature"
+  },
+  {
+    "id": 1,
+    "is_plugin": false,
+    "is_focused": false,
+    "is_fullscreen": false,
+    "is_floating": false,
+    "is_suppressed": false,
+    "title": "agent",
+    "exited": false,
+    "terminal_command": "/bin/fish -C 'codex --resume def'",
+    "pane_command": "codex --resume def",
+    "tab_id": 4,
+    "tab_position": 2,
+    "tab_name": "other"
+  }
+]

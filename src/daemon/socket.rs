@@ -56,6 +56,10 @@ pub enum ClientMsg {
         name: String,
         #[serde(default)]
         force: bool,
+        /// Branch identity captured by the confirming UI. Older clients omit
+        /// it; new clients use it to fail closed if a reusable slot changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_branch: Option<String>,
     },
     /// Run non-forced removal checks without mutating the worktree.
     CheckRemoval {
@@ -272,12 +276,12 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
                     }
-                    ClientMsg::RemoveWorktree { name, force } => {
+                    ClientMsg::RemoveWorktree { name, force, expected_branch } => {
                         if let Err(e) = validate_worktree_name(&name) {
                             write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
                             continue;
                         }
-                        match daemon.remove_worktree(&name, force).await {
+                        match daemon.remove_worktree(&name, force, expected_branch.as_deref()).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => {
                                 // Surface a refused-removal distinctly so the TUI
@@ -565,6 +569,8 @@ mod tests {
                     rebase: false,
                     agent: AgentStatus::Idle,
                     agent_ts: 0,
+                    activity_id: None,
+                    completion_id: None,
                     session_name: None,
                     head_ts: 0,
                     harness: None,
@@ -620,6 +626,7 @@ mod tests {
             ClientMsg::RemoveWorktree {
                 name: "feature-x".into(),
                 force: false,
+                expected_branch: None,
             },
             ClientMsg::CheckRemoval {
                 name: "feature-x".into(),

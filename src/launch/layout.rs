@@ -91,15 +91,10 @@ pub(super) fn write_multi_tab_layout(
     let nix = nix_available();
     let mut s = String::new();
     s.push_str("layout {\n");
-    s.push_str("  default_tab_template {\n");
-    s.push_str("    pane size=1 borderless=true {\n");
-    s.push_str("      plugin location=\"tab-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("    children\n");
-    s.push_str("    pane size=2 borderless=true {\n");
-    s.push_str("      plugin location=\"status-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("  }\n");
+    s.push_str(match cfg.dashboard.layout {
+        crate::config::DashboardLayout::Workspace => tab_template(),
+        crate::config::DashboardLayout::Classic => classic_tab_template(),
+    });
 
     // A new session opens to a single focused dashboard tab — for bare and
     // normal repos alike. Worktree tabs are no longer pre-created per worktree;
@@ -110,12 +105,62 @@ pub(super) fn write_multi_tab_layout(
         "  tab name=\"{DASHBOARD_TAB}\" focus=true cwd=\"{}\" {{\n",
         kdl_escape(&session_cwd(worktrees, git_dir)),
     ));
-    push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
+    match cfg.dashboard.layout {
+        crate::config::DashboardLayout::Workspace => {
+            push_workspace_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
+        }
+        crate::config::DashboardLayout::Classic => {
+            push_dashboard_panes(&mut s, cfg, &swamp_bin, nix);
+        }
+    }
     s.push_str("  }\n");
     s.push_str("}\n");
     let tmp = TempLayout::create("layout", &s)?;
     tracing::info!("built single dashboard-tab session layout");
     Ok(tmp)
+}
+
+fn tab_template() -> &'static str {
+    "  default_tab_template {\n    children\n    pane size=1 borderless=true {\n      plugin location=\"zellij:compact-bar\"\n    }\n  }\n"
+}
+
+fn classic_tab_template() -> &'static str {
+    "  default_tab_template {\n    pane size=1 borderless=true {\n      plugin location=\"tab-bar\"\n    }\n    children\n    pane size=2 borderless=true {\n      plugin location=\"status-bar\"\n    }\n  }\n"
+}
+
+fn push_workspace_dashboard_panes(s: &mut String, cfg: &ConfigPaths, swamp_bin: &str, nix: bool) {
+    let sh = user_shell();
+    let shell_glue = nix_entry(
+        &sh,
+        nix,
+        &format!("bash -c 'exec {}'", sh.path),
+        &sh.path,
+        true,
+    );
+    s.push_str(&format!(
+        r#"    pane split_direction="vertical" {{
+      pane command="{swamp_bin}" size="{sidebar_width}" borderless=true focus=true {{
+        args "tui" "--view" "sidebar" "--embedded"
+        name "sidebar"
+      }}
+      pane split_direction="horizontal" size="65%" {{
+        pane command="{swamp_bin}" size="65%" {{
+          args "tui" "--view" "details"
+          name "details"
+        }}
+        pane command="{shell_path}" size="35%" {{
+          args "{run_flag}" "{shell_glue}"
+          name "shell"
+        }}
+      }}
+    }}
+"#,
+        swamp_bin = kdl_escape(swamp_bin),
+        sidebar_width = cfg.dashboard.sidebar_width,
+        shell_path = kdl_escape(&sh.path),
+        run_flag = sh.run_flag,
+        shell_glue = kdl_escape(&shell_glue),
+    ));
 }
 
 /// Generate the layout of the dedicated overview session: one tab with one
@@ -173,20 +218,10 @@ pub(super) fn write_worktree_layout(
         .to_string();
     let mut s = String::new();
     s.push_str("layout {\n");
-    // Mirror the per-tab frame from `write_multi_tab_layout`: a
-    // `default_tab_template` carrying both the tab-bar (top) and status-bar
-    // (bottom). A new-tab layout that omits this leaves the created tab with no
-    // tab header or status bar — they only reappear when you switch to a tab
-    // that *was* built with the template.
-    s.push_str("  default_tab_template {\n");
-    s.push_str("    pane size=1 borderless=true {\n");
-    s.push_str("      plugin location=\"tab-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("    children\n");
-    s.push_str("    pane size=2 borderless=true {\n");
-    s.push_str("      plugin location=\"status-bar\"\n");
-    s.push_str("    }\n");
-    s.push_str("  }\n");
+    s.push_str(match cfg.dashboard.layout {
+        crate::config::DashboardLayout::Workspace => tab_template(),
+        crate::config::DashboardLayout::Classic => classic_tab_template(),
+    });
     s.push_str("  tab {\n");
     // An on-demand worktree tab resumes its recorded Claude session when one
     // exists (`claude --resume <id>`), else starts the agent fresh.
@@ -455,8 +490,46 @@ fn push_worktree_panes(
         nix_entry(&sh, nix, &agent_cmd, &agent_cmd, false)
     );
 
-    s.push_str(&format!(
-        r#"    pane split_direction="vertical" {{
+    let workspace = matches!(
+        cfg.dashboard.layout,
+        crate::config::DashboardLayout::Workspace
+    );
+    let kdl = if workspace {
+        format!(
+            r#"    pane split_direction="vertical" {{
+      pane command="{swamp_bin}" size="{sidebar_width}" borderless=true {{
+        args "tui" "--view" "sidebar" "--embedded"
+        name "sidebar"
+      }}
+      pane split_direction="horizontal" {{
+        pane command="{shell_path}" size="70%" start_suspended=true focus=true {{
+          args "{run_flag}" "{agent_glue}"
+          name "agent"
+        }}
+        pane split_direction="vertical" size="30%" {{
+          pane command="{shell_path}" size="50%" {{
+            args "{run_flag}" "{lazygit_glue}"
+            name "lazygit"
+          }}
+          pane command="{shell_path}" size="50%" {{
+            args "{run_flag}" "{shell_glue}"
+            name "shell"
+          }}
+        }}
+      }}
+    }}
+"#,
+            sidebar_width = cfg.dashboard.sidebar_width,
+            swamp_bin = kdl_escape(swamp_bin),
+            shell_path = kdl_escape(&sh.path),
+            run_flag = sh.run_flag,
+            lazygit_glue = kdl_escape(&lazygit_glue),
+            agent_glue = kdl_escape(&agent_glue),
+            shell_glue = kdl_escape(&shell_glue),
+        )
+    } else {
+        format!(
+            r#"    pane split_direction="vertical" {{
       pane split_direction="horizontal" size="50%" {{
         pane command="{shell_path}" size="65%" {{
           args "{run_flag}" "{lazygit_glue}"
@@ -470,7 +543,7 @@ fn push_worktree_panes(
       pane split_direction="horizontal" size="50%" {{
         pane command="{shell_path}" size="60%" start_suspended=true {{
           args "{run_flag}" "{agent_glue}"
-          name "{bin}"
+          name "agent"
         }}
         pane command="{shell_path}" size="40%" {{
           args "{run_flag}" "{shell_glue}"
@@ -479,14 +552,15 @@ fn push_worktree_panes(
       }}
     }}
 "#,
-        shell_path = kdl_escape(&sh.path),
-        run_flag = sh.run_flag,
-        lazygit_glue = kdl_escape(&lazygit_glue),
-        swamp_bin = kdl_escape(swamp_bin),
-        agent_glue = kdl_escape(&agent_glue),
-        bin = kdl_escape(bin),
-        shell_glue = kdl_escape(&shell_glue),
-    ));
+            shell_path = kdl_escape(&sh.path),
+            run_flag = sh.run_flag,
+            lazygit_glue = kdl_escape(&lazygit_glue),
+            swamp_bin = kdl_escape(swamp_bin),
+            agent_glue = kdl_escape(&agent_glue),
+            shell_glue = kdl_escape(&shell_glue),
+        )
+    };
+    s.push_str(&kdl);
 }
 
 #[cfg(test)]
@@ -580,13 +654,23 @@ mod tests {
             !content.contains("cwd=\"/repo/talks\""),
             "dashboard tab must NOT use bare container as cwd; got:\n{content}"
         );
-        // Dashboard tab should have the four swamp TUI view panes.
-        for view_name in &["worktrees", "ai-status", "resources", "pr-status"] {
+        // Workspace dashboard uses one navigation rail and one details pane.
+        for view_name in &["sidebar", "details"] {
             assert!(
                 content.contains(&format!("\"--view\" \"{}\"", view_name)),
                 "dashboard tab should have --view {view_name} pane; got:\n{content}"
             );
         }
+        assert!(content.contains("plugin location=\"zellij:compact-bar\""));
+        assert!(content.contains("size=\"32\" borderless=true focus=true"));
+        assert!(content.contains("\"--view\" \"sidebar\" \"--embedded\""));
+        assert!(!content.contains("plugin location=\"tab-bar\""));
+        assert!(!content.contains("plugin location=\"status-bar\""));
+        assert!(content.contains("name \"shell\""));
+        assert!(
+            !content.contains("--view\" \"worktrees"),
+            "no legacy panel grid in workspace layout"
+        );
         // The layout should use the current binary, not a bare "swamp" command.
         assert!(
             !content.contains("command=\"swamp\""),
@@ -608,6 +692,26 @@ mod tests {
             content.contains("tab name=\"dashboard\""),
             "the sole tab should be the dashboard; got:\n{content}"
         );
+    }
+
+    #[test]
+    fn classic_layout_preserves_legacy_dashboard_and_chrome() {
+        let _guard = env_guard();
+        let worktrees = vec![make_wt("/repo/main", "main")];
+        let mut cfg = dummy_cfg();
+        cfg.dashboard.layout = crate::config::DashboardLayout::Classic;
+        let layout = write_multi_tab_layout(&worktrees, "demo", &cfg, &dummy_git_dir()).unwrap();
+        let content = std::fs::read_to_string(&layout).unwrap();
+        let _ = std::fs::remove_file(&layout);
+        for view in ["worktrees", "resources", "ai-status", "pr-status"] {
+            assert!(
+                content.contains(&format!("\"--view\" \"{view}\"")),
+                "classic panel {view} missing: {content}"
+            );
+        }
+        assert!(content.contains("plugin location=\"tab-bar\""));
+        assert!(content.contains("plugin location=\"status-bar\""));
+        assert!(!content.contains("compact-bar"));
     }
 
     /// The launch layout is dashboard-only: the tab count does not track the
@@ -802,7 +906,7 @@ mod tests {
         );
     }
 
-    /// A Codex harness resolves `codex` on PATH, names the pane `codex`, and
+    /// A Codex harness resolves `codex` on PATH, names the pane `agent`, and
     /// never resumes — Codex notify gives us no resumable id.
     #[test]
     fn worktree_panes_codex_launches_codex_fresh() {
@@ -823,7 +927,10 @@ mod tests {
             s.contains("command -v codex"),
             "codex resolved on PATH; got:\n{s}"
         );
-        assert!(s.contains("name \"codex\""), "pane named codex; got:\n{s}");
+        assert!(
+            s.contains("name \"agent\""),
+            "stable role name agent; got:\n{s}"
+        );
         assert!(
             !s.contains("--resume"),
             "codex never resumes even with a recorded id; got:\n{s}"
@@ -852,6 +959,8 @@ mod tests {
             None,
             Harness::Claude,
         );
+        assert!(s.contains("size=\"32\" borderless=true"));
+        assert!(s.contains("\"--view\" \"sidebar\" \"--embedded\""));
         // Agent is not exec'd, and the shell follows once it returns.
         assert!(
             s.contains("$cp; exec /bin/bash"),

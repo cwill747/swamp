@@ -350,6 +350,8 @@ mod tests {
             rebase: false,
             agent,
             agent_ts,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts: 0,
             harness: None,

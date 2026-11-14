@@ -1,0 +1,24 @@
+Spaces >  !1 ~1 +1 -0  │ swamp
+>v swamp               │ swamp / Live
+ ~ @ Herdr-style dashbo│ /repos/swamp/.bare
+ ? * main Unknown      │
+ + Review parser Done  │ Resources (selected repository)
+ v papr  !1            │
+ ! Fix flaky tests Wait│ Enter Open agent   g Go To   c Create   m More
+Agents  !1 ~1 +1 -0    │ Outside Zellij: paths available; terminal opening
+ ! Fix flaky tests Wait│ disabled
+ + Review parser Done  │
+ ~ @ Herdr-style dashbo│
+ ~ @   Review parser Wo│
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+/ search  g Go To  l details  ? help

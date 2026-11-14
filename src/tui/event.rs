@@ -38,11 +38,16 @@ pub(super) enum AppEvent {
     InputError(String),
     /// A non-forced delete was refused; re-open the confirmation as a force
     /// override. Carries `(worktree_name, reason_description)`.
-    DeleteNeedsForce(String, String),
+    DeleteNeedsForce {
+        name: String,
+        reason: String,
+        expected_branch: Option<String>,
+    },
     /// Result of the on-demand check before `D` closes its own tab.
     DeleteTabCheckDone {
         name: String,
         path: PathBuf,
+        branch: String,
         result: Result<Option<String>, String>,
     },
 }
@@ -252,7 +257,11 @@ where
                 app.input = None;
                 app.status_msg = Some(msg);
             }
-            AppEvent::DeleteNeedsForce(name, reason) => {
+            AppEvent::DeleteNeedsForce {
+                name,
+                reason,
+                expected_branch,
+            } => {
                 // The daemon refused; re-prompt as a force override so the user
                 // can decide whether to proceed. `close_tab` is always false
                 // here: this path only fires for a direct `RemoveWorktree`
@@ -261,16 +270,44 @@ where
                 // which closes a tab on this retry either.
                 app.pending_delete = None;
                 app.status_msg = None;
+                if expected_branch.as_ref().is_some_and(|expected| {
+                    !app.snapshot
+                        .rows
+                        .iter()
+                        .any(|row| row.name == name && &row.branch == expected)
+                }) {
+                    app.status_msg =
+                        Some("Destination changed during delete; force was not offered".into());
+                    continue;
+                }
                 app.input = Some(InputMode::ConfirmDelete {
                     name,
                     force_reason: Some(reason),
                     close_tab: false,
                 });
             }
-            AppEvent::DeleteTabCheckDone { name, path, result } => {
+            AppEvent::DeleteTabCheckDone {
+                name,
+                path,
+                branch,
+                result,
+            } => {
                 app.status_msg = None;
+                let identity_matches = super::workspace::delete_check_target_matches(
+                    &app.snapshot,
+                    &name,
+                    &path,
+                    &branch,
+                );
+                if !identity_matches {
+                    app.status_msg =
+                        Some("Destination changed during delete check; tab remains open".into());
+                    continue;
+                }
                 match result {
-                    Ok(None) => crate::launch::spawn_delete_tab(&name, &path, common, false),
+                    Ok(None) => {
+                        crate::launch::spawn_delete_tab(&name, &path, common, false, Some(&branch))
+                    }
                     Ok(Some(reason)) => {
                         app.input = Some(InputMode::ConfirmDelete {
                             name,

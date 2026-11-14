@@ -904,7 +904,12 @@ impl Daemon {
     /// background. The old behavior — `refresh_all_unlocked().await` inline —
     /// made the client wait out a status scan of *every* remaining worktree
     /// (which scales with worktree count) before the row could disappear.
-    pub async fn remove_worktree(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+    pub async fn remove_worktree(
+        self: &Arc<Self>,
+        name: &str,
+        force: bool,
+        expected_branch: Option<&str>,
+    ) -> Result<()> {
         let snap = {
             let mut s = self.state.write().await;
             s.mark_deleting(name);
@@ -929,9 +934,27 @@ impl Daemon {
             };
             let common = self.common_dir.clone();
             let name = name.to_string();
+            let expected_branch = expected_branch.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 // Serialize with slot operations from the CLI and other clients.
                 let _slots = crate::worktree::slots::lock(&common)?;
+                if let Some(expected) = expected_branch {
+                    let wt = crate::worktree::list_worktrees(&common)?
+                        .into_iter()
+                        .find(|wt| wt.name() == name)
+                        .with_context(|| format!("worktree {name} no longer exists"))?;
+                    let info = crate::worktree::git_info(&wt.path)?;
+                    let actual = if info.branch.is_empty() || info.branch == "(detached)" {
+                        wt.branch
+                    } else {
+                        info.branch
+                    };
+                    if actual != expected {
+                        anyhow::bail!(
+                            "worktree {name} changed branch from {expected} to {actual}; refusing removal"
+                        );
+                    }
+                }
                 crate::worktree::remove_worktree(&common, &name, true, force, pr_state, pr_head_oid)
             })
             .await
@@ -1277,6 +1300,8 @@ mod tests {
             rebase: false,
             agent: crate::daemon::state::AgentStatus::Idle,
             agent_ts: 0,
+            activity_id: None,
+            completion_id: None,
             session_name: None,
             head_ts: 0,
             harness: None,
@@ -1607,8 +1632,34 @@ mod tests {
         daemon.state.write().await.update_prs(prs);
         daemon.check_worktree_removal("feature").await.unwrap();
 
-        daemon.remove_worktree("feature", false).await.unwrap();
+        daemon
+            .remove_worktree("feature", false, None)
+            .await
+            .unwrap();
         assert!(!wt.path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_when_confirmed_branch_identity_changed() {
+        use crate::worktree::create_worktree;
+        use crate::worktree::test_support::{git_available, setup};
+
+        if !git_available() {
+            return;
+        }
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+        let daemon = build_daemon(&bare).await;
+        daemon.refresh_all().await.unwrap();
+
+        let error = daemon
+            .remove_worktree("feature", true, Some("reassigned-branch"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed branch"));
+        assert!(wt.path.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

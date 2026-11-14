@@ -5,6 +5,7 @@ mod input;
 mod state;
 mod theme;
 pub(crate) mod view;
+mod workspace;
 
 pub(crate) use state::{
     AppState, CreateEntry, CreatePicker, CreateStep, HitRegions, InputMode, PrHit,
@@ -24,7 +25,13 @@ use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool) -> Result<()> {
+pub async fn run(dir: Option<PathBuf>, view: TuiView, pin_cwd: bool, embedded: bool) -> Result<()> {
+    if matches!(
+        view,
+        TuiView::Workspace | TuiView::Sidebar | TuiView::Details
+    ) {
+        return workspace::run(dir, view, pin_cwd, embedded).await;
+    }
     let cwd = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,

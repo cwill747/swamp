@@ -111,7 +111,7 @@ session named after the repo. The session name is `{repo-basename}-{4-hex}`
 (e.g. `myrepo-3b8b`) so two repos with the same directory name but different
 paths get distinct sessions. A new session opens to a single dashboard tab — for
 bare clones and normal repos alike. The dashboard lists every worktree; open a
-worktree's own tab on demand (`Enter` or double-click), and swamp switches to it
+worktree's own tab on demand (`Enter` or single-click), and swamp switches to it
 if it is already open. The tab count is no longer tied to the worktree count,
 and tabs you open stay part of the Zellij session across detach/reattach.
 
@@ -173,12 +173,23 @@ that a subagent took stays busy until you release it.
 
 ### `swamp tui`
 
-Runs the status TUI. This is normally embedded in each Zellij tab, but it can be
-started directly:
+Runs the workspace with Spaces above Agents, a searchable cross-repository
+inventory, and selected-destination details. Generated Zellij tabs keep the
+navigation rail beside real terminals; the agent pane stays suspended until
+you start it. It can also be started directly:
 
 ```bash
 swamp tui
+swamp tui --view sidebar
+swamp tui --view details
+swamp tui --view all        # original four-panel view
 ```
+
+Explicit `worktrees`, `ai-status`, `resources`, and `pr-status` views retain their
+panel behavior. Outside Zellij, workspace displays paths and status; opening a
+terminal is disabled. Discovery never starts stopped repositories. Enter on a
+stopped repository explicitly starts it; cross-repository navigation switches
+flat sessions. Selecting a subagent opens its parent's agent pane.
 
 Useful keys:
 
@@ -186,7 +197,17 @@ Useful keys:
 | --------- | ----------------------------------- |
 | `j` / `↓` | Move selection down                 |
 | `k` / `↑` | Move selection up                   |
-| `Enter`   | Open or switch to the selected worktree tab |
+| `Tab`     | Switch Spaces / Agents              |
+| `←` / `→` | Collapse / expand a repository      |
+| `Enter`   | Open selected agent (single-click also opens) |
+| `/` / `g` | Go To: search titles, repo, branch, path, harness, subagents |
+| `f`       | Filters: `a` All, `b` Waiting, `w` Working, `d` Done, `i` Idle |
+| `[` / `]` | Visit previous / next attention destination |
+| `v`       | Mark the selected completion seen   |
+| `l`       | Details drill-in on narrow screens  |
+| `Esc`     | Cancel overlay / clear search       |
+| `?`       | Contextual help                     |
+| `m`       | More actions                        |
 | `c`       | Create a worktree                   |
 | `d`       | Delete the selected worktree        |
 | `D`       | Delete the worktree this pane lives in and close its tab |
@@ -195,8 +216,31 @@ Useful keys:
 | `r`       | Refresh status                      |
 | `u`       | Update branches                     |
 | `O`       | Open the cross-repo overview        |
-| `K`       | Kill the swamp session              |
-| `q`       | Quit                                |
+| `K`       | Confirm stopping the repo session and agents |
+| `q`       | Exit standalone / return to terminal from a navigation pane |
+
+In search, printable keys always edit text; Tab switches to the filter controls.
+Keyboard movement and wheel scrolling only browse. Chevron clicks only expand
+or collapse. Mutations support the current repository; foreign rows offer Open
+Repo instead of applying an action to the pane's working directory.
+
+Waiting (`!`), Working (`~`), unseen Done (`+`), Idle (`-`), and Unknown (`?`)
+remain distinguishable with `SWAMP_ASCII=1` and without color. Done requires a
+confirmed observed completion; older daemons keep their original status.
+The selection caret (`>`) is separate from the active location (`@`) and trunk
+marker (`*`); active rows keep their state symbol.
+An explicit successful agent-pane visit or `v` acknowledges that exact completion
+across local views. Native Zellij tab navigation and tab-only partial jumps do
+not acknowledge Done. A later completion stays unseen.
+
+Use your native Zellij pane focus, tab, resize, fullscreen, and detach controls;
+Swamp does not change the global prefix. Ordinary keys in the shell or agent
+go straight to that application. Fullscreen reclaims terminal space when the
+sidebar is too narrow. Closing a sidebar or detaching leaves agents running.
+
+The generated Zellij 0.45 dashboard composition is captured at
+[`tests/fixtures/workspace/zellij-0.45-captures/`](tests/fixtures/workspace/zellij-0.45-captures/),
+with pane dumps and 120x36 / 160x48 terminal transcripts.
 
 A deletion that git refuses without `--force` (uncommitted changes, unpushed
 commits, ...) opens a floating Zellij pane showing the reason plus the
@@ -314,8 +358,9 @@ swamp serve
 swamp serve --foreground
 ```
 
-Most users do not need this command; `swamp` and `swamp tui` start the daemon on
-demand.
+Most users do not need this command; `swamp` and legacy single-repo TUI views
+start the daemon on demand. Workspace views discover existing daemons through
+the shared broker.
 
 ### `swamp kill`
 
@@ -447,6 +492,9 @@ default; missing values fall back to built-in defaults.
 
 ```toml
 [dashboard]
+layout = "workspace"     # or "classic"
+sidebar_width = 32        # cells; 16–60
+# These percentages apply only to classic:
 worktrees_column = 33
 ai_column        = 34
 shell_column     = 33
@@ -461,6 +509,25 @@ enabled = true
 
 Set `[harness] default = "choose"` to pick Claude or Codex per worktree from the
 TUI with `h`.
+
+Workspace is the default for newly generated layouts, even when an existing
+config contains only classic percentages. Existing live sessions attach with
+their current layout and processes; changing presentation does not restart
+agents. Newly opened tabs can coexist with older tabs.
+
+To deliberately recreate a session, finish or preserve its terminal work, run
+`swamp kill`, then `swamp launch`. To roll back the presentation, first set
+`[dashboard] layout = "classic"`, then recreate it the same way. This is an
+explicit session stop; attaching after an upgrade never performs a cosmetic
+migration. Additive completion metadata is readable by older versions, though
+an older version rewriting status may discard it.
+
+Rendered workspace fixtures are in [tests/fixtures/workspace](tests/fixtures/workspace).
+Real Zellij 0.45.0 captures show the generated dashboard at
+[120×36](tests/fixtures/workspace/zellij-0.45-composed-120x36.txt) and
+[160×48](tests/fixtures/workspace/zellij-0.45-composed-160x48.txt); pane records
+and ANSI source captures are in
+[zellij-0.45-captures](tests/fixtures/workspace/zellij-0.45-captures).
 
 ### Attention badges
 
@@ -521,13 +588,17 @@ never runs commands that someone else chose. User hooks run first.
 | `$XDG_CONFIG_HOME/swamp/lazygit.yml`  | Managed lazygit config               |
 | `<git-common-dir>/.swamp-status.json` | Per-worktree agent status            |
 | `$XDG_STATE_HOME/swamp/repos.json`    | Registry of repos swamp has launched |
+| `$XDG_STATE_HOME/swamp/seen.json`     | Shared exact-completion acknowledgements |
+| `$XDG_RUNTIME_DIR/swamp/workspace.sock` | Versioned singleton workspace broker |
+| `$XDG_RUNTIME_DIR/swamp/ui/<session>.json` | Shared sidebar/details selection |
 | `<git-common-dir>/swamp/config.toml`  | Per-repository slot settings         |
 | `<git-common-dir>/swamp/branches.json` | Per-branch sessions and titles      |
 | `<git-common-dir>/swamp/pins/`        | Slot pins                            |
 | `<git-common-dir>/swamp/slots.lock`   | Lock for slot operations             |
 | `$XDG_RUNTIME_DIR/swamp/<id>.sock`    | Daemon Unix socket                   |
 | `$XDG_RUNTIME_DIR/swamp/<id>.pid`     | Daemon PID file                      |
-| `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Single-instance lock of `swamp aggregate` |
+| `$XDG_RUNTIME_DIR/swamp/workspace.lock` | Single-instance workspace broker lock |
+| `$XDG_RUNTIME_DIR/swamp/aggregator.lock` | Attention-count owner lock; retained for upgrade handoff |
 
 ## Contributing
 

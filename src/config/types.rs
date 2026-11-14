@@ -208,11 +208,16 @@ pub fn resolve_harness(setting: HarnessSetting, override_: Option<Harness>) -> H
     }
 }
 
-/// Dashboard layout knobs. The dashboard is three side-by-side columns; these
-/// percentages set each column's width and should sum to ~100.
+/// Dashboard layout and sizing knobs. The percentage settings remain available
+/// for the explicit classic layout.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
+    /// Generated layout: the Herdr-style workspace or the legacy classic grid.
+    pub layout: DashboardLayout,
+    /// Width in cells of the workspace sidebar (16..=60).
+    #[serde(deserialize_with = "deserialize_sidebar_width")]
+    pub sidebar_width: u16,
     /// Width (%) of the left column (worktrees + resources panes).
     pub worktrees_column: u16,
     /// Width (%) of the middle column (ai-status + pr-status panes).
@@ -221,13 +226,73 @@ pub struct DashboardConfig {
     pub shell_column: u16,
 }
 
+fn deserialize_sidebar_width<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct WidthVisitor;
+    impl Visitor<'_> for WidthVisitor {
+        type Value = u16;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an integer from 16 through 60")
+        }
+
+        fn visit_i64<E: Error>(self, value: i64) -> Result<Self::Value, E> {
+            if (16..=60).contains(&value) {
+                Ok(value as u16)
+            } else {
+                Err(E::custom(
+                    "[dashboard] sidebar_width must be between 16 and 60",
+                ))
+            }
+        }
+
+        fn visit_u64<E: Error>(self, value: u64) -> Result<Self::Value, E> {
+            if (16..=60).contains(&value) {
+                Ok(value as u16)
+            } else {
+                Err(E::custom(
+                    "[dashboard] sidebar_width must be between 16 and 60",
+                ))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(WidthVisitor)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DashboardLayout {
+    #[default]
+    Workspace,
+    Classic,
+}
+
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
+            layout: DashboardLayout::Workspace,
+            sidebar_width: 32,
             worktrees_column: 33,
             ai_column: 34,
             shell_column: 33,
         }
+    }
+}
+
+impl DashboardConfig {
+    /// Validate values whose ranges are part of the generated layout contract.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (16..=60).contains(&self.sidebar_width),
+            "[dashboard] sidebar_width must be between 16 and 60"
+        );
+        Ok(())
     }
 }
 
@@ -259,6 +324,8 @@ mod tests {
     fn default_config_toml_parses_to_defaults() {
         let cfg: SwampConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
         let def = DashboardConfig::default();
+        assert_eq!(cfg.dashboard.layout, DashboardLayout::Workspace);
+        assert_eq!(cfg.dashboard.sidebar_width, 32);
         assert_eq!(cfg.dashboard.worktrees_column, def.worktrees_column);
         assert_eq!(cfg.dashboard.ai_column, def.ai_column);
         assert_eq!(cfg.dashboard.shell_column, def.shell_column);
@@ -272,8 +339,30 @@ mod tests {
         // Unset fields keep their defaults.
         assert_eq!(cfg.dashboard.worktrees_column, 33);
         assert_eq!(cfg.dashboard.ai_column, 34);
+        assert_eq!(cfg.dashboard.layout, DashboardLayout::Workspace);
+        assert_eq!(cfg.dashboard.sidebar_width, 32);
         // An absent [harness] block defaults to Claude.
         assert_eq!(cfg.harness.default, HarnessSetting::Claude);
+    }
+
+    #[test]
+    fn dashboard_layout_config_keeps_classic_knobs_and_validates_sidebar_width() {
+        let cfg: SwampConfig = toml::from_str(
+            "[dashboard]\nlayout = 'classic'\nsidebar_width = 60\nworktrees_column = 25\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.dashboard.layout, DashboardLayout::Classic);
+        assert_eq!(cfg.dashboard.sidebar_width, 60);
+        assert_eq!(cfg.dashboard.worktrees_column, 25);
+        assert!(cfg.dashboard.validate().is_ok());
+        for width in [-1_i64, 0, 15, 61, 65_536, i64::MAX] {
+            let error =
+                toml::from_str::<SwampConfig>(&format!("[dashboard]\nsidebar_width = {width}\n"))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("between 16 and 60"), "{width}: {error}");
+        }
+        assert!(toml::from_str::<SwampConfig>("[dashboard]\nlayout = 'other'\n").is_err());
     }
 
     #[test]

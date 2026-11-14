@@ -1,0 +1,48 @@
+Spaces >  !1 ~1 +0 -0          │                                                             details
+ v capture120  !1              │Build agent
+   Live                        │capture160 / Live
+ ! * Fixture agent             │Path     /tmp/swamp-herdr-final/capture160/
+   main / trunk / Waiting      │Branch   main (trunk)
+ v capture160                  │Slot     overflow
+   Live                        │Title    Some(Session)
+>~ * Build agent               │Git      0 staged / 0 unstaged / 0 untracked
+   main / trunk / Working      │         +0 ahead / -0 behind
+Agents  !1 ~1 +0 -0            │Agent    unknown harness / Working / status 809s ago
+ ! * Fixture agent             │
+   capture120 / main / trunk / │Resources (selected repository)
+ ~ *   Explore                 │CPU 4.4% / RSS 165M / load 1.83
+     capture120 / subagent → pa│3317833 1.6% 20M swamp
+ ~ * Build agent               │3317802 1.4% 90M zellij
+   capture160 / main / trunk / │3317831 1.3% 19M swamp
+                               │3317794 0.1% 24M zellij
+                               │3317844 0.0% 11M fish
+                               │
+                               │Enter Open agent   g Go To   c Create   m More
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │/ search  g Go To  l details  ? help
+                               ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                               │                                                              shell
+                               │cameron@dev-vm /t/s/capture160 (main)>
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+/ search  g Go To  l details  ?│
+ Zellij (capture160-b251) NORMAL  dashboard ●1 [ ]                                                                                                    BASE 

@@ -30,10 +30,12 @@
           # match the workflow YAML.
           srcDir = "${toString ./src}/";
           ymlFilter = path: pkgs.lib.hasSuffix ".yml" path && pkgs.lib.hasPrefix srcDir path;
+          fixtureFilter = path: pkgs.lib.hasPrefix "${toString ./tests}/fixtures/" path;
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
               (ymlFilter path)
+              || (fixtureFilter path)
               || (pkgs.lib.hasSuffix ".toml" path)
               || (craneLib.filterCargoSources path type);
           };
@@ -99,6 +101,7 @@
                 src = ./.;
                 filter = path: type:
                   (ymlFilter path)
+                  || (fixtureFilter path)
                   || (pkgs.lib.hasSuffix ".toml" path)
                   || (craneLibStatic.filterCargoSources path type);
               };

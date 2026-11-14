@@ -1,0 +1,21 @@
+Fixture agent
+capture120 / Live
+Path     /tmp/swamp-herdr-final/capture120/
+Branch   main (trunk)
+Slot     overflow
+Title    Some(Session)
+Git      0 staged / 0 unstaged / 0 untracked
+         +0 ahead / -0 behind
+Agent    unknown harness / Waiting / status 649s ago
+  Subagent Explore: Running / sub1 (opens parent)
+
+Resources (selected repository)
+CPU 4.7% / RSS 151M / load 2.61
+3314831 1.5% 77M zellij
+3314858 1.4% 20M swamp
+3314856 1.3% 19M swamp
+3314872 0.3% 11M fish
+3314827 0.2% 24M zellij
+
+Enter Open agent   g Go To   c Create   m More
+/ search  g Go To  l details  ? help
