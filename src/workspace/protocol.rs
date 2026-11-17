@@ -17,6 +17,9 @@ pub enum ClientMessage {
     Subscribe {
         version: u16,
         selected_repo: Option<String>,
+        // Legacy clients omit this field and must only see local rows.
+        #[serde(default)]
+        include_remote: bool,
     },
     SelectRepo {
         repo_id: Option<String>,
@@ -35,6 +38,9 @@ pub struct WorkspaceState {
     pub version: u16,
     pub revision: u64,
     pub repositories: Vec<Repository>,
+    // Absent when a client connects to a broker from an older release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<super::remote::Host>>,
     pub selected_repo: Option<String>,
     pub resource: ResourceState,
 }
@@ -116,11 +122,12 @@ mod tests {
         let message = ClientMessage::Subscribe {
             version: VERSION,
             selected_repo: Some("repo-id".into()),
+            include_remote: false,
         };
         write(&mut a, &message).await.unwrap();
         let decoded: ClientMessage = read(&mut b).await.unwrap().unwrap();
         assert!(
-            matches!(decoded, ClientMessage::Subscribe { version: VERSION, selected_repo: Some(id) } if id == "repo-id")
+            matches!(decoded, ClientMessage::Subscribe { version: VERSION, selected_repo: Some(id), .. } if id == "repo-id")
         );
 
         let (mut a, mut b) = UnixStream::pair().unwrap();

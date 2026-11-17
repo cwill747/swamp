@@ -11,6 +11,7 @@ pub struct SwampConfig {
     pub slots: SlotsConfig,
     pub badges: BadgesConfig,
     pub notifications: NotificationsConfig,
+    pub ssh_hosts: std::collections::BTreeMap<String, SshHostConfig>,
 }
 
 /// Native desktop alerts. The notifier is an executable, never a shell command.
@@ -31,6 +32,42 @@ impl Default for NotificationsConfig {
             finished: true,
             command: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshHostConfig {
+    pub target: String,
+    /// Override the executable when a noninteractive SSH shell cannot find it.
+    pub swamp_path: Option<String>,
+}
+
+impl SshHostConfig {
+    pub fn validate(&self, id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+            "invalid SSH host name {id:?}; use up to 64 letters, digits, dots, hyphens or underscores"
+        );
+        anyhow::ensure!(
+            !self.target.is_empty()
+                && !self.target.starts_with('-')
+                && !self
+                    .target
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace()),
+            "invalid SSH target for {id}"
+        );
+        if let Some(path) = &self.swamp_path {
+            anyhow::ensure!(
+                std::path::Path::new(path).is_absolute() && !path.chars().any(char::is_control),
+                "swamp_path for {id} must be an absolute path"
+            );
+        }
+        Ok(())
     }
 }
 

@@ -44,6 +44,10 @@ pub fn load_config() -> Result<SwampConfig> {
     cfg.dashboard
         .validate()
         .with_context(|| format!("invalid [dashboard] settings in {}", path.display()))?;
+    for (id, host) in &cfg.ssh_hosts {
+        host.validate(id)
+            .with_context(|| format!("invalid [ssh_hosts] settings in {}", path.display()))?;
+    }
     // A bad `[logging] filter` directive is rejected here, alongside other
     // malformed config, rather than being silently dropped at subscriber init.
     if let Some(filter) = &cfg.logging.filter {
