@@ -604,9 +604,7 @@ impl Daemon {
                 &cfg,
                 &prs,
                 || state.blocking_read().autoclean_agents(),
-                |wt| {
-                    crate::launch::close_slot_tab_wait(&common, &wt.name(), &wt.path)
-                },
+                |wt| crate::launch::close_slot_tab_wait(&common, &wt.name(), &wt.path),
             )
         })
         .await
@@ -775,7 +773,7 @@ impl Daemon {
             .map(|_| ())
     }
 
-    /// Allocate a worktree for `branch` (see [`crate::slot_service::alloc`]),
+    /// Allocate a worktree for `branch` (see [`crate::slot_service::alloc_with_pr`]),
     /// apply the agent-record changes, and broadcast the refreshed snapshot.
     pub async fn slot_alloc(
         &self,
@@ -786,6 +784,17 @@ impl Daemon {
     ) -> Result<crate::worktree::slots::Allocation> {
         let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
+        let pr = self
+            .state
+            .read()
+            .await
+            .pr_state_for_verdicts()
+            .and_then(|prs| prs.get(branch))
+            .map(|p| crate::worktree::slots::PrFacts {
+                branch: branch.to_string(),
+                state: p.state.clone(),
+                head_oid: p.head_oid.as_ref().and_then(|oid| oid.parse().ok()),
+            });
         let branch = branch.to_string();
         let (allocation, changes) = tokio::task::spawn_blocking(move || {
             let cfg = crate::config::slots_config(&common)?;
@@ -799,7 +808,7 @@ impl Daemon {
             } else {
                 &cfg.hooks.post_alloc[..]
             };
-            crate::slot_service::alloc(&common, &branch, &opts, hooks)
+            crate::slot_service::alloc_with_pr(&common, &branch, &opts, hooks, pr.as_ref())
         })
         .await
         .context("slot alloc task")??;
@@ -1221,6 +1230,119 @@ mod tests {
             .path;
         assert_ne!(cli_path, tui_path);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Exercise the actual inline refresh plus later refreshes and a restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn autoclean_allocation_handoff_preserves_pool_and_overflow() {
+        let _env = crate::util::test_env_lock();
+        use crate::worktree::test_support::{run as git, setup};
+        use std::os::unix::fs::PermissionsExt;
+        // Model a machine with no Zellij session. This is a command stub, not
+        // live Zellij integration; cleanup must still reach detach/removal.
+        struct RestorePath(std::ffi::OsString);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                // SAFETY: the test holds the environment lock.
+                unsafe { std::env::set_var("PATH", &self.0) };
+            }
+        }
+        let saved_path = RestorePath(std::env::var_os("PATH").unwrap());
+        for pool_size in [0, 2] {
+            for existing in [false, true] {
+                let (root, common) = setup();
+                let bin = root.join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let stub = bin.join("zellij");
+                std::fs::write(&stub, "#!/bin/sh\n[ \"$1\" = list-sessions ]\n").unwrap();
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let mut paths = vec![bin];
+                paths.extend(std::env::split_paths(&saved_path.0));
+                // SAFETY: serialized by the test environment lock.
+                unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+                // SAFETY: serialized by the test environment lock.
+                unsafe { std::env::set_var("XDG_CONFIG_HOME", root.join("config")) };
+                std::fs::create_dir_all(common.join("swamp")).unwrap();
+                std::fs::write(
+                    crate::config::repo_config_path(&common),
+                    format!("[slots]\npool_size = {pool_size}\n"),
+                )
+                .unwrap();
+                git(&common, &["config", "core.logAllRefUpdates", "true"]);
+                git(
+                    &common,
+                    &["remote", "add", "origin", common.to_str().unwrap()],
+                );
+                git(&common, &["update-ref", "refs/remotes/origin/main", "main"]);
+                git(
+                    &common,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/main",
+                    ],
+                );
+                let opts = crate::worktree::slots::AllocOptions::pool(pool_size);
+                let (first, _) = crate::slot_service::alloc(&common, "reopen", &opts, &[]).unwrap();
+                git(
+                    &first.path,
+                    &["commit", "--allow-empty", "-m", "first work"],
+                );
+                let other_opts = crate::worktree::slots::AllocOptions {
+                    base: Some("reopen".into()),
+                    ..opts
+                };
+                let (other, _) =
+                    crate::slot_service::alloc(&common, "other", &other_opts, &[]).unwrap();
+                git(
+                    &other.path,
+                    &["commit", "--allow-empty", "-m", "other work"],
+                );
+                git(
+                    &common,
+                    &["update-ref", "refs/remotes/origin/main", "other"],
+                );
+                if !existing {
+                    git(
+                        &common,
+                        &["worktree", "remove", first.path.to_str().unwrap()],
+                    );
+                }
+                let daemon = build_daemon(&common).await;
+                let a = daemon.slot_alloc("reopen", None, true, true).await.unwrap();
+                assert_eq!(a.existing, existing);
+                assert_eq!(
+                    crate::worktree::slots::checked_out_branch(&a.path).as_deref(),
+                    Some("reopen")
+                );
+                assert_ne!(
+                    crate::worktree::slots::checked_out_branch(&other.path).as_deref(),
+                    Some("other")
+                );
+                daemon.refresh_all_exclusive().await.unwrap();
+                let restarted = build_daemon(&common).await;
+                restarted.refresh_all_exclusive().await.unwrap();
+                assert_eq!(
+                    crate::worktree::slots::checked_out_branch(&a.path).as_deref(),
+                    Some("reopen")
+                );
+                // Protection ends when new work is committed and subsequently merged.
+                git(&a.path, &["commit", "--allow-empty", "-m", "new work"]);
+                restarted.refresh_all_exclusive().await.unwrap();
+                assert!(a.path.exists());
+                git(
+                    &common,
+                    &["update-ref", "refs/remotes/origin/main", "reopen"],
+                );
+                restarted.refresh_all_exclusive().await.unwrap();
+                assert_ne!(
+                    crate::worktree::slots::checked_out_branch(&a.path).as_deref(),
+                    Some("reopen")
+                );
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     /// Releasing through the daemon clears the slot's agent record in memory

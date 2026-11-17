@@ -592,7 +592,10 @@ New branches that have not acquired commits are retained. Git-only cleanup
 requires a previously observed unmerged tip (saved in branch memory across
 restarts) or a branch creation reflog showing subsequent commits. If that
 history is unavailable, cleanup waits for matching PR evidence. Closed,
-unmerged PRs never trigger autoclean.
+unmerged PRs never trigger autoclean. Explicitly allocating an already merged
+branch retains its current tip across refreshes and daemon restarts, giving the
+caller time to open and use it. New commits can become eligible again; use an
+explicit release to reclaim it without making new commits.
 
 Working/waiting agents, running subagents, pinned or Git-locked worktrees,
 dirty trees, and merge/rebase operations defer cleanup. Pre-release hooks run

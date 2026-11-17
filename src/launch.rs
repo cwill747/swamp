@@ -541,9 +541,7 @@ pub fn close_slot_tab_wait(common: &Path, name: &str, path: &Path) -> Result<()>
     spawn_slot_tab(common, crate::cli::SlotTabOp::Close, name, path, true)?;
     let session = crate::util::session_name_for(common);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while zellij::session_is_live(&session)?
-        && zellij::worktree_tab_exists(Some(&session), name)?
-    {
+    while zellij::session_is_live(&session)? && zellij::worktree_tab_exists(Some(&session), name)? {
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("tab {name} did not close; keeping its worktree");
         }

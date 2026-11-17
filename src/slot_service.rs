@@ -31,8 +31,8 @@ pub mod autoclean;
 /// Swamp state that belongs to a branch rather than to the worktree it sits in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
-    /// Starting point of a new (not restored remote) branch. A branch that
-    /// never acquired any work must not be mistaken for a completed task.
+    /// Starting point of a new branch, or the merged tip explicitly reopened
+    /// by allocation. Retain it until new work changes the tip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoclean_initial_tip: Option<String>,
     /// Last tip observed outside the remote merge destination. Persisted so
@@ -152,20 +152,34 @@ impl AgentChanges {
 /// with: the branch's remembered session, or none. `post_alloc` hooks run
 /// after the slot lock is released, so a slow hook does not block other
 /// allocations; a failed hook becomes a warning.
+#[cfg(test)]
 pub fn alloc(
     common: &Path,
     branch: &str,
     opts: &AllocOptions,
     post_alloc: &[HookCommand],
 ) -> Result<(Allocation, AgentChanges)> {
+    alloc_with_pr(common, branch, opts, post_alloc, None)
+}
+
+/// Allocate with the daemon's cached PR evidence. Protection is persisted under
+/// the slot lock before hooks or the caller handoff, and survives refreshes and
+/// restarts. A one-pass exclusion would race the next background refresh.
+pub fn alloc_with_pr(
+    common: &Path,
+    branch: &str,
+    opts: &AllocOptions,
+    post_alloc: &[HookCommand],
+    pr: Option<&PrFacts>,
+) -> Result<(Allocation, AgentChanges)> {
     let (a, changes) = {
         let guard = slots::lock(common)?;
-        alloc_under(&guard, common, branch, opts)?
+        alloc_under(&guard, common, branch, opts, pr)?
     };
     Ok((run_post_alloc(common, a, post_alloc), changes))
 }
 
-/// [`alloc`] for the CLI when no daemon runs: it applies the agent changes to
+/// [`alloc_with_pr`] for the CLI when no daemon runs: it applies the agent changes to
 /// `.swamp-status.json` before it releases the slot lock, so a concurrent
 /// operation cannot reuse the slot between the two steps.
 pub fn alloc_with_status_file(
@@ -176,7 +190,7 @@ pub fn alloc_with_status_file(
 ) -> Result<Allocation> {
     let a = {
         let guard = slots::lock(common)?;
-        let (a, changes) = alloc_under(&guard, common, branch, opts)?;
+        let (a, changes) = alloc_under(&guard, common, branch, opts, None)?;
         apply_to_status_file(common, &changes)?;
         a
     };
@@ -188,18 +202,27 @@ fn alloc_under(
     common: &Path,
     branch: &str,
     opts: &AllocOptions,
+    pr: Option<&PrFacts>,
 ) -> Result<(Allocation, AgentChanges)> {
     let a = slots::alloc_locked(guard, common, branch, opts)?;
-    if a.created_branch {
-        let repo = git2::Repository::open(&a.path)?;
-        let local = repo.find_branch(&a.branch, git2::BranchType::Local)?;
-        if local.upstream().is_err() {
-            let mut memory = load_branches(common);
-            let entry = memory.entry(a.branch.clone()).or_default();
-            entry.autoclean_initial_tip = repo.head()?.target().map(|oid| oid.to_string());
-            entry.autoclean_unmerged_tip = None;
-            save_branches(common, &memory)?;
-        }
+    let repo = git2::Repository::open(&a.path)?;
+    let tip = repo.head()?.peel_to_commit()?.id();
+    let new_local = a.created_branch
+        && repo
+            .find_branch(&a.branch, git2::BranchType::Local)?
+            .upstream()
+            .is_err();
+    let merged_pr =
+        pr.is_some_and(|p| p.branch == a.branch && p.state == "MERGED" && p.head_oid == Some(tip));
+    let merged_git = crate::worktree::remote_default_tip(common).is_some_and(|(_, destination)| {
+        tip == destination || repo.graph_descendant_of(destination, tip).unwrap_or(false)
+    });
+    if new_local || merged_pr || merged_git {
+        let mut memory = autoclean::load_memory(common)?;
+        let entry = memory.entry(a.branch.clone()).or_default();
+        entry.autoclean_initial_tip = Some(tip.to_string());
+        entry.autoclean_unmerged_tip = None;
+        save_branches(common, &memory)?;
     }
     let mut changes = AgentChanges::default();
     if !a.existing {

@@ -8,7 +8,7 @@ use git2::{Oid, Repository, RepositoryState, WorktreeLockStatus};
 #[cfg(test)]
 mod tests;
 
-fn load_memory(common: &Path) -> Result<HashMap<String, BranchRecord>> {
+pub(super) fn load_memory(common: &Path) -> Result<HashMap<String, BranchRecord>> {
     match std::fs::read(branches_path(common)) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),

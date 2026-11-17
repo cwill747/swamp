@@ -940,7 +940,10 @@ mod tests {
                 finished_ts: None,
             }],
         );
-        assert_eq!(state.autoclean_agents()["work1"].status, AgentStatus::Working);
+        assert_eq!(
+            state.autoclean_agents()["work1"].status,
+            AgentStatus::Working
+        );
         state.subagents.get_mut("work1").unwrap()[0].status = SubagentStatus::Done;
         assert_eq!(state.autoclean_agents()["work1"].status, AgentStatus::Idle);
     }
