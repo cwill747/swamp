@@ -1055,9 +1055,19 @@ impl Daemon {
         session_name: Option<&str>,
         session_id: Option<&str>,
         subagent: Option<&state::SubagentEvent>,
+        completed_turn: Option<&str>,
     ) -> Result<()> {
         let mut s = self.state.write().await;
-        let changed = s.apply_hook_event(wt_name, status, session_name, session_id, subagent)?;
+        let before = s.agents.get(wt_name).cloned();
+        let changed = if let Some(turn) = completed_turn {
+            anyhow::ensure!(
+                status == "idle" && subagent.is_none(),
+                "invalid completion hook"
+            );
+            s.apply_codex_completion(wt_name, turn)
+        } else {
+            s.apply_hook_event(wt_name, status, session_name, session_id, subagent)?
+        };
         if !changed {
             // Timestamp-only ping (active agents send one per tool call). The
             // in-memory record is fresh; skip the persist — whose status-file
@@ -1069,9 +1079,20 @@ impl Daemon {
         }
         tracing::info!(worktree = %wt_name, status, "applied agent hook");
         s.persist(&self.common_dir).await?;
+        let notification = s
+            .agents
+            .get(wt_name)
+            .and_then(|after| crate::notifications::transition(before.as_ref(), after));
         let snap = s.snapshot();
         drop(s);
         let _ = self.tx.send(ServerMsg::Snapshot(snap));
+        if let Some(event) = notification {
+            let common = self.common_dir.clone();
+            let worktree = wt_name.to_owned();
+            tokio::spawn(async move {
+                crate::notifications::send(&common, &worktree, event).await;
+            });
+        }
         Ok(())
     }
 
@@ -1368,7 +1389,14 @@ mod tests {
             .await
             .unwrap();
         daemon
-            .apply_hook(&a.name, "idle", Some("Remember me"), Some("sess-1"), None)
+            .apply_hook(
+                &a.name,
+                "idle",
+                Some("Remember me"),
+                Some("sess-1"),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1701,7 +1729,7 @@ mod tests {
             let daemon = daemon.clone();
             async move {
                 daemon
-                    .apply_hook("feature", "working", None, None, Some(&ev(kind)))
+                    .apply_hook("feature", "working", None, None, Some(&ev(kind)), None)
                     .await
                     .unwrap();
             }

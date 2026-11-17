@@ -114,6 +114,18 @@ pub(crate) fn apply_hook_record(
     ))
 }
 
+/// Codex has no working hook. Its explicit turn identity supplies a stable
+/// completion without inventing a working transition or a Claude resume token.
+pub(crate) fn apply_codex_record(existing: Option<&AgentRecord>, turn: &str) -> AgentRecord {
+    AgentRecord {
+        status: AgentStatus::Idle,
+        ts: now_unix(),
+        activity_id: Some(format!("codex:{turn}")),
+        completion_id: Some(format!("codex:{turn}")),
+        ..existing.cloned().unwrap_or_default()
+    }
+}
+
 /// How long a done subagent stays visible before the daemon drops it.
 pub const SUBAGENT_DONE_GRACE_SECS: u64 = 60;
 /// How long a running subagent may go without any event before the daemon
@@ -431,6 +443,22 @@ impl DaemonState {
     ) -> Result<bool> {
         let (rec, changed) =
             apply_hook_record(self.agents.get(wt_name), status, session_name, session_id)?;
+        self.store_agent_record(wt_name, rec);
+        Ok(changed)
+    }
+
+    pub fn apply_codex_completion(&mut self, wt_name: &str, turn: &str) -> bool {
+        let before = self.agents.get(wt_name);
+        let rec = apply_codex_record(before, turn);
+        // Duplicate completions must not refresh state or send another alert.
+        if before.is_some_and(|r| r.completion_id == rec.completion_id) {
+            return false;
+        }
+        self.store_agent_record(wt_name, rec);
+        true
+    }
+
+    fn store_agent_record(&mut self, wt_name: &str, rec: AgentRecord) {
         self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
             row.agent = rec.status;
@@ -439,7 +467,6 @@ impl DaemonState {
             row.completion_id = rec.completion_id.clone();
             row.session_name = rec.session_name;
         }
-        Ok(changed)
     }
 
     /// Record a hook that may carry a subagent event. Returns `true` when subscribers can observe the change, with the
@@ -1361,6 +1388,32 @@ mod tests {
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].agent, AgentStatus::Working);
         assert!(snap.rows[0].activity_id.is_some());
+    }
+
+    #[test]
+    fn codex_completions_are_stable_and_preserve_claude_resume_state() {
+        let mut state = DaemonState::default();
+        state.rows.insert("main".into(), make_row("main"));
+        state
+            .apply_hook("main", "idle", Some("saved"), Some("claude-session"))
+            .unwrap();
+        assert!(state.apply_codex_completion("main", "thread-1/turn-1"));
+        let first = state.agents["main"].clone();
+        assert_eq!(first.status, AgentStatus::Idle);
+        assert_eq!(first.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(first.session_name.as_deref(), Some("saved"));
+        assert_eq!(state.rows["main"].completion_id, first.completion_id);
+        assert!(!state.apply_codex_completion("main", "thread-1/turn-1"));
+        assert_eq!(state.agents["main"].completion_id, first.completion_id);
+        assert!(state.apply_codex_completion("main", "thread-1/turn-2"));
+        assert_ne!(state.agents["main"].completion_id, first.completion_id);
+        // Persisted records retain deduplication across a daemon restart.
+        let json = serde_json::to_vec(&state.agents).unwrap();
+        let mut restored = DaemonState {
+            agents: serde_json::from_slice(&json).unwrap(),
+            ..Default::default()
+        };
+        assert!(!restored.apply_codex_completion("main", "thread-1/turn-2"));
     }
 
     #[test]
