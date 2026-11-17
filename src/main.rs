@@ -11,6 +11,7 @@ mod hook;
 mod kill;
 mod launch;
 mod logging;
+mod notifications;
 mod overview;
 mod registry;
 mod slot_cmd;

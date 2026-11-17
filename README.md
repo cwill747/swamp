@@ -579,6 +579,32 @@ exits when no repo session has run for one minute.
 To keep tab names unchanged, set `[badges] enabled = false` and restart the
 session.
 
+### System notifications
+
+Swamp sends desktop alerts when a parent agent starts waiting for input or
+finishes a turn. It uses `terminal-notifier` on macOS and `notify-send` (libnotify)
+on Linux, matching Herdr's system notification tools. Install the appropriate
+tool through your system configuration and make it available on Swamp's PATH.
+Missing tools, unavailable desktop services, and notification failures do not
+interrupt agents. Delivery has a five-second time limit.
+
+```toml
+[notifications]
+enabled = true
+waiting = true
+finished = true
+# Optional executable path, using the platform's notifier argument format:
+# command = "/path/to/terminal-notifier"
+```
+
+Set `enabled = false` to disable all alerts, or disable either event separately.
+These settings are read for each alert. Alerts include the repository and
+worktree name; they do not include conversation content. Refreshes, startup,
+subagent hooks, and repeated status updates do not generate alerts. Codex turn
+IDs deduplicate repeat completion events; older payloads without IDs alert on
+each completion invocation. Existing daemons must be restarted to use the new
+notification handling. Notifications have no click action.
+
 The slot pool has its own section:
 
 ```toml

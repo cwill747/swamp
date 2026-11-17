@@ -10,7 +10,29 @@ pub struct SwampConfig {
     pub logging: LoggingConfig,
     pub slots: SlotsConfig,
     pub badges: BadgesConfig,
+    pub notifications: NotificationsConfig,
     pub ssh_hosts: std::collections::BTreeMap<String, SshHostConfig>,
+}
+
+/// Native desktop alerts. The notifier is an executable, never a shell command.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub waiting: bool,
+    pub finished: bool,
+    pub command: Option<String>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            waiting: true,
+            finished: true,
+            command: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -344,6 +366,28 @@ mod tests {
     use super::*;
 
     const DEFAULT_CONFIG_TOML: &str = include_str!("config.toml");
+
+    #[test]
+    fn notification_defaults_and_overrides() {
+        for text in ["", "[notifications]", DEFAULT_CONFIG_TOML] {
+            let cfg: SwampConfig = toml::from_str(text).unwrap();
+            assert!(
+                cfg.notifications.enabled
+                    && cfg.notifications.waiting
+                    && cfg.notifications.finished
+            );
+            assert!(cfg.notifications.command.is_none());
+        }
+        let cfg: SwampConfig = toml::from_str("[notifications]\nenabled = false\nwaiting = false\nfinished = false\ncommand = '/custom/notifier'").unwrap();
+        assert!(
+            !cfg.notifications.enabled && !cfg.notifications.waiting && !cfg.notifications.finished
+        );
+        assert_eq!(
+            cfg.notifications.command.as_deref(),
+            Some("/custom/notifier")
+        );
+        assert!(toml::from_str::<SwampConfig>("[notifications]\nenabeld = false").is_err());
+    }
 
     #[test]
     fn badges_are_on_unless_the_config_turns_them_off() {

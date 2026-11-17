@@ -13,8 +13,9 @@ pub use paths::{
 #[allow(unused_imports)]
 pub use types::{
     DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_POOL_SIZE, DashboardConfig, DashboardLayout, Harness,
-    HarnessConfig, HarnessSetting, HookCommand, LogLevel, LoggingConfig, RepoConfig,
-    RepoSlotsConfig, SlotHooks, SlotsConfig, SshHostConfig, SwampConfig, resolve_harness,
+    HarnessConfig, HarnessSetting, HookCommand, LogLevel, LoggingConfig, NotificationsConfig,
+    RepoConfig, RepoSlotsConfig, SlotHooks, SlotsConfig, SshHostConfig, SwampConfig,
+    resolve_harness,
 };
 
 use anyhow::Result;
