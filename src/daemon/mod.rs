@@ -1832,12 +1832,19 @@ mod tests {
     /// it later populates in the background. A current-thread runtime guarantees
     /// the spawned scan can't have run before the synchronous `try_read`.
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn bind_happens_before_initial_scan() {
+        let _env = crate::util::test_env_lock();
         if !git_available() {
             eprintln!("skipping bind_happens_before_initial_scan: git not on PATH");
             return;
         }
         let repo = git_init_repo();
+        // Nix's check environment has an intentionally unwritable HOME. Do
+        // not depend on another test having set a writable runtime directory.
+        let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: the test environment lock serializes these changes.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", repo.join("runtime")) };
         let common = git_common_dir(&repo).unwrap();
         let daemon = build_daemon(&common).await;
         let sock = repo.join("test.sock");
@@ -1871,5 +1878,12 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_dir_all(&repo);
+        // SAFETY: the test still holds the environment lock.
+        unsafe {
+            match previous_runtime {
+                Some(path) => std::env::set_var("XDG_RUNTIME_DIR", path),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
     }
 }
