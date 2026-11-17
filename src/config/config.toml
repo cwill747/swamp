@@ -37,6 +37,16 @@ default = "claude"
 # they are.
 enabled = true
 
+[notifications]
+# Native desktop alerts when an agent needs input or finishes a turn.
+# Uses terminal-notifier on macOS and notify-send on Linux, found on PATH.
+# Missing tools/headless desktops are ignored. Set enabled = false to opt out.
+enabled = true
+waiting = true
+finished = true
+# Optional absolute path to the platform's notifier executable (no shell args):
+# command = "/path/to/terminal-notifier"
+
 # [logging]
 # Diagnostic logging for debugging swamp itself — e.g. "why was a tab added?"
 # or "what did that git refresh do?". The daemon writes a per-repo log file

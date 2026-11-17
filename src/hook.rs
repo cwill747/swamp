@@ -1,5 +1,7 @@
 use crate::daemon::socket::{ClientMsg, ServerMsg, read_server_msg, write_client_msg};
-use crate::daemon::state::{AgentRecord, SubagentEvent, SubagentEventKind, apply_hook_record};
+use crate::daemon::state::{
+    AgentRecord, SubagentEvent, SubagentEventKind, apply_codex_record, apply_hook_record,
+};
 use crate::daemon::{self};
 use crate::util::now_unix;
 use crate::worktree::{git_common_dir, list_worktrees};
@@ -40,6 +42,7 @@ pub async fn run(
                 session_name: session_name.clone(),
                 session_id: session_id.clone(),
                 subagent: payload.subagent.clone(),
+                completed_turn: payload.completed_turn.clone(),
             },
         )
         .await
@@ -87,6 +90,10 @@ async fn write_status_file(
     tracing::debug!(worktree = %wt_name, status = %status, "daemon down; writing hook to status file");
     // Fallback: mutate .swamp-status.json directly.
     let path = common.join(".swamp-status.json");
+    // Serialize offline read/modify/write so concurrent hooks cannot both
+    // notify for the same transition or overwrite each other's status.
+    let lock_path = common.join(".swamp-status.lock");
+    let lock = tokio::task::spawn_blocking(move || daemon::flock_exclusive(&lock_path)).await??;
     let mut map = read_status_map(&path).await?;
     // Carry forward prior session_name / session_id / harness when this hook
     // omits them, so transient `working`/`idle` pings don't erase data we need
@@ -99,16 +106,33 @@ async fn write_status_file(
         .get(&wt_name)
         .cloned()
         .and_then(|value| serde_json::from_value::<AgentRecord>(value).ok());
-    let (record, _) = apply_hook_record(
-        prior.as_ref(),
-        status,
-        session_name.as_deref(),
-        session_id.as_deref(),
-    )?;
-    map.insert(wt_name, serde_json::to_value(record)?);
+    let record = if let Some(turn) = &payload.completed_turn {
+        let record = apply_codex_record(prior.as_ref(), turn);
+        if prior
+            .as_ref()
+            .is_some_and(|r| r.completion_id == record.completion_id)
+        {
+            return Ok(());
+        }
+        record
+    } else {
+        apply_hook_record(
+            prior.as_ref(),
+            status,
+            session_name.as_deref(),
+            session_id.as_deref(),
+        )?
+        .0
+    };
+    let notification = crate::notifications::transition(prior.as_ref(), &record);
+    map.insert(wt_name.clone(), serde_json::to_value(record)?);
     let tmp = path.with_extension("json.tmp");
     tokio::fs::write(&tmp, serde_json::to_vec_pretty(&map)?).await?;
     tokio::fs::rename(&tmp, &path).await?;
+    drop(lock);
+    if let Some(event) = notification {
+        crate::notifications::send(common, &wt_name, event).await;
+    }
     Ok(())
 }
 
@@ -125,6 +149,8 @@ const MAX_PAYLOAD_FIELD: usize = 256;
 /// What `swamp hook` takes from a Claude Code hook's stdin payload.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HookPayload {
+    /// Explicit Codex turn identity; never used as a Claude resume token.
+    pub completed_turn: Option<String>,
     /// `hook_event_name`, for example `UserPromptSubmit`.
     pub hook_event: Option<String>,
     pub subagent: Option<SubagentEvent>,

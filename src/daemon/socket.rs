@@ -29,6 +29,8 @@ pub enum ClientMsg {
         /// ignores this field and applies only the status.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent: Option<SubagentEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_turn: Option<String>,
     },
     GetVersion,
     /// Ask which repository and Zellij session this daemon serves. Cross-repo
@@ -194,12 +196,16 @@ pub async fn handle_client(daemon: Arc<Daemon>, mut stream: UnixStream) -> Resul
                         }
                         write_msg(&mut stream, &ServerMsg::PrStatus(pr_snap)).await?;
                     }
-                    ClientMsg::Hook { worktree, status, session_name, session_id, subagent } => {
+                    ClientMsg::Hook { worktree, status, session_name, session_id, subagent, completed_turn } => {
                         if let Err(e) = validate_hook(&worktree, session_name.as_deref(), session_id.as_deref(), subagent.as_ref()) {
                             write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?;
                             continue;
                         }
-                        match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref(), subagent.as_ref()).await {
+                        if completed_turn.as_ref().is_some_and(|turn| turn.is_empty() || turn.len() > 1024 || turn.chars().any(char::is_control)) {
+                            write_msg(&mut stream, &ServerMsg::Err { message: "invalid completed turn".into() }).await?;
+                            continue;
+                        }
+                        match daemon.apply_hook(&worktree, &status, session_name.as_deref(), session_id.as_deref(), subagent.as_ref(), completed_turn.as_deref()).await {
                             Ok(()) => write_msg(&mut stream, &ServerMsg::Ok).await?,
                             Err(e) => write_msg(&mut stream, &ServerMsg::Err { message: e.to_string() }).await?,
                         }
@@ -600,6 +606,7 @@ mod tests {
             ClientMsg::Subscribe,
             ClientMsg::Hook {
                 worktree: "main".into(),
+                completed_turn: None,
                 status: "working".into(),
                 session_name: None,
                 session_id: None,
@@ -958,6 +965,7 @@ mod tests {
         }
         let new = serde_json::to_string(&ClientMsg::Hook {
             worktree: "main".into(),
+            completed_turn: Some("thread:turn".into()),
             status: "idle".into(),
             session_name: None,
             session_id: None,
