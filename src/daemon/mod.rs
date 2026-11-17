@@ -291,7 +291,10 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
             }
             let mut delay = Duration::from_secs(60);
             loop {
-                if d.pr_subscribers.load(Ordering::Relaxed) == 0 {
+                let autoclean = crate::config::slots_config(&d.common_dir)
+                    .map(|cfg| cfg.autoclean)
+                    .unwrap_or(false);
+                if d.pr_subscribers.load(Ordering::Relaxed) == 0 && !autoclean {
                     // No subscribers: idle until one connects (which wakes us) or
                     // re-check shortly in case a subscriber raced the gate.
                     tokio::select! {
@@ -575,6 +578,43 @@ impl Daemon {
     }
 
     async fn refresh_all_unlocked(&self) -> Result<()> {
+        // All callers hold repo_ops. The service also takes the cross-process
+        // slot lock and re-reads live agent state around hooks and tab closure.
+        let common = self.common_dir.clone();
+        let state = self.state.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::slots_config(&common)?;
+            let prs = state
+                .blocking_read()
+                .pr_state_for_verdicts()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(branch, p)| {
+                    let facts = crate::worktree::slots::PrFacts {
+                        branch: branch.clone(),
+                        state: p.state,
+                        head_oid: p.head_oid.and_then(|oid| oid.parse().ok()),
+                    };
+                    (branch, facts)
+                })
+                .collect();
+            crate::slot_service::autoclean::run(
+                &common,
+                &cfg,
+                &prs,
+                || state.blocking_read().autoclean_agents(),
+                |wt| {
+                    crate::launch::close_slot_tab_wait(&common, &wt.name(), &wt.path)
+                },
+            )
+        })
+        .await
+        .context("autoclean task")?;
+        match cleanup {
+            Ok(changes) => self.apply_agent_changes(&changes).await?,
+            Err(e) => tracing::warn!("autoclean skipped: {e:#}"),
+        }
         // Clone out the agents map and default branch under a read lock so the git
         // scan (which can take seconds on large repos) runs completely off the
         // runtime via spawn_blocking, without blocking any async task or

@@ -535,6 +535,23 @@ pub fn clear_tab_closing(common: &Path, name: &str) {
     let _ = std::fs::remove_file(tab_closing_path(common, name));
 }
 
+/// Autoclean must observe the close, not just enqueue an action, before a
+/// slot can be reused. Called with the cross-process slot lock held.
+pub fn close_slot_tab_wait(common: &Path, name: &str, path: &Path) -> Result<()> {
+    spawn_slot_tab(common, crate::cli::SlotTabOp::Close, name, path, true)?;
+    let session = crate::util::session_name_for(common);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while zellij::session_is_live(&session)?
+        && zellij::worktree_tab_exists(Some(&session), name)?
+    {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("tab {name} did not close; keeping its worktree");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 /// The owner of a pending close for `name`, when that process still runs.
 fn pending_close_owner(common: &Path, name: &str) -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(tab_closing_path(common, name))
@@ -573,7 +590,7 @@ pub fn spawn_slot_tab(
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let session = crate::util::session_name_for(common_dir);
-    if !zellij::session_is_live(&session).unwrap_or(false) {
+    if !zellij::session_is_live(&session)? {
         tracing::debug!(%session, worktree = %name, "repo session not running; no slot tab change");
         if matches!(op, crate::cli::SlotTabOp::Close) {
             clear_tab_closing(common_dir, name);

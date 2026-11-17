@@ -26,9 +26,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod autoclean;
+
 /// Swamp state that belongs to a branch rather than to the worktree it sits in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
+    /// Starting point of a new (not restored remote) branch. A branch that
+    /// never acquired any work must not be mistaken for a completed task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoclean_initial_tip: Option<String>,
+    /// Last tip observed outside the remote merge destination. Persisted so
+    /// merge detection survives restarts even in bare repos without reflogs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoclean_unmerged_tip: Option<String>,
     /// Activity/completion revisions belong to a branch session and must
     /// follow it when a reusable slot is allocated to a different branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +190,17 @@ fn alloc_under(
     opts: &AllocOptions,
 ) -> Result<(Allocation, AgentChanges)> {
     let a = slots::alloc_locked(guard, common, branch, opts)?;
+    if a.created_branch {
+        let repo = git2::Repository::open(&a.path)?;
+        let local = repo.find_branch(&a.branch, git2::BranchType::Local)?;
+        if local.upstream().is_err() {
+            let mut memory = load_branches(common);
+            let entry = memory.entry(a.branch.clone()).or_default();
+            entry.autoclean_initial_tip = repo.head()?.target().map(|oid| oid.to_string());
+            entry.autoclean_unmerged_tip = None;
+            save_branches(common, &memory)?;
+        }
+    }
     let mut changes = AgentChanges::default();
     if !a.existing {
         match load_branches(common).get(&a.branch) {

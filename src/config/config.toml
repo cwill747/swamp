@@ -59,6 +59,8 @@ enabled = true
 # branch-named worktree instead.
 #
 #   pool_size — the most slots swamp creates (default 5). 0 turns the pool off.
+#   autoclean — automatically clean merged branches (default true). Set false
+#               to retain their worktrees and sessions until manual release.
 #
 #   hooks     — shell commands (run with `sh -c`) around slot operations:
 #               "post-alloc" runs in the worktree after an allocation, and
@@ -68,10 +70,11 @@ enabled = true
 #               get SWAMP_WORKTREE, SWAMP_NAME, SWAMP_KIND, SWAMP_BRANCH, and
 #               SWAMP_REPO_ROOT. Each hook has a 300-second limit by default.
 #
-# A repository can override pool_size and add hooks in
+# A repository can override pool_size/autoclean and add hooks in
 # <git-common-dir>/swamp/config.toml (for a bare layout, .bare/swamp/config.toml).
 # User hooks run first, then the repository's.
 # pool_size = 5
+# autoclean = true
 #
 # [[slots.hooks.pre-release]]
 # run = "bazel shutdown"
