@@ -21,6 +21,7 @@ pub const DEFAULT_POOL_SIZE: u32 = 5;
 #[serde(default)]
 pub struct SlotsConfig {
     pub pool_size: u32,
+    pub autoclean: bool,
     pub hooks: SlotHooks,
 }
 
@@ -28,6 +29,7 @@ impl Default for SlotsConfig {
     fn default() -> Self {
         Self {
             pool_size: DEFAULT_POOL_SIZE,
+            autoclean: true,
             hooks: SlotHooks::default(),
         }
     }
@@ -80,6 +82,7 @@ pub struct RepoConfig {
 #[serde(default)]
 pub struct RepoSlotsConfig {
     pub pool_size: Option<u32>,
+    pub autoclean: Option<bool>,
     pub hooks: SlotHooks,
 }
 
@@ -88,6 +91,9 @@ impl SlotsConfig {
     /// `pool_size` replaces the user value. Hooks add up: user hooks run
     /// first, then the repository's.
     pub fn merged_with(mut self, repo: &RepoSlotsConfig) -> Self {
+        if let Some(enabled) = repo.autoclean {
+            self.autoclean = enabled;
+        }
         if let Some(size) = repo.pool_size {
             self.pool_size = size;
         }

@@ -553,6 +553,7 @@ The slot pool has its own section:
 ```toml
 [slots]
 pool_size = 5          # most slots swamp creates; 0 turns the pool off
+autoclean = true       # clean up merged branches automatically; false disables
 
 [[slots.hooks.pre-release]]
 run = "bazel shutdown"
@@ -575,10 +576,35 @@ changes in place. `--force` can override those checks, but never a hook that
 switches or detaches the branch. A hook's new commits are not covered by stale
 merged/closed PR facts and do not trigger deletion of their branch.
 
-A repository can set its own `pool_size` and add hooks in
+A repository can set its own `pool_size`, override `autoclean`, and add hooks in
 `<git-common-dir>/swamp/config.toml` (for the bare layout,
 `.bare/swamp/config.toml`). That file is not part of the repository, so a clone
 never runs commands that someone else chose. User hooks run first.
+
+Autoclean runs in the daemon on Git refreshes and the 30-second heartbeat.
+It checks the **remote-tracking default branch**, not an unpushed local default
+branch or the feature branch's own tracking upstream. Fetching updates this
+evidence; autoclean itself never fetches. Merges to other destinations and
+squash/rebase merges require a `MERGED` PR with an exact matching head commit.
+PR polling continues without a dashboard subscriber while autoclean is enabled.
+
+New branches that have not acquired commits are retained. Git-only cleanup
+requires a previously observed unmerged tip (saved in branch memory across
+restarts) or a branch creation reflog showing subsequent commits. If that
+history is unavailable, cleanup waits for matching PR evidence. Closed,
+unmerged PRs never trigger autoclean. Explicitly allocating an already merged
+branch retains its current tip across refreshes and daemon restarts, giving the
+caller time to open and use it. New commits can become eligible again; use an
+explicit release to reclaim it without making new commits.
+
+Working/waiting agents, running subagents, pinned or Git-locked worktrees,
+dirty trees, and merge/rebase operations defer cleanup. Pre-release hooks run
+with the usual failure checks, followed by another branch, commit, status, and
+agent check. Swamp closes the idle agent's Zellij tab synchronously under the
+slot lock before releasing the worktree. Failed tab closure leaves the worktree
+available for retry; no detached closer can affect a reused slot. Pool slots
+are detached for reuse; overflow worktrees are removed. Completed session
+memory is cleared, while local branches without merged-PR evidence are kept.
 
 ## Files
 

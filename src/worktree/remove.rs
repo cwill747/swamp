@@ -199,6 +199,15 @@ pub(super) fn branch_safety(repo: &Repository, ctx: &VerdictContext) -> RemovalV
     };
     let tip = tip.id();
 
+    // A feature's tracking ref may lag even after its commits landed on the
+    // remote default branch. Those commits are safe without pushing them to
+    // the obsolete feature ref. Never use an unpushed local main for this.
+    if branches::remote_default_tip(repo.path()).is_some_and(|(_, destination)| {
+        destination == tip || repo.graph_descendant_of(destination, tip).unwrap_or(false)
+    }) {
+        return RemovalVerdict::Removable;
+    }
+
     if branch.upstream().is_ok() {
         // Live upstream: a "clean" working tree can still hold commits the
         // upstream never saw; branch deletion would orphan them.

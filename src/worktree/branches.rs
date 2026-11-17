@@ -133,6 +133,21 @@ pub fn default_branch_tip(dir: &Path) -> Option<git2::Oid> {
         .and_then(|r| default_branch_tip_in_repo(&r))
 }
 
+/// The remote default destination, never its potentially unpushed local copy.
+/// A feature branch's own tracking ref is evidence of a push, not a merge.
+pub fn remote_default_tip(dir: &Path) -> Option<(String, git2::Oid)> {
+    let repo = open_lenient(dir).ok()?;
+    let remote = default_remote(&repo)?;
+    let name = default_branch_name(&repo)?;
+    let tip = repo
+        .find_reference(&format!("refs/remotes/{remote}/{name}"))
+        .ok()?
+        .peel_to_commit()
+        .ok()?
+        .id();
+    Some((name, tip))
+}
+
 /// Detect the default branch name. Returns an empty string when the default
 /// branch cannot be determined; callers that need a base must handle that
 /// explicitly instead of silently assuming `main`.

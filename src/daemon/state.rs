@@ -342,6 +342,21 @@ impl Default for DaemonState {
 }
 
 impl DaemonState {
+    /// An idle parent may still own a running subagent. Treat that worktree
+    /// as active for automatic cleanup, including while hooks are running.
+    pub fn autoclean_agents(&self) -> HashMap<String, AgentRecord> {
+        let mut agents = self.agents.clone();
+        for (name, children) in &self.subagents {
+            if children
+                .iter()
+                .any(|child| child.status == SubagentStatus::Running)
+            {
+                agents.entry(name.clone()).or_default().status = AgentStatus::Working;
+            }
+        }
+        agents
+    }
+
     pub async fn load(common_dir: &Path) -> Result<Self> {
         // Hydrate the agent records persisted by a prior run. `persist` rewrites
         // the whole `agents` map, so without this an empty in-memory map would
@@ -908,6 +923,30 @@ fn take_pending_description(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoclean_preserves_running_subagents_of_idle_parents() {
+        let mut state = DaemonState::default();
+        state.agents.insert("work1".into(), AgentRecord::default());
+        state.subagents.insert(
+            "work1".into(),
+            vec![SubagentRow {
+                id: "child".into(),
+                agent_type: "worker".into(),
+                description: None,
+                status: SubagentStatus::Running,
+                started_ts: 1,
+                last_ts: 1,
+                finished_ts: None,
+            }],
+        );
+        assert_eq!(
+            state.autoclean_agents()["work1"].status,
+            AgentStatus::Working
+        );
+        state.subagents.get_mut("work1").unwrap()[0].status = SubagentStatus::Done;
+        assert_eq!(state.autoclean_agents()["work1"].status, AgentStatus::Idle);
+    }
     use std::path::PathBuf;
 
     fn make_row(name: &str) -> WorktreeRow {

@@ -19,7 +19,7 @@ mod status;
 
 pub use branches::{
     default_branch, default_branch_tip, default_worktree_path, find_default_worktree,
-    list_branches, list_worktrees,
+    list_branches, list_worktrees, remote_default_tip,
 };
 pub use clone::clone_repo;
 #[cfg(test)]
