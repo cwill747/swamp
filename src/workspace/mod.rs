@@ -4,6 +4,7 @@
 pub mod broker;
 pub mod client;
 pub mod protocol;
+pub mod remote;
 pub mod seen;
 pub mod selection;
 pub mod ui;
@@ -50,6 +51,8 @@ pub enum Connection {
 pub struct Repository {
     pub id: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub identity: Option<RepoIdentity>,
     pub socket: Option<PathBuf>,
     pub connection: Connection,
@@ -151,11 +154,15 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn set_registry(&mut self, entries: Vec<RepoEntry>) {
-        self.registry = entries
+    pub fn set_registry(&mut self, entries: Vec<RepoEntry>) -> bool {
+        let registry = entries
             .into_iter()
             .map(|e| (repo_id(&e.common_dir), e))
             .collect();
+        if self.registry == registry {
+            return false;
+        }
+        self.registry = registry;
         // A registry entry is the durable identity for a launched repo. If
         // its live follower already ended, expose it as Stopped so explicit
         // activation can relaunch it; do not preserve its old rows as live.
@@ -163,6 +170,7 @@ impl Workspace {
         self.peers.retain(|id, peer| {
             peer.connection != Connection::Disconnected || !registry.contains_key(id)
         });
+        true
     }
 
     pub fn apply(&mut self, event: Event) {
@@ -175,6 +183,7 @@ impl Workspace {
                 let peer = self.peers.entry(id.clone()).or_insert_with(|| Repository {
                     id,
                     label: String::new(),
+                    host: None,
                     identity: None,
                     socket: None,
                     connection: Connection::Loading,
@@ -232,6 +241,7 @@ impl Workspace {
             repos.push(Repository {
                 id: id.clone(),
                 label: String::new(),
+                host: None,
                 identity: Some(RepoIdentity {
                     common_dir: entry.common_dir.clone(),
                     session_name: entry.session_name.clone(),

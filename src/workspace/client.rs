@@ -112,6 +112,7 @@ impl WorkspaceClient {
                         &ClientMessage::Subscribe {
                             version: protocol::VERSION,
                             selected_repo: selected.clone(),
+                            include_remote: true,
                         },
                     ),
                 )
@@ -278,6 +279,7 @@ mod tests {
             version: protocol::VERSION,
             revision,
             repositories: Vec::new(),
+            hosts: None,
             selected_repo: None,
             resource: super::super::protocol::ResourceState::Loading {
                 repo_id: String::new(),

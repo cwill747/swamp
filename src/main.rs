@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
         }
         Some(cli::Cmd::Kill(args)) => kill::run(args.dir),
         Some(cli::Cmd::Aggregate) => aggregate::run().await,
+        Some(cli::Cmd::SshInventory) => workspace::remote::export().await,
+        Some(cli::Cmd::SshAttach { common_dir }) => workspace::remote::attach(&common_dir),
         Some(cli::Cmd::Overview(args)) => overview::run(args.no_session).await,
         Some(cli::Cmd::Register(args)) => registry::run_register(args.dir, args.all_live).await,
         Some(cli::Cmd::Forget(args)) => registry::run_forget(args.dir),

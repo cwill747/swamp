@@ -86,6 +86,10 @@ impl StateHub {
     pub fn subscribe_inventory(&self) -> watch::Receiver<WorkspaceState> {
         self.inventory.subscribe()
     }
+    pub fn has_clients(&self) -> bool {
+        self.inventory.receiver_count() > 0
+    }
+
     pub async fn publish_resource(&self, repo_id: String, mut state: ResourceState) -> bool {
         let (state_repo, generation) = match &state {
             ResourceState::Loading {
@@ -147,7 +151,7 @@ impl StateHub {
             .borrow()
             .repositories
             .iter()
-            .find(|repo| repo.id == repo_id)
+            .find(|repo| repo.id == repo_id && repo.host.is_none())
             .cloned()?;
         let mut resources = self.resources.write().await;
         Some(
@@ -283,6 +287,7 @@ async fn serve_client(stream: UnixStream, hub: StateHub, write_deadline: Duratio
     let Some(ClientMessage::Subscribe {
         version,
         selected_repo,
+        include_remote,
     }) = first_message
     else {
         bail!("workspace client did not subscribe");
@@ -315,12 +320,18 @@ async fn serve_client(stream: UnixStream, hub: StateHub, write_deadline: Duratio
         };
         let mut last_revision = 0_u64;
         loop {
-            let state = revisions.borrow().clone();
-            let selected = selections.borrow().clone();
-            let mut state = state;
-            let selected_present = selected
-                .as_ref()
-                .is_some_and(|id| state.repositories.iter().any(|repo| &repo.id == id));
+            let mut state = revisions.borrow_and_update().clone();
+            let selected = selections.borrow_and_update().clone();
+            if !include_remote {
+                state.repositories.retain(|repo| repo.host.is_none());
+                state.hosts = None;
+            }
+            let selected_present = selected.as_ref().is_some_and(|id| {
+                state
+                    .repositories
+                    .iter()
+                    .any(|repo| &repo.id == id && repo.host.is_none())
+            });
             if selected != resource_id || selected_resource.as_ref().is_some_and(Option::is_none) {
                 resource_id = selected.clone();
                 selected_resource = if selected_present {
@@ -433,12 +444,70 @@ mod tests {
             version: protocol::VERSION,
             revision,
             repositories: Vec::new(),
+            hosts: None,
             selected_repo: None,
             resource: ResourceState::Loading {
                 repo_id: String::new(),
                 generation: 0,
                 snapshot: None,
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_clients_receive_only_local_repositories() {
+        let mut initial = state(0);
+        initial.hosts = Some(vec![]);
+        for (id, host) in [("local", None), ("ssh:dev:local", Some("dev".into()))] {
+            initial.repositories.push(crate::workspace::Repository {
+                id: id.into(),
+                label: id.into(),
+                host,
+                identity: None,
+                socket: None,
+                connection: super::super::Connection::Stopped,
+                snapshot: None,
+                prs: None,
+            });
+        }
+        let hub = StateHub::new(initial);
+        for include_remote in [false, true] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let serving = tokio::spawn(serve_client(server, hub.clone(), WRITE_DEADLINE));
+            if include_remote {
+                protocol::write(
+                    &mut client,
+                    &ClientMessage::Subscribe {
+                        version: protocol::VERSION,
+                        selected_repo: None,
+                        include_remote: true,
+                    },
+                )
+                .await
+                .unwrap();
+            } else {
+                // The old wire format has no capability field.
+                protocol::write(
+                    &mut client,
+                    &serde_json::json!({
+                        "type": "subscribe", "version": protocol::VERSION, "selected_repo": null
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            let Some(ServerMessage::State(received)) = protocol::read(&mut client).await.unwrap()
+            else {
+                panic!("missing workspace state");
+            };
+            assert_eq!(received.hosts.is_some(), include_remote);
+            assert_eq!(
+                received.repositories.len(),
+                if include_remote { 2 } else { 1 }
+            );
+            assert_eq!(received.repositories[0].id, "local");
+            drop(client);
+            serving.await.unwrap().unwrap();
         }
     }
 
@@ -568,6 +637,7 @@ mod tests {
             initial.repositories.push(crate::workspace::Repository {
                 id: id.into(),
                 label: id.into(),
+                host: None,
                 identity: None,
                 socket: None,
                 connection,
@@ -598,6 +668,7 @@ mod tests {
                 &ClientMessage::Subscribe {
                     version: protocol::VERSION,
                     selected_repo: Some(id.into()),
+                    include_remote: false,
                 },
             )
             .await
@@ -608,6 +679,7 @@ mod tests {
             &ClientMessage::Subscribe {
                 version: protocol::VERSION,
                 selected_repo: Some("cold".into()),
+                include_remote: false,
             },
         )
         .await
@@ -749,6 +821,7 @@ mod tests {
         large.repositories.push(crate::workspace::Repository {
             id: "large".into(),
             label: "x".repeat(15 * 1024 * 1024),
+            host: None,
             identity: None,
             socket: None,
             connection: crate::workspace::Connection::Loading,
@@ -784,6 +857,7 @@ mod tests {
             &ClientMessage::Subscribe {
                 version: protocol::VERSION,
                 selected_repo: None,
+                include_remote: false,
             },
         )
         .await
@@ -796,6 +870,7 @@ mod tests {
             &ClientMessage::Subscribe {
                 version: protocol::VERSION,
                 selected_repo: None,
+                include_remote: false,
             },
         )
         .await
@@ -889,6 +964,7 @@ mod tests {
                 version: protocol::VERSION,
                 revision,
                 repositories: repositories.clone(),
+                hosts: None,
                 selected_repo: None,
                 resource: ResourceState::Loading {
                     repo_id: String::new(),

@@ -136,6 +136,14 @@ pub enum Cmd {
     )]
     Aggregate,
 
+    #[command(hide = true)]
+    SshInventory,
+    #[command(hide = true)]
+    SshAttach {
+        #[arg(value_name = "GIT_COMMON_DIR")]
+        common_dir: PathBuf,
+    },
+
     #[command(
         about = "Add a repo to the registry",
         long_about = "Record a repo in swamp's registry without launching it, so that cross-repo commands can list it while no session runs. With --all-live, record every repo that has a running daemon, including a daemon from an older swamp version. No daemon or session is started, stopped, or restarted."

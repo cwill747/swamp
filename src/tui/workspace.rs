@@ -11,6 +11,7 @@ use crate::workspace::{
     Connection, DestinationKey,
     client::{ClientStatus, WorkspaceClient},
     protocol::ResourceState,
+    remote::{self, HostStatus},
     seen::SeenLedger,
     selection,
     ui::{self, Action, App, Filter, Mode, Section},
@@ -80,6 +81,7 @@ enum ResultEvent {
         u64,
     ),
     Status(Result<(), String>),
+    RemoteOpen(Result<(), String>),
     SharedWrite(Result<(), String>),
 }
 
@@ -318,15 +320,16 @@ pub async fn run(
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let common = crate::worktree::git_common_dir(&crate::worktree::resolve_git_dir(&cwd)).ok();
     let local_id = common.as_deref().map(crate::util::repo_id);
+    let config = crate::config::load_config();
+    let expects_ssh_hosts = config
+        .as_ref()
+        .is_ok_and(|config| !config.ssh_hosts.is_empty());
     if let Some(common) = &common {
-        crate::logging::init(
-            common,
-            false,
-            false,
-            &crate::config::load_config()
-                .map(|c| c.logging)
-                .unwrap_or_default(),
-        );
+        let logging = config
+            .as_ref()
+            .map(|config| config.logging.clone())
+            .unwrap_or_default();
+        crate::logging::init(common, false, false, &logging);
     }
     let runtime = crate::util::runtime_base_dir()?;
     let selection_path = std::env::var("ZELLIJ_SESSION_NAME")
@@ -343,6 +346,10 @@ pub async fn run(
         active_path: pin_cwd.then_some(cwd.clone()),
         ascii: crate::util::ascii_mode(),
         connection: "Connecting to workspace broker".into(),
+        status: config
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default(),
         ..Default::default()
     };
     let mut saved_selection = if let Some(path) = selection_path.clone() {
@@ -378,7 +385,11 @@ pub async fn run(
             if inventory.has_changed().unwrap_or(false) {
                 let state = inventory.borrow_and_update().clone();
                 if let Some(state) = state {
+                    if !have_inventory && state.hosts.is_none() && expects_ssh_hosts {
+                        app.status = "Restart the local workspace broker to load SSH hosts".into();
+                    }
                     app.repositories = state.repositories;
+                    app.hosts = state.hosts.unwrap_or_default();
                     have_inventory = true;
                     if let Some(shared) = last_shared.clone().or_else(|| saved_selection.take()) {
                         apply_inventory_selection(
@@ -472,6 +483,10 @@ pub async fn run(
                         } else if let Err(e) = shared {
                             app.status = format!("Selection state unavailable: {e}");
                         }
+                    }
+                    Ok(ResultEvent::RemoteOpen(result)) => {
+                        app.activating = false;
+                        app.status = result.err().unwrap_or_else(|| "Opened SSH pane".into());
                     }
                     Ok(ResultEvent::Status(result)) => {
                         if let Err(e) = result {
@@ -657,7 +672,12 @@ pub async fn run(
             let selected_repo = if view_mode == TuiView::Sidebar {
                 None
             } else {
-                app.selected.as_ref().map(|s| s.0.clone())
+                app.selected.as_ref().and_then(|(id, _)| {
+                    app.repositories
+                        .iter()
+                        .find(|repo| &repo.id == id && repo.host.is_none())
+                        .map(|repo| repo.id.clone())
+                })
             };
             if selected_repo != resource_repo {
                 resource_repo = selected_repo.clone();
@@ -772,6 +792,7 @@ pub async fn run(
                     Action::Activate => {
                         let slot_action = app
                             .selected_entry()
+                            .filter(|entry| !entry.repo.starts_with("ssh:"))
                             .and_then(|e| e.destination)
                             .map(|d| slot_activation(Some(&d.row)))
                             .unwrap_or(SlotActivation::Navigate);
@@ -827,14 +848,18 @@ fn activate(app: &mut App, tasks: &mut JoinSet<ResultEvent>) {
         app.status = "Workspace disconnected; reconnect before opening a destination".into();
         return;
     }
+    let Some(entry) = app.selected_entry() else {
+        return;
+    };
+    if app.host(&entry.repo).is_some() {
+        app.mode = Mode::Details;
+        return;
+    }
     if !crate::zellij::in_zellij() {
         app.status = "Outside Zellij: use the displayed destination path".into();
         app.mode = Mode::Details;
         return;
     }
-    let Some(entry) = app.selected_entry() else {
-        return;
-    };
     let Some(repo) = app.repositories.iter().find(|r| r.id == entry.repo) else {
         return;
     };
@@ -845,6 +870,30 @@ fn activate(app: &mut App, tasks: &mut JoinSet<ResultEvent>) {
     let Some(identity) = repo.identity.clone() else {
         return;
     };
+    if let Some(host_id) = &repo.host {
+        let Some(host) = app.hosts.iter().find(|host| &host.id == host_id).cloned() else {
+            app.status = "SSH host unavailable".into();
+            return;
+        };
+        if !matches!(host.status, HostStatus::Connected) {
+            app.status = "SSH host disconnected; wait for it to reconnect".into();
+            return;
+        }
+        let label = ui::clean(&repo.label);
+        app.activating = true;
+        app.status = "Opening SSH pane…".into();
+        tasks.spawn(async move {
+            ResultEvent::RemoteOpen(
+                tokio::task::spawn_blocking(move || {
+                    remote::open(&host, &identity.common_dir, &label)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| format!("{e:#}"))),
+            )
+        });
+        return;
+    }
     let (target, captured) = match entry.destination {
         Some(d) => (
             Target {
@@ -1117,6 +1166,7 @@ mod tests {
         Repository {
             id: "repo-1".into(),
             label: "repo".into(),
+            host: None,
             identity: None,
             socket: None,
             connection: Connection::Live,
@@ -1219,6 +1269,7 @@ mod tests {
         let repo = Repository {
             id: "repo".into(),
             label: "repo".into(),
+            host: None,
             identity: None,
             socket: None,
             connection: Connection::Live,

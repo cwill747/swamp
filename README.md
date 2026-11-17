@@ -529,6 +529,37 @@ Real Zellij 0.45.0 captures show the generated dashboard at
 and ANSI source captures are in
 [zellij-0.45-captures](tests/fixtures/workspace/zellij-0.45-captures).
 
+### Remote SSH hosts
+
+Install a version of Swamp with SSH discovery on each host and add its
+OpenSSH alias to your local Swamp config:
+
+```toml
+[ssh_hosts.dev]
+target = "dev-box"  # an SSH config alias or user@host
+# swamp_path = "/absolute/path/to/swamp"  # optional for noninteractive SSH
+```
+
+The workspace dashboard reloads this list automatically. Spaces groups
+repositories by host and shows SSH connection status, including hosts with
+no repositories. Agents includes reported agents from connected remote hosts.
+Swamp discovers running Swamp daemons and repositories added on that host
+with `swamp register`. An SSH disconnect marks cached rows stale and Swamp
+retries automatically.
+
+Use an SSH account that can connect without prompting. Swamp uses your usual
+OpenSSH keys, agent, host keys, and jump hosts. Run `ssh dev-box swamp --version`
+to check the remote binary. The SSH login needs the same Swamp runtime and
+state directories as the remote sessions. If you upgraded with an old
+`swamp aggregate` process still running, restart that broker process and
+reopen the dashboard to pick up SSH support.
+
+Inside local Zellij, press Enter on a remote repository or one of its rows
+to open that repository's remote Swamp session in an SSH pane. From there
+you can use the remote dashboard to select a worktree or agent and run
+repository actions. Outside local Zellij, the workspace shows remote status
+and paths.
+
 ### Attention badges
 
 swamp marks Zellij tab names, so that you can see a waiting agent from any tab:

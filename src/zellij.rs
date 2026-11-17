@@ -61,6 +61,13 @@ pub fn new_floating_pane(cwd: &Path, name: &str, cmd: &[&str]) -> Result<()> {
     action(&refs)
 }
 
+/// Leave the pane open after the SSH client exits so connection errors remain visible.
+pub fn new_ssh_pane(name: &str, cmd: &[&str]) -> Result<()> {
+    let mut args = vec!["new-pane", "--floating", "--name", name, "--"];
+    args.extend_from_slice(cmd);
+    action(&args)
+}
+
 /// Environment variables that tie a `zellij` command to the session that
 /// contains this process. A command that targets a different session must not
 /// inherit them.

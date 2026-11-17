@@ -5,7 +5,7 @@
 //! module, and sends each daemon its count when the count changes and on an
 //! interval. A daemon drops a count that is not sent again, so an aggregator
 //! that stops cannot leave a stale badge. The process holds no state on disk
-//! and exits when no daemon has run for a while.
+//! and exits when no daemon or dashboard client has connected for a while.
 
 use crate::daemon::socket::ClientMsg;
 use crate::daemon::state::{AgentStatus, Snapshot};
@@ -14,6 +14,7 @@ use crate::workspace::{
     self,
     broker::StateHub,
     protocol::{ResourceState, WorkspaceState},
+    remote::Remotes,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -56,7 +57,7 @@ pub struct Timing {
     /// Interval at which each count is sent again. It must be shorter than
     /// the lifetime of a count in the daemon.
     pub resend_interval: Duration,
-    /// How long the process runs with no live daemon before it exits.
+    /// How long the process runs without live daemons or dashboard clients.
     pub idle_exit: Duration,
     pub request_timeout: Duration,
 }
@@ -76,7 +77,7 @@ impl Default for Timing {
 pub enum Exit {
     /// A different instance holds the lock.
     AlreadyRunning,
-    /// No daemon was live for the idle time.
+    /// No daemon or dashboard client was active for the idle time.
     Idle,
 }
 
@@ -210,7 +211,7 @@ fn acquire_attention_lock(lock: &mut Option<std::fs::File>, path: &Path) {
 }
 
 /// Run the aggregator for the daemons in `runtime_dir`.
-pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
+async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("create {}", runtime_dir.display()))?;
     // Older Swamp versions hold `aggregator.lock` while serving attention
@@ -226,18 +227,34 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     let listener = workspace::broker::bind_owned(&runtime_dir)?;
     let _endpoint_guard =
         workspace::broker::EndpointGuard::capture(&workspace::protocol::socket_path(&runtime_dir));
-    let initial = WorkspaceState {
-        version: workspace::protocol::VERSION,
-        revision: 0,
-        repositories: Vec::new(),
-        selected_repo: None,
-        resource: ResourceState::Loading {
-            repo_id: String::new(),
-            generation: 0,
-            snapshot: None,
-        },
-    };
-    let hub = StateHub::new(initial);
+    let mut model = workspace::Workspace::default();
+    let mut remotes = Remotes::default();
+    let hub = StateHub::new(inventory_state(&model, &remotes));
+
+    let (config_tx, mut config_rx) = tokio::sync::watch::channel(BTreeMap::new());
+    let load_ssh_config = !cfg!(test);
+    let config_task = load_ssh_config.then(|| {
+        OwnedTask::new(tokio::spawn(async move {
+            let mut refresh = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                refresh.tick().await;
+                match tokio::task::spawn_blocking(crate::config::load_config).await {
+                    Ok(Ok(config)) => {
+                        config_tx.send_if_modified(|hosts| {
+                            if *hosts == config.ssh_hosts {
+                                return false;
+                            }
+                            *hosts = config.ssh_hosts;
+                            true
+                        });
+                    }
+                    Ok(Err(error)) => tracing::debug!("could not reload SSH hosts: {error:#}"),
+                    Err(error) => tracing::warn!("SSH host config task: {error}"),
+                }
+            }
+        }))
+    });
+    let (remote_tx, mut remote_rx) = mpsc::channel(64);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let broker = OwnedTask::new(tokio::spawn(workspace::broker::serve(
         listener,
@@ -281,14 +298,12 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
         timing.request_timeout,
         runtime_dir.join(LOCK_FILE),
     )));
-    let mut model = workspace::Workspace::default();
     let mut generations = BTreeMap::<String, u64>::new();
     let mut resource_deadlines = BTreeMap::<String, Instant>::new();
-    let mut revision = 0_u64;
     let mut idle_since = Instant::now();
     let mut resource_check = tokio::time::interval(Duration::from_millis(500));
     let exit = loop {
-        tokio::select! {
+        let changed = tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break Exit::Idle };
                 match &event {
@@ -334,21 +349,14 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
                 model.apply(event);
                 let waiting = repos.iter().map(|(id, repo)| (id.clone(), Repo { sock: repo.sock.clone(), waiting: repo.waiting, sent: None, supported: true })).collect();
                 attention_tx.send_replace(waiting);
-                revision = revision.wrapping_add(1);
-                hub.publish(WorkspaceState {
-                    version: workspace::protocol::VERSION,
-                    revision,
-                    repositories: model.repositories(),
-                    selected_repo: None,
-                    resource: ResourceState::Loading { repo_id: String::new(), generation: 0, snapshot: None },
-                });
+                true
             }
             changed = registry_rx.changed() => {
-                if changed.is_ok() {
-                    model.set_registry(registry_rx.borrow_and_update().clone());
-                    revision = revision.wrapping_add(1);
-                    hub.publish(WorkspaceState { version: workspace::protocol::VERSION, revision, repositories: model.repositories(), selected_repo: None, resource: ResourceState::Loading { repo_id: String::new(), generation: 0, snapshot: None } });
-                }
+                changed.is_ok() && model.set_registry(registry_rx.borrow_and_update().clone())
+            }
+            update = remote_rx.recv() => update.is_some_and(|update| remotes.apply(update)),
+            changed = config_rx.changed(), if load_ssh_config => {
+                changed.is_ok() && remotes.configure(&config_rx.borrow_and_update(), hub.has_clients(), &remote_tx)
             }
             _ = resource_check.tick() => {
                 let expired: Vec<_> = resource_deadlines.iter().filter(|(_, deadline)| **deadline <= Instant::now()).map(|(id, _)| id.clone()).collect();
@@ -358,14 +366,22 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
                     let state = ResourceState::Unavailable { repo_id: id.clone(), generation, snapshot: None };
                     hub.publish_resource(id, state).await;
                 }
+                remotes.configure(&config_rx.borrow(), hub.has_clients(), &remote_tx)
             }
+        };
+        if changed {
+            hub.publish(inventory_state(&model, &remotes));
         }
-        if !repos.is_empty() {
+        if !repos.is_empty() || hub.has_clients() {
             idle_since = Instant::now();
         } else if idle_since.elapsed() >= timing.idle_exit {
             break Exit::Idle;
         }
     };
+    drop(remotes);
+    if let Some(task) = config_task {
+        task.abort_and_join().await;
+    }
     attention.abort_and_join().await;
     registry_task.abort_and_join().await;
     drop(tx);
@@ -374,6 +390,24 @@ pub async fn run_at(runtime_dir: PathBuf, timing: Timing) -> Result<Exit> {
     shutdown_tx.send_replace(true);
     broker.join().await.context("workspace broker task")??;
     Ok(exit)
+}
+
+fn inventory_state(model: &workspace::Workspace, remotes: &Remotes) -> WorkspaceState {
+    let mut repositories = model.repositories();
+    let (hosts, remote_repositories) = remotes.inventory();
+    repositories.extend(remote_repositories);
+    WorkspaceState {
+        version: workspace::protocol::VERSION,
+        revision: 0,
+        repositories,
+        hosts: Some(hosts),
+        selected_repo: None,
+        resource: ResourceState::Loading {
+            repo_id: String::new(),
+            generation: 0,
+            snapshot: None,
+        },
+    }
 }
 
 /// Entry point of the hidden `swamp aggregate` command.
@@ -638,6 +672,7 @@ mod tests {
             version: crate::workspace::protocol::VERSION,
             revision: 0,
             repositories: Vec::new(),
+            hosts: None,
             selected_repo: None,
             resource: ResourceState::Loading {
                 repo_id: String::new(),
@@ -651,6 +686,7 @@ mod tests {
             version: crate::workspace::protocol::VERSION,
             revision: 1,
             repositories: Vec::new(),
+            hosts: None,
             selected_repo: None,
             resource: ResourceState::Loading {
                 repo_id: String::new(),

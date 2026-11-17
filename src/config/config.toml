@@ -82,3 +82,9 @@ enabled = true
 # [[slots.hooks.post-alloc]]
 # run = "direnv allow"
 # timeout_secs = 60
+
+# SSH hosts shown in the workspace dashboard. The remote account must have
+# Swamp installed and be able to log in with OpenSSH without prompting.
+# [ssh_hosts.dev]
+# target = "dev-box"
+# swamp_path = "/absolute/path/to/swamp"

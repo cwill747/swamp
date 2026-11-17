@@ -1,4 +1,5 @@
 //! Cached workspace presentation and input. No filesystem or terminal actions.
+use super::remote::{Host, HostStatus};
 use super::seen::{SeenState, SemanticState};
 use super::selection::SharedSelection;
 use super::{Connection, Destination, DestinationKey, Repository};
@@ -11,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use unicode_width::UnicodeWidthChar;
 
 // ANSI theme tokens also work without truecolor. The canvas inherits the
@@ -100,6 +101,7 @@ pub struct App {
     /// Generated Zellij panes already have a native split gutter.
     pub embedded: bool,
     pub repositories: Vec<Repository>,
+    pub hosts: Vec<Host>,
     pub seen: SeenState,
     pub section: Section,
     pub mode: Mode,
@@ -130,6 +132,10 @@ fn state_rank(s: SemanticState) -> u8 {
         SemanticState::Unknown => 4,
     }
 }
+fn stale_remote(repo: &Repository) -> bool {
+    repo.host.is_some() && repo.connection == Connection::Disconnected
+}
+
 fn connection_label(c: Connection) -> &'static str {
     match c {
         Connection::Loading => "Loading",
@@ -204,7 +210,11 @@ impl App {
             repo: repo.id.clone(),
             key: Some(d.key.clone()),
             primary: d.title.clone(),
-            secondary,
+            secondary: if stale_remote(repo) {
+                format!("{secondary} / stale")
+            } else {
+                secondary
+            },
             destination: Some(d),
             state,
             child: false,
@@ -213,7 +223,12 @@ impl App {
     }
     pub fn entries(&self, section: Section) -> Vec<Entry> {
         let mut out = Vec::new();
+        let mut remote_rows = BTreeMap::<&str, Vec<Entry>>::new();
         for repo in &self.repositories {
+            let out = match (section, repo.host.as_deref()) {
+                (Section::Spaces, Some(host)) => remote_rows.entry(host).or_default(),
+                _ => &mut out,
+            };
             let destinations = repo.destinations();
             if section == Section::Spaces {
                 let matching: Vec<_> = destinations
@@ -286,8 +301,9 @@ impl App {
                                     .map(|p| format!(" #{}", p.number))
                                     .unwrap_or_default()
                             };
+                            let stale = if stale_remote(repo) { " / stale" } else { "" };
                             entry.secondary = format!(
-                                "{slot}{}{}{dirty}{pr}",
+                                "{slot}{}{}{dirty}{pr}{stale}",
                                 row.branch,
                                 if row.is_default { " / trunk" } else { "" }
                             );
@@ -319,9 +335,10 @@ impl App {
                         });
                         entry.primary = child.description.unwrap_or(child.agent_type);
                         entry.secondary = format!(
-                            "{} / subagent {} parent",
+                            "{} / subagent {} parent{}",
                             repo.label,
-                            if self.ascii { "->" } else { "→" }
+                            if self.ascii { "->" } else { "→" },
+                            if stale_remote(repo) { " / stale" } else { "" },
                         );
                         entry.state = match child.status {
                             crate::daemon::state::SubagentStatus::Running => SemanticState::Working,
@@ -356,8 +373,38 @@ impl App {
             });
             return groups.into_iter().flatten().collect();
         }
+        let query = self.query.to_lowercase();
+        for host in &self.hosts {
+            let matching = remote_rows.remove(host.id.as_str()).unwrap_or_default();
+            if matching.is_empty()
+                && (self.filter != Filter::All
+                    || !(host.id.to_lowercase().contains(&query)
+                        || host.config.target.to_lowercase().contains(&query)))
+            {
+                continue;
+            }
+            let key = host.key();
+            let expanded = !self.collapsed.contains(&key) || !self.query.is_empty();
+            out.push(Entry {
+                repo: key,
+                destination: None,
+                key: None,
+                primary: format!("{} · {}", host.id, host.status.label()),
+                secondary: host.config.target.clone(),
+                state: SemanticState::Unknown,
+                child: false,
+                header: true,
+            });
+            if expanded {
+                out.extend(matching);
+            }
+        }
         out
     }
+    pub fn host(&self, key: &str) -> Option<&Host> {
+        self.hosts.iter().find(|host| host.key() == key)
+    }
+
     pub fn selected_entry(&self) -> Option<Entry> {
         self.entries(self.section)
             .into_iter()
@@ -567,6 +614,9 @@ impl App {
         let ranked = rank(&states);
         let mut out = Vec::new();
         for repo in &self.repositories {
+            if stale_remote(repo) {
+                continue;
+            }
             for d in repo.destinations() {
                 if d.row.deleting {
                     continue;
@@ -893,10 +943,11 @@ fn render_section(f: &mut Frame, app: &mut App, area: Rect, section: Section) {
     {
         let y = 1 + ((index - app.scroll[which]) * height) as u16;
         let selected = selected == Some(index);
-        let active = entry
-            .destination
-            .as_ref()
-            .is_some_and(|d| app.active_path.as_ref().is_some_and(|p| p == &d.row.path));
+        let active = !entry.repo.starts_with("ssh:")
+            && entry
+                .destination
+                .as_ref()
+                .is_some_and(|d| app.active_path.as_ref().is_some_and(|p| p == &d.row.path));
         let prefix = if selected { ">" } else { " " };
         let symbol = if entry.header {
             if app.collapsed.contains(&entry.repo) {
@@ -1007,6 +1058,38 @@ fn render_details(f: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     };
+    if let Some(host) = app.host(&entry.repo) {
+        let mut lines = vec![
+            Line::from(clean(&entry.primary)),
+            Line::from(clean(&format!("SSH target    {}", host.config.target))),
+        ];
+        match &host.status {
+            HostStatus::Offline(error) => {
+                lines.push(Line::from(clean(error)));
+                lines.push(Line::from(
+                    "Retrying automatically. Cached repositories are stale.",
+                ));
+            }
+            HostStatus::Connected
+                if !app
+                    .repositories
+                    .iter()
+                    .any(|repo| repo.host.as_ref() == Some(&host.id)) =>
+            {
+                lines.push(Line::from(
+                    "No Swamp repositories on this host. Run swamp register there to add one.",
+                ));
+            }
+            _ => {}
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((app.detail_scroll, 0)),
+            area,
+        );
+        return;
+    }
     let Some(repo) = app.repositories.iter().find(|r| r.id == entry.repo) else {
         return;
     };
@@ -1099,10 +1182,14 @@ fn render_details(f: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Resources (selected repository)"));
-    lines.extend(app.resource_lines.iter().map(|s| Line::from(clean(s))));
-    lines.push(Line::from(""));
-    lines.push(Line::from("Enter Open agent   g Go To   c Create   m More"));
+    if repo.host.is_some() {
+        lines.push(Line::from("Enter Open remote session   g Go To"));
+    } else {
+        lines.push(Line::from("Resources (selected repository)"));
+        lines.extend(app.resource_lines.iter().map(|s| Line::from(clean(s))));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Enter Open agent   g Go To   c Create   m More"));
+    }
     if !crate::zellij::in_zellij() {
         lines.push(Line::from(
             "Outside Zellij: paths available; terminal opening disabled",
@@ -1157,6 +1244,7 @@ pub(crate) mod tests {
         let repo = |id: &str, label: &str, rows| Repository {
             id: id.into(),
             label: label.into(),
+            host: None,
             identity: Some(RepoIdentity {
                 common_dir: format!("/repos/{label}/.bare").into(),
                 session_name: format!("{label}-session"),
