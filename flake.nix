@@ -47,6 +47,17 @@
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
             # Git-backed fixtures must run in the isolated check environment.
             nativeCheckInputs = [ pkgs.git ];
+            # Darwin's Nix build directory can exceed the Unix socket path limit
+            # once tests append their runtime directory and socket names.
+            preCheck = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              swampOriginalTmpdir="$TMPDIR"
+              TMPDIR=$(mktemp -d /private/tmp/swamp.XXXXXX)
+              export TMPDIR
+            '';
+            postCheck = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              rm -rf "$TMPDIR"
+              export TMPDIR="$swampOriginalTmpdir"
+            '';
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           swampUnwrapped = craneLib.buildPackage (commonArgs // {
