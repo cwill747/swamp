@@ -104,6 +104,34 @@ pub fn git_info(dir: &Path) -> Result<GitInfo> {
     Ok(info)
 }
 
+/// Recheck initialized submodules before releasing or removing their parent.
+pub fn dirty_for_removal(dir: &Path, info: &GitInfo) -> Result<bool> {
+    if info.is_dirty() {
+        return Ok(true);
+    }
+    if !dir.join(".gitmodules").try_exists()? {
+        return Ok(false);
+    }
+    // Override ignore settings intended for display, including untracked files.
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--ignore-submodules=none",
+            "--untracked-files=normal",
+        ])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "could not inspect submodule status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(!output.stdout.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

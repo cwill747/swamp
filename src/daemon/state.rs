@@ -6,7 +6,7 @@ use crate::worktree::slots;
 use crate::worktree::{self, GitInfo, RemoveRefusedReason, SlotState, Worktree, WorktreeKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -301,6 +301,8 @@ pub struct DaemonState {
     pub rows: HashMap<String, WorktreeRow>,
     pub agents: HashMap<String, AgentRecord>,
     pub prs: HashMap<String, PrSummary>,
+    // Display-only cache for branches whose individual lookup failed.
+    stale_prs: BTreeMap<String, Option<PrSummary>>,
     /// Unix timestamp of the last successful PR fetch (mirrors `PrSnapshot::fetched_at`).
     pr_fetched_at: Option<u64>,
     /// Last PR fetch error, if any (mirrors `PrSnapshot::error`).
@@ -340,6 +342,7 @@ impl Default for DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
             prs: HashMap::new(),
+            stale_prs: BTreeMap::new(),
             pr_fetched_at: None,
             pr_error: None,
             // No PR fetch has happened yet, so a fresh daemon reports loading.
@@ -350,6 +353,17 @@ impl Default for DaemonState {
             pending_descriptions: HashMap::new(),
             branch_titles: HashMap::new(),
         }
+    }
+}
+
+impl WorktreeRow {
+    fn apply_agent(&mut self, rec: &AgentRecord) {
+        self.agent = rec.status;
+        self.agent_ts = rec.ts;
+        self.activity_id.clone_from(&rec.activity_id);
+        self.completion_id.clone_from(&rec.completion_id);
+        self.session_name.clone_from(&rec.session_name);
+        self.harness = rec.harness;
     }
 }
 
@@ -426,6 +440,11 @@ impl DaemonState {
             self.drop_subagents(name);
         }
         self.rows = new_rows;
+        for (name, row) in &mut self.rows {
+            if let Some(agent) = self.agents.get(name) {
+                row.apply_agent(agent);
+            }
+        }
     }
 
     /// Record an agent status ping. Returns `true` when the record changed in
@@ -459,14 +478,10 @@ impl DaemonState {
     }
 
     fn store_agent_record(&mut self, wt_name: &str, rec: AgentRecord) {
-        self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
-            row.agent = rec.status;
-            row.agent_ts = rec.ts;
-            row.activity_id = rec.activity_id.clone();
-            row.completion_id = rec.completion_id.clone();
-            row.session_name = rec.session_name;
+            row.apply_agent(&rec);
         }
+        self.agents.insert(wt_name.to_owned(), rec);
     }
 
     /// Record a hook that may carry a subagent event. Returns `true` when subscribers can observe the change, with the
@@ -696,7 +711,11 @@ impl DaemonState {
                         .then(a.id.cmp(&b.id))
                 });
                 let pr = (!row.is_default)
-                    .then(|| self.prs.get(&row.branch))
+                    .then(|| {
+                        self.prs
+                            .get(&row.branch)
+                            .or_else(|| self.stale_prs.get(&row.branch)?.as_ref())
+                    })
                     .flatten()
                     .map(|p| p.title.as_str());
                 let (title, source) = titles::resolve(TitleInputs {
@@ -730,7 +749,17 @@ impl DaemonState {
     ///
     /// Replaces the PR map, records `fetched_at`, and clears any previous
     /// error.  The daemon's PR poller calls this on the `Ok(Ok(prs))` arm.
-    pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>) {
+    pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>, failed: Vec<String>) {
+        self.stale_prs = failed
+            .into_iter()
+            .map(|branch| {
+                let previous = self
+                    .prs
+                    .remove(&branch)
+                    .or_else(|| self.stale_prs.remove(&branch).flatten());
+                (branch, previous)
+            })
+            .collect();
         self.prs = prs;
         self.pr_fetched_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -757,10 +786,27 @@ impl DaemonState {
     }
 
     pub fn pr_snapshot(&self) -> PrSnapshot {
+        let mut prs = self.prs.clone();
+        prs.extend(
+            self.stale_prs
+                .iter()
+                .filter_map(|(branch, pr)| Some((branch.clone(), pr.clone()?))),
+        );
         PrSnapshot {
-            prs: self.prs.clone(),
+            prs,
             fetched_at: self.pr_fetched_at,
-            error: self.pr_error.clone(),
+            error: self.pr_error.clone().or_else(|| {
+                (!self.stale_prs.is_empty()).then(|| {
+                    format!(
+                        "PR lookup failed for {}",
+                        self.stale_prs
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            }),
             loading: self.pr_loading,
         }
     }
@@ -799,21 +845,10 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
     serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// Run the full git scan (list_worktrees + per-worktree git_info) and return
-/// the computed row map.  This function is CPU/IO-bound and is meant to be
-/// called from `tokio::task::spawn_blocking`; it must NOT be called while
-/// holding any async lock.
-///
-/// `agents` is a snapshot cloned out from `DaemonState::agents` under a read
-/// lock *before* this call; the caller swaps the result in under the write lock
-/// with [`DaemonState::apply_scanned_rows`]. `prs` is the PR map to trust for
-/// the merged-branch removal signal — pass `None` while a PR fetch is loading
-/// or has most recently failed, since a stale-but-cached map shouldn't unlock
-/// a squash-merge deletion during an outage (see
-/// [`DaemonState::pr_state_for_verdicts`]).
+/// Collect Git state on blocking workers. The caller joins current agent
+/// records under the state write lock in [`DaemonState::apply_scanned_rows`].
 pub fn scan_worktrees(
     common_dir: &Path,
-    agents: &HashMap<String, AgentRecord>,
     default_branch: &str,
 ) -> Result<HashMap<String, WorktreeRow>> {
     let wts = worktree::list_worktrees(common_dir)?;
@@ -822,12 +857,7 @@ pub fn scan_worktrees(
     }
     let default_tip = worktree::default_branch_tip(common_dir);
 
-    // Gather per-worktree git status concurrently. Each `git_info` shells out to
-    // `git status` / `git rev-list`, so a sequential loop made first-launch
-    // latency scale with worktree count. We're already on a `spawn_blocking`
-    // thread, so fanning the work across a small pool of scoped OS threads is
-    // safe; `MAX_SCAN_CONCURRENCY` caps the number of simultaneous `git`
-    // subprocesses so a repo with dozens of worktrees can't stampede the box.
+    // Bound concurrent libgit2 status walks on large repositories.
     const MAX_SCAN_CONCURRENCY: usize = 8;
     let workers = MAX_SCAN_CONCURRENCY.min(wts.len());
     let next = AtomicUsize::new(0);
@@ -851,11 +881,10 @@ pub fn scan_worktrees(
                         }
                     };
                     let name = wt.name();
-                    let agent = agents.get(&name).cloned().unwrap_or_default();
                     let pin =
                         slots::slot_number(&name).and_then(|_| slots::read_pin(common_dir, &name));
                     let openspec = titles::openspec_change(common_dir, &wt.path, default_tip);
-                    let row = build_row(wt, &info, &agent, default_branch, pin, openspec);
+                    let row = build_row(wt, &info, default_branch, pin, openspec);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -876,7 +905,6 @@ pub fn scan_worktrees(
 fn build_row(
     wt: &Worktree,
     info: &GitInfo,
-    agent: &AgentRecord,
     default_branch: &str,
     pin: Option<String>,
     openspec_change: Option<String>,
@@ -909,13 +937,13 @@ fn build_row(
         untracked: info.untracked,
         conflict: info.conflict,
         rebase: info.rebase,
-        agent: agent.status,
-        agent_ts: agent.ts,
-        activity_id: agent.activity_id.clone(),
-        completion_id: agent.completion_id.clone(),
-        session_name: agent.session_name.clone(),
+        agent: AgentStatus::Idle,
+        agent_ts: 0,
+        activity_id: None,
+        completion_id: None,
+        session_name: None,
         head_ts: info.head_ts,
-        harness: agent.harness,
+        harness: None,
         is_default,
         removal_block: None,
         // Projected from `DaemonState::deleting` by `snapshot()`, not known
@@ -1026,20 +1054,11 @@ mod tests {
     /// leaves every other row unflagged.
     #[test]
     fn build_row_flags_default_branch() {
-        let agent = AgentRecord::default();
-
         let info_main = GitInfo {
             branch: "main".into(),
             ..Default::default()
         };
-        let main = build_row(
-            &worktree("main", "main"),
-            &info_main,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let main = build_row(&worktree("main", "main"), &info_main, "main", None, None);
         assert!(main.is_default, "the default branch row must be flagged");
 
         let info_feat = GitInfo {
@@ -1049,7 +1068,6 @@ mod tests {
         let feat = build_row(
             &worktree("feature-x", "feature/x"),
             &info_feat,
-            &agent,
             "main",
             None,
             None,
@@ -1061,12 +1079,11 @@ mod tests {
     /// even a worktree literally named/branched `main`.
     #[test]
     fn build_row_no_default_when_undetectable() {
-        let agent = AgentRecord::default();
         let info = GitInfo {
             branch: "main".into(),
             ..Default::default()
         };
-        let row = build_row(&worktree("main", "main"), &info, &agent, "", None, None);
+        let row = build_row(&worktree("main", "main"), &info, "", None, None);
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
@@ -1105,7 +1122,7 @@ mod tests {
         let dirty = create_worktree(&bare, "feature").unwrap();
         std::fs::write(dirty.path.join("scratch.txt"), "wip").unwrap();
 
-        let rows = scan_worktrees(&bare, &HashMap::new(), "").unwrap();
+        let rows = scan_worktrees(&bare, "").unwrap();
 
         assert_eq!(
             rows.get("feature").unwrap().removal_block,
@@ -1201,7 +1218,6 @@ mod tests {
     /// Slot rows carry their kind and state; a pin turns a free slot pinned.
     #[test]
     fn build_row_reports_slot_state() {
-        let agent = AgentRecord::default();
         let detached = GitInfo {
             branch: "(detached)".into(),
             ..Default::default()
@@ -1209,7 +1225,6 @@ mod tests {
         let free = build_row(
             &worktree("work2", "detached@abc1234"),
             &detached,
-            &agent,
             "main",
             None,
             None,
@@ -1220,7 +1235,6 @@ mod tests {
         let pinned = build_row(
             &worktree("work3", "detached@abc1234"),
             &detached,
-            &agent,
             "main",
             Some("review #172".into()),
             None,
@@ -1232,24 +1246,10 @@ mod tests {
             branch: "fix-ci".into(),
             ..Default::default()
         };
-        let busy = build_row(
-            &worktree("work1", "fix-ci"),
-            &on_branch,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let busy = build_row(&worktree("work1", "fix-ci"), &on_branch, "main", None, None);
         assert_eq!(busy.slot_state, Some(SlotState::Busy));
 
-        let overflow = build_row(
-            &worktree("spike", "spike"),
-            &on_branch,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let overflow = build_row(&worktree("spike", "spike"), &on_branch, "main", None, None);
         assert_eq!(overflow.kind, WorktreeKind::Overflow);
         assert_eq!(overflow.slot_state, None);
     }
@@ -1616,7 +1616,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(42));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
 
         assert_eq!(state.prs.len(), 1);
         assert!(state.pr_error.is_none());
@@ -1628,6 +1628,34 @@ mod tests {
         assert!(snap.fetched_at.is_some());
     }
 
+    #[test]
+    fn partial_poll_retains_only_failed_branches_for_display() {
+        let mut state = DaemonState::default();
+        state.update_prs(
+            HashMap::from([
+                ("feature".into(), make_pr(1)),
+                ("closed".into(), make_pr(2)),
+            ]),
+            vec![],
+        );
+        for _ in 0..2 {
+            state.update_prs(
+                HashMap::from([("fresh".into(), make_pr(3))]),
+                vec!["feature".into()],
+            );
+            let snapshot = state.pr_snapshot();
+            assert_eq!(snapshot.prs.len(), 2);
+            assert_eq!(snapshot.prs["feature"].number, 1);
+            assert!(snapshot.error.unwrap().contains("feature"));
+            let trusted = state.pr_state_for_verdicts().unwrap();
+            assert!(!trusted.contains_key("feature"));
+            assert!(trusted.contains_key("fresh"));
+        }
+        state.update_prs(HashMap::new(), vec![]);
+        assert!(state.pr_snapshot().prs.is_empty());
+        assert!(state.pr_snapshot().error.is_none());
+    }
+
     /// A PR fetch error keeps the previous map and records the error message.
     #[test]
     fn record_pr_error_preserves_previous_map() {
@@ -1636,7 +1664,7 @@ mod tests {
         // Seed a successful fetch first.
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(7));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(state.pr_fetched_at.is_some());
 
         // Now a transient failure must NOT wipe the map.
@@ -1671,7 +1699,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("main".into(), make_pr(1));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(state.pr_error.is_none());
     }
 
@@ -1694,7 +1722,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(9));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
 
         assert!(
             !state.pr_snapshot().loading,
@@ -1726,7 +1754,7 @@ mod tests {
         // Seed a prior success so we can confirm the map is preserved on error.
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(3));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(!state.pr_snapshot().loading);
 
         state.record_pr_error("network timeout".into());
@@ -2055,6 +2083,18 @@ mod tests {
         state.remove_row("main");
         state.rows.insert("main".into(), make_row("main"));
         assert!(subs(&state).is_empty());
+    }
+
+    #[test]
+    fn publishing_scan_keeps_completion_received_during_scan() {
+        let mut state = state_with_main();
+        let scanned = HashMap::from([("main".into(), make_row("main"))]);
+        state.apply_codex_completion("main", "turn-17");
+        state.set_harness("main", Harness::Codex);
+        state.apply_scanned_rows(scanned);
+        let row = &state.rows["main"];
+        assert_eq!(row.completion_id.as_deref(), Some("codex:turn-17"));
+        assert_eq!(row.harness, Some(Harness::Codex));
     }
 
     #[test]

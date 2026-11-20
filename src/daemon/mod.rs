@@ -323,7 +323,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                                 .collect::<Vec<_>>()
                         };
                         let before = titles(&s.snapshot());
-                        s.update_prs(prs);
+                        s.update_prs(prs.prs, prs.failed);
                         let pr_snap = s.pr_snapshot();
                         // Row titles can come from PR titles, so a PR change
                         // can retitle rows: send the new rows at once rather
@@ -613,23 +613,12 @@ impl Daemon {
             Ok(changes) => self.apply_agent_changes(&changes).await?,
             Err(e) => tracing::warn!("autoclean skipped: {e:#}"),
         }
-        // Clone out the agents map and default branch under a read lock so the git
-        // scan (which can take seconds on large repos) runs completely off the
-        // runtime via spawn_blocking, without blocking any async task or
-        // holding any lock.
-        let (agents, default_branch) = {
-            let s = self.state.read().await;
-            (s.agents.clone(), s.default_branch.clone())
-        };
-
-        // `scan_worktrees` fans the per-worktree git status out across a bounded
-        // pool of scoped threads internally, so a single `spawn_blocking` keeps
-        // the whole concurrent scan off the async runtime. No async lock is held
-        // across this await — `agents` was cloned out above under a read
-        // lock.
+        // Agent hooks may arrive during the scan. Join their live state when
+        // publishing the rows under the write lock.
+        let default_branch = self.state.read().await.default_branch.clone();
         let common = self.common_dir.clone();
         let (new_rows, titles) = tokio::task::spawn_blocking(move || {
-            let rows = crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)?;
+            let rows = crate::daemon::state::scan_worktrees(&common, &default_branch)?;
             anyhow::Ok((rows, crate::slot_service::user_titles(&common)))
         })
         .await
@@ -719,16 +708,11 @@ impl Daemon {
         // configured, which would make `@{u}` fail with "no upstream
         // configured".
         let common = self.common_dir.clone();
-        let (wt, branch) = tokio::task::spawn_blocking(move || {
-            (
-                crate::worktree::default_worktree_path(&common),
-                crate::worktree::default_branch(&common),
-            )
-        })
-        .await
-        .context("locate default worktree")?;
-        if let Some(path) = wt {
-            let remote_ref = format!("origin/{branch}");
+        let target =
+            tokio::task::spawn_blocking(move || crate::worktree::default_update_target(&common))
+                .await
+                .context("locate default worktree")??;
+        if let Some((path, remote_ref)) = target {
             let merge_child = tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&path)
@@ -750,9 +734,9 @@ impl Daemon {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            tracing::info!(worktree = %wt_name, branch = %branch, "fast-forwarded default branch");
+            tracing::info!(worktree = %wt_name, refname = %remote_ref, "fast-forwarded default branch");
         } else {
-            tracing::debug!(branch = %branch, "default branch not checked out; nothing to fast-forward");
+            tracing::debug!("default branch not checked out; nothing to fast-forward");
         }
 
         self.refresh_all_unlocked().await
@@ -782,6 +766,8 @@ impl Daemon {
         offline: bool,
         no_hooks: bool,
     ) -> Result<crate::worktree::slots::Allocation> {
+        let warning =
+            crate::worktree::slots::prepare_alloc(&self.common_dir, branch, offline).await?;
         let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let pr = self
@@ -796,11 +782,10 @@ impl Daemon {
                 head_oid: p.head_oid.as_ref().and_then(|oid| oid.parse().ok()),
             });
         let branch = branch.to_string();
-        let (allocation, changes) = tokio::task::spawn_blocking(move || {
+        let (mut allocation, changes) = tokio::task::spawn_blocking(move || {
             let cfg = crate::config::slots_config(&common)?;
             let opts = crate::worktree::slots::AllocOptions {
                 pool_size: cfg.pool_size,
-                fetch: !offline,
                 base,
             };
             let hooks = if no_hooks {
@@ -812,6 +797,7 @@ impl Daemon {
         })
         .await
         .context("slot alloc task")??;
+        allocation.warnings.extend(warning);
         tracing::info!(
             worktree = %allocation.name,
             branch = %allocation.branch,
@@ -836,31 +822,43 @@ impl Daemon {
         no_hooks: bool,
         pr: Option<crate::worktree::slots::PrFacts>,
     ) -> Result<crate::worktree::slots::Release> {
-        let _repo = self.repo_ops.lock().await;
-        let (agents, prs) = {
-            let s = self.state.read().await;
-            (s.agents.clone(), s.pr_state_for_verdicts().cloned())
+        let expected = crate::worktree::slots::prepare_release(
+            &self.common_dir,
+            target.as_deref(),
+            &cwd,
+            offline,
+        )
+        .await?;
+        let pr = if pr.is_some() {
+            pr
+        } else {
+            let state = self.state.read().await;
+            state
+                .pr_state_for_verdicts()
+                .and_then(|prs| prs.get(&expected.branch))
+                .map(|summary| crate::worktree::slots::PrFacts {
+                    branch: expected.branch.clone(),
+                    state: summary.state.clone(),
+                    head_oid: summary.head_oid.as_ref().and_then(|oid| oid.parse().ok()),
+                })
         };
+        let pr = match pr {
+            None if !offline => {
+                let wt = expected.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::slot_service::lookup_branch_pr(&wt.path, &wt.branch)
+                })
+                .await?
+            }
+            pr => pr,
+        };
+        let _repo = self.repo_ops.lock().await;
+        let agents = self.state.read().await.agents.clone();
         let common = self.common_dir.clone();
         let (release, changes) = tokio::task::spawn_blocking(move || {
-            let pr = pr.or_else(|| {
-                let wt = crate::worktree::slots::resolve_target(&common, target.as_deref(), &cwd)
-                    .ok()?;
-                let branch = crate::worktree::slots::checked_out_branch(&wt.path)?;
-                let summary = prs?.remove(&branch)?;
-                Some(crate::worktree::slots::PrFacts {
-                    branch,
-                    state: summary.state,
-                    head_oid: summary.head_oid.and_then(|o| o.parse().ok()),
-                })
-            });
-            let pr = match pr {
-                None if !offline => crate::slot_service::pr_facts(&common, target.as_deref(), &cwd),
-                pr => pr,
-            };
             let opts = crate::worktree::slots::ReleaseOptions {
                 force,
-                fetch: !offline,
+                expected: Some(expected),
                 pr,
             };
             let cfg = crate::config::slots_config(&common)?;
@@ -1211,6 +1209,66 @@ mod tests {
             external_attention: std::sync::Mutex::new(None),
             badge_wake: Arc::new(Notify::new()),
         })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stalled_allocation_fetch_leaves_repo_and_slot_locks_available() {
+        use crate::worktree::test_support::{run, setup};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::util::test_env_lock();
+        let (root, common) = setup();
+        let daemon = build_daemon(&common).await;
+        let helper = root.join("wait-for-fetch");
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
+touch "$1/fetch-started"
+while test ! -f "$1/fetch-continue"; do sleep 0.05; done
+exec git-upload-pack "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(
+            &common,
+            &["remote", "add", "origin", common.to_str().unwrap()],
+        );
+        run(
+            &common,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                helper.to_str().unwrap(),
+            ],
+        );
+        let worker = daemon.clone();
+        let allocation =
+            tokio::spawn(async move { worker.slot_alloc("fetch-test", None, false, true).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !common.join("fetch-started").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fetch reached the local transport");
+        let repo_available = daemon.repo_ops.try_lock().is_ok();
+        let slot_wait = common.clone();
+        let slot_available = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || crate::worktree::slots::lock(&slot_wait).map(drop)),
+        )
+        .await;
+        std::fs::write(common.join("fetch-continue"), "").unwrap();
+        let result = allocation.await.unwrap();
+        assert!(repo_available);
+        slot_available
+            .expect("slot lock available during fetch")
+            .unwrap()
+            .unwrap();
+        // The fetch passes through a real upload-pack after the barrier.
+        assert!(result.unwrap().warnings.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A TUI create (through the daemon) and a CLI alloc (in-process) race for
@@ -1819,7 +1877,7 @@ mod tests {
                 reviews_partial: false,
             },
         );
-        daemon.state.write().await.update_prs(prs);
+        daemon.state.write().await.update_prs(prs, vec![]);
         daemon.check_worktree_removal("feature").await.unwrap();
 
         daemon

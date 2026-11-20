@@ -13,12 +13,15 @@ mod types;
 pub use types::CheckMeta;
 pub use types::{CheckState, PrSummary, ReviewDecision};
 
-pub fn list_prs_for_branches(
-    repo_root: &Path,
-    branches: &[String],
-) -> Result<HashMap<String, PrSummary>> {
+#[derive(Default)]
+pub struct PrFetch {
+    pub prs: HashMap<String, PrSummary>,
+    pub failed: Vec<String>,
+}
+
+pub fn list_prs_for_branches(repo_root: &Path, branches: &[String]) -> Result<PrFetch> {
     if branches.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(PrFetch::default());
     }
 
     // Deduplicate branches before building queries (safe here; daemon/mod.rs
@@ -32,7 +35,10 @@ pub fn list_prs_for_branches(
     let branches = &deduped;
 
     match graphql::list_prs_for_branches(repo_root, branches) {
-        Ok(map) => Ok(map),
+        Ok(prs) => Ok(PrFetch {
+            prs,
+            failed: Vec::new(),
+        }),
         Err(e) if is_preflight_error(&e) => Err(e),
         Err(e) => {
             debug!("github:graphql batch failed, falling back to per-branch GraphQL: {e}");

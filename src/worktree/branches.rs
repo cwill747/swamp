@@ -174,20 +174,19 @@ pub fn find_default_worktree<'a>(worktrees: &'a [Worktree], dir: &Path) -> Optio
         .or_else(|| worktrees.first())
 }
 
-/// Path of the worktree that has the default branch checked out, if any. Unlike
-/// [`find_default_worktree`] this never falls back to an unrelated worktree - it
-/// returns `None` when the default branch isn't checked out anywhere, so callers
-/// (e.g. the "update" action) don't fast-forward the wrong tree.
-pub fn default_worktree_path(common_dir: &Path) -> Option<PathBuf> {
-    let default = default_branch(common_dir);
-    if default.is_empty() {
-        return None;
-    }
-    list_worktrees(common_dir)
-        .ok()?
+/// Checked-out default worktree and its configured remote's tracking ref.
+pub fn default_update_target(common_dir: &Path) -> Result<Option<(PathBuf, String)>> {
+    let repo = open_lenient(common_dir)?;
+    let Some(remote) = default_remote(&repo) else {
+        return Ok(None);
+    };
+    let Some(branch) = default_branch_name_for_remote(&repo, &remote) else {
+        return Ok(None);
+    };
+    Ok(list_worktrees(common_dir)?
         .into_iter()
-        .find(|w| w.branch == default)
-        .map(|w| w.path)
+        .find(|w| w.branch == branch)
+        .map(|w| (w.path, format!("refs/remotes/{remote}/{branch}"))))
 }
 
 /// List local + remote-tracking branches for the create picker.
@@ -269,6 +268,32 @@ mod tests {
     use super::*;
     use crate::worktree::create_worktree;
     use crate::worktree::test_support::{git_available, run, setup};
+
+    #[test]
+    fn default_update_uses_selected_remote_with_or_without_origin() {
+        let (root, bare) = crate::worktree::test_support::setup();
+        let run = crate::worktree::test_support::run;
+        let wt = crate::worktree::create_worktree(&bare, "main").unwrap();
+        run(
+            &bare,
+            &["remote", "add", "upstream", bare.to_str().unwrap()],
+        );
+        run(&bare, &["update-ref", "refs/remotes/upstream/main", "main"]);
+        run(
+            &bare,
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/main",
+            ],
+        );
+        let expected = Some((wt.path, String::from("refs/remotes/upstream/main")));
+        assert_eq!(default_update_target(&bare).unwrap(), expected);
+        run(&bare, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&bare, &["config", "checkout.defaultRemote", "upstream"]);
+        assert_eq!(default_update_target(&bare).unwrap(), expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn create_lists_and_removes_worktree() {

@@ -159,7 +159,6 @@ fn new_branch_on_a_custom_base_is_retained_when_the_base_merges() {
         &slots::AllocOptions {
             pool_size: 5,
             base: Some("feature".into()),
-            ..Default::default()
         },
         &[],
     )

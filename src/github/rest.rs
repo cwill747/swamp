@@ -1,3 +1,4 @@
+use super::PrFetch;
 /// Per-branch GraphQL fallback.
 ///
 /// When the batch GraphQL query fails (e.g. network glitch, field-level
@@ -14,37 +15,31 @@
 /// - Individual branch failures are logged at `warn` and skipped so the
 ///   returned map is as complete as possible.
 use super::graphql;
-use super::types::PrSummary;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
 
-pub(super) fn list_prs_for_branches(
-    repo_root: &Path,
-    branches: &[String],
-) -> Result<HashMap<String, PrSummary>> {
-    let mut map: HashMap<String, PrSummary> = HashMap::new();
-    let mut error_count = 0usize;
+pub(super) fn list_prs_for_branches(repo_root: &Path, branches: &[String]) -> Result<PrFetch> {
+    let mut fetch = PrFetch::default();
 
     for branch in branches {
         match graphql::list_prs_for_branches(repo_root, std::slice::from_ref(branch)) {
-            Ok(partial) => map.extend(partial),
+            Ok(partial) => fetch.prs.extend(partial),
             Err(e) => {
                 warn!("github:rest per-branch fallback failed for {branch:?}: {e}");
-                error_count += 1;
+                fetch.failed.push(branch.clone());
             }
         }
     }
 
-    if error_count == branches.len() && !branches.is_empty() {
+    if fetch.failed.len() == branches.len() && !branches.is_empty() {
         return Err(anyhow!(
             "all {} per-branch fallback queries failed",
             branches.len()
         ));
     }
 
-    Ok(map)
+    Ok(fetch)
 }
 
 #[cfg(test)]
