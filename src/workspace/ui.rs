@@ -675,6 +675,14 @@ impl App {
         self.query.clear();
         self.filter = Filter::All;
         self.collapsed.remove(&keys[i].repo);
+        if let Some(host) = self
+            .repositories
+            .iter()
+            .find(|repo| repo.id == keys[i].repo)
+            .and_then(|repo| repo.host.as_ref())
+        {
+            self.collapsed.remove(&format!("ssh:{host}"));
+        }
         self.selected = Some((keys[i].repo.clone(), Some(keys[i].clone())));
         self.reconcile();
         true
@@ -1389,6 +1397,63 @@ pub(crate) mod tests {
         assert_eq!(keys[1].branch, "parser");
         app.repositories.clear();
         assert_eq!(app.key(key(']')), Action::None);
+    }
+    #[test]
+    fn attention_reveals_remote_worktree_and_preserves_selection() {
+        for direction in ['[', ']'] {
+            for section in [Section::Spaces, Section::Agents] {
+                for collapse_repo in [false, true] {
+                    let mut app = fixture();
+                    let host = Host {
+                        id: "dev".into(),
+                        config: crate::config::SshHostConfig {
+                            target: "user@dev".into(),
+                            swamp_path: None,
+                        },
+                        status: HostStatus::Connected,
+                    };
+                    let host_key = host.key();
+                    app.hosts.push(host);
+                    let remote = &mut app.repositories[1];
+                    remote.id = "ssh:dev:papr".into();
+                    remote.host = Some("dev".into());
+                    let target = remote.destinations()[0].key.clone();
+                    app.collapsed.insert(host_key.clone());
+                    if collapse_repo {
+                        app.collapsed.insert(target.repo.clone());
+                    }
+                    // The other attention target is local. Both directions must
+                    // move from it to the waiting remote worktree.
+                    let local = app.repositories[0]
+                        .destinations()
+                        .into_iter()
+                        .find(|d| d.key.branch == "parser")
+                        .unwrap()
+                        .key;
+                    app.section = section;
+                    app.selected = Some((local.repo.clone(), Some(local.clone())));
+                    app.reconcile();
+                    assert_eq!(app.selected_entry().unwrap().key, Some(local));
+                    app.collapsed.insert("ssh:unrelated".into());
+
+                    assert_eq!(app.key(key(direction)), Action::Activate);
+                    assert_eq!(app.section, Section::Spaces);
+                    assert!(!app.collapsed.contains(&host_key));
+                    assert!(!app.collapsed.contains(&target.repo));
+                    assert!(app.collapsed.contains("ssh:unrelated"));
+                    assert_eq!(app.selected_entry().unwrap().key, Some(target.clone()));
+                    assert_eq!(app.shared().destination, Some(target.clone()));
+                    assert_eq!(
+                        app.entries(Section::Spaces)[app.index].key,
+                        Some(target.clone())
+                    );
+
+                    app.repositories.reverse();
+                    app.reconcile();
+                    assert_eq!(app.selected_entry().unwrap().key, Some(target));
+                }
+            }
+        }
     }
     #[test]
     fn clipping_respects_columns_and_strips_terminal_sequences() {
