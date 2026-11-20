@@ -141,7 +141,7 @@ pub fn check_worktree_removal(
         let worktree_repo = Repository::open(&wt_path)?;
         if worktree_repo.head_detached()? {
             let tip = worktree_repo.head()?.peel_to_commit()?.id();
-            if !reachable_from_other_branch(&repo, "", tip, None) {
+            if !detached_head_is_saved(&repo, tip)? {
                 return Err(RemoveRefused {
                     name: name.to_owned(),
                     reason: RemoveRefusedReason::UnmergedCommits,
@@ -265,6 +265,22 @@ fn is_merged(repo: &Repository, branch_name: &str, tip: Oid, ctx: &VerdictContex
     reachable_from_other_branch(repo, branch_name, tip, other_default)
 }
 
+/// Detached HEAD has no branch reflog to fall back on after pruning.
+fn detached_head_is_saved(repo: &Repository, tip: Oid) -> Result<bool> {
+    if reachable_from_other_branch(repo, "", tip, None) {
+        return Ok(true);
+    }
+    for tag in repo.references_glob("refs/tags/*")? {
+        // Tags can also point to trees or blobs.
+        if let Ok(commit) = tag?.peel_to_commit()
+            && (commit.id() == tip || repo.graph_descendant_of(commit.id(), tip)?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// True when `tip` is reachable from the repository default branch's tip.
 fn reachable_from_default(repo: &Repository, tip: Oid, default_tip: Option<Oid>) -> bool {
     default_tip.is_some_and(|default_tip| {
@@ -332,6 +348,9 @@ mod tests {
             RemoveRefusedReason::UnmergedCommits
         );
         run(&wt.path, &["branch", "saved"]);
+        check_worktree_removal(&bare, "feature", None, None).unwrap();
+        run(&wt.path, &["tag", "-a", "checkpoint", "-m", "saved"]);
+        run(&wt.path, &["branch", "-D", "saved"]);
         check_worktree_removal(&bare, "feature", None, None).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

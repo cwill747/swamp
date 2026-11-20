@@ -845,18 +845,8 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
     serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// Run the full git scan (list_worktrees + per-worktree git_info) and return
-/// the computed row map.  This function is CPU/IO-bound and is meant to be
-/// called from `tokio::task::spawn_blocking`; it must NOT be called while
-/// holding any async lock.
-///
-/// `agents` is a snapshot cloned out from `DaemonState::agents` under a read
-/// lock *before* this call; the caller swaps the result in under the write lock
-/// with [`DaemonState::apply_scanned_rows`]. `prs` is the PR map to trust for
-/// the merged-branch removal signal — pass `None` while a PR fetch is loading
-/// or has most recently failed, since a stale-but-cached map shouldn't unlock
-/// a squash-merge deletion during an outage (see
-/// [`DaemonState::pr_state_for_verdicts`]).
+/// Collect Git state on blocking workers. The caller joins current agent
+/// records under the state write lock in [`DaemonState::apply_scanned_rows`].
 pub fn scan_worktrees(
     common_dir: &Path,
     default_branch: &str,
@@ -867,12 +857,7 @@ pub fn scan_worktrees(
     }
     let default_tip = worktree::default_branch_tip(common_dir);
 
-    // Gather per-worktree git status concurrently. Each `git_info` shells out to
-    // `git status` / `git rev-list`, so a sequential loop made first-launch
-    // latency scale with worktree count. We're already on a `spawn_blocking`
-    // thread, so fanning the work across a small pool of scoped OS threads is
-    // safe; `MAX_SCAN_CONCURRENCY` caps the number of simultaneous `git`
-    // subprocesses so a repo with dozens of worktrees can't stampede the box.
+    // Bound concurrent libgit2 status walks on large repositories.
     const MAX_SCAN_CONCURRENCY: usize = 8;
     let workers = MAX_SCAN_CONCURRENCY.min(wts.len());
     let next = AtomicUsize::new(0);

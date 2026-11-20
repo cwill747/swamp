@@ -1211,6 +1211,66 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stalled_allocation_fetch_leaves_repo_and_slot_locks_available() {
+        use crate::worktree::test_support::{run, setup};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::util::test_env_lock();
+        let (root, common) = setup();
+        let daemon = build_daemon(&common).await;
+        let helper = root.join("wait-for-fetch");
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
+touch "$1/fetch-started"
+while test ! -f "$1/fetch-continue"; do sleep 0.05; done
+exec git-upload-pack "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(
+            &common,
+            &["remote", "add", "origin", common.to_str().unwrap()],
+        );
+        run(
+            &common,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                helper.to_str().unwrap(),
+            ],
+        );
+        let worker = daemon.clone();
+        let allocation =
+            tokio::spawn(async move { worker.slot_alloc("fetch-test", None, false, true).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !common.join("fetch-started").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fetch reached the local transport");
+        let repo_available = daemon.repo_ops.try_lock().is_ok();
+        let slot_wait = common.clone();
+        let slot_available = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || crate::worktree::slots::lock(&slot_wait).map(drop)),
+        )
+        .await;
+        std::fs::write(common.join("fetch-continue"), "").unwrap();
+        let result = allocation.await.unwrap();
+        assert!(repo_available);
+        slot_available
+            .expect("slot lock available during fetch")
+            .unwrap()
+            .unwrap();
+        // The fetch passes through a real upload-pack after the barrier.
+        assert!(result.unwrap().warnings.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A TUI create (through the daemon) and a CLI alloc (in-process) race for
     /// the same free slot; the shared slot lock gives them different ones.
     // Holds the env lock across awaits: `slot_alloc` reads the user config,
