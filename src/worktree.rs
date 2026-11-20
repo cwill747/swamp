@@ -30,7 +30,7 @@ pub use model::{
 };
 pub use remove::{check_worktree_removal, remove_worktree};
 pub use repo::{git_common_dir, resolve_git_dir};
-pub use status::git_info;
+pub use status::{dirty_for_removal, git_info};
 
 #[cfg(test)]
 pub(crate) mod test_support {

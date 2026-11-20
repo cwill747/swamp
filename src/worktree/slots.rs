@@ -760,7 +760,9 @@ pub fn release_locked(
         if !opts.force {
             let info: GitInfo =
                 git_info(&wt.path).map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?;
-            if info.is_dirty() {
+            if super::dirty_for_removal(&wt.path, &info)
+                .map_err(|_| refused(ReleaseRefusedReason::StatusUnreadable))?
+            {
                 return Err(refused(ReleaseRefusedReason::Dirty).into());
             }
             if info.rebase || slot_repo.state() != RepositoryState::Clean {

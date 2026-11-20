@@ -82,7 +82,7 @@ fn eligible(
     if agents
         .get(&name)
         .is_some_and(|r| r.status != AgentStatus::Idle)
-        || worktree::git_info(&wt.path)?.is_dirty()
+        || worktree::dirty_for_removal(&wt.path, &worktree::git_info(&wt.path)?)?
     {
         return Ok(None);
     }

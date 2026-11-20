@@ -126,10 +126,30 @@ pub fn check_worktree_removal(
     // clean. This check can't be folded into `removal_verdict` because the
     // error occurs while building the `GitInfo` passed to it.
     let info = if wt_path.exists() {
-        git_info(&wt_path).map_err(|_| RemoveRefused {
+        let unreadable = |_| RemoveRefused {
             name: name.to_string(),
             reason: RemoveRefusedReason::StatusUnreadable,
-        })?
+        };
+        let info = git_info(&wt_path).map_err(unreadable)?;
+        if super::dirty_for_removal(&wt_path, &info).map_err(unreadable)? {
+            return Err(RemoveRefused {
+                name: name.to_owned(),
+                reason: RemoveRefusedReason::Dirty,
+            }
+            .into());
+        }
+        let worktree_repo = Repository::open(&wt_path)?;
+        if worktree_repo.head_detached()? {
+            let tip = worktree_repo.head()?.peel_to_commit()?.id();
+            if !reachable_from_other_branch(&repo, "", tip, None) {
+                return Err(RemoveRefused {
+                    name: name.to_owned(),
+                    reason: RemoveRefusedReason::UnmergedCommits,
+                }
+                .into());
+            }
+        }
+        info
     } else {
         GitInfo::default()
     };
@@ -236,13 +256,13 @@ pub(super) fn branch_safety(repo: &Repository, ctx: &VerdictContext) -> RemovalV
 /// squash merge), and finally the bounded reachability probe against every
 /// other branch.
 fn is_merged(repo: &Repository, branch_name: &str, tip: Oid, ctx: &VerdictContext) -> bool {
-    if reachable_from_default(repo, tip, ctx.default_branch_tip) {
-        return true;
-    }
+    let other_default = ctx
+        .default_branch_tip
+        .filter(|_| branch_name != ctx.default_branch);
     if ctx.pr_state.as_deref() == Some("MERGED") && ctx.pr_head_oid == Some(tip) {
         return true;
     }
-    reachable_from_other_branch(repo, branch_name, tip, ctx.default_branch_tip)
+    reachable_from_other_branch(repo, branch_name, tip, other_default)
 }
 
 /// True when `tip` is reachable from the repository default branch's tip.
@@ -296,6 +316,80 @@ mod tests {
     use crate::worktree::test_support::{git_available, run, setup};
     use crate::worktree::{create_worktree, git_info, list_worktrees};
     use std::process::Command;
+
+    #[test]
+    fn refuses_orphan_detached_commit_until_a_branch_reaches_it() {
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+        run(&wt.path, &["checkout", "--detach"]);
+        run(
+            &wt.path,
+            &["commit", "--allow-empty", "-m", "detached work"],
+        );
+        let err = check_worktree_removal(&bare, "feature", None, None).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RemoveRefused>().unwrap().reason,
+            RemoveRefusedReason::UnmergedCommits
+        );
+        run(&wt.path, &["branch", "saved"]);
+        check_worktree_removal(&bare, "feature", None, None).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_branch_cannot_vouch_for_its_own_unpushed_tip() {
+        let (root, bare) = setup();
+        run(&bare, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&bare, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(
+            &bare,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let wt = create_worktree(&bare, "main").unwrap();
+        run(
+            &wt.path,
+            &["commit", "--allow-empty", "-m", "unpushed main"],
+        );
+        let err = check_worktree_removal(&bare, "main", None, None).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RemoveRefused>().unwrap().reason,
+            RemoveRefusedReason::UnmergedCommits
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_dirty_submodule_even_when_git_config_hides_it() {
+        let (root, bare) = setup();
+        let wt = create_worktree(&bare, "feature").unwrap();
+        run(
+            &wt.path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                bare.to_str().unwrap(),
+                "child",
+            ],
+        );
+        run(&wt.path, &["commit", "-m", "add child"]);
+        run(&wt.path, &["branch", "saved"]);
+        run(&wt.path, &["config", "submodule.child.ignore", "all"]);
+        check_worktree_removal(&bare, "feature", None, None).unwrap();
+        std::fs::write(wt.path.join("child/scratch"), "unfinished").unwrap();
+        let err = remove_worktree(&bare, "feature", true, false, None, None).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RemoveRefused>().unwrap().reason,
+            RemoveRefusedReason::Dirty
+        );
+        assert!(wt.path.join("child/scratch").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn removes_worktree_and_branch() {
