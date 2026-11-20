@@ -43,18 +43,12 @@ fn eligible(
     if branch == default || common_repo.workdir().is_some_and(|p| p == wt.path) {
         return Ok(None);
     }
-    // libgit2 names can differ from the worktree directory name.
-    let mut linked_found = false;
-    for id in common_repo.worktrees()?.iter().flatten().flatten() {
-        let linked = common_repo.find_worktree(id)?;
-        if linked.path() == wt.path {
-            linked_found = true;
-            if !matches!(linked.is_locked()?, WorktreeLockStatus::Unlocked) {
-                return Ok(None);
-            }
-        }
+    // Open this checkout's registry entry directly, including after a rename.
+    if !repo.is_worktree() || repo.commondir() != common_repo.commondir() {
+        return Ok(None);
     }
-    if !linked_found {
+    let linked = git2::Worktree::open_from_repository(&repo)?;
+    if linked.path() != wt.path || !matches!(linked.is_locked()?, WorktreeLockStatus::Unlocked) {
         return Ok(None);
     }
     let merged_pr =
