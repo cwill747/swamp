@@ -312,6 +312,12 @@ fn release_under(
     pre_release: &[HookCommand],
 ) -> Result<(Release, AgentChanges)> {
     let wt = slots::resolve_target(common, target, cwd)?;
+    if let Some(expected) = &opts.expected {
+        anyhow::ensure!(
+            wt.path == expected.path && wt.branch == expected.branch,
+            "release target changed while fetching"
+        );
+    }
     let name = wt.name();
     let record = agents.get(&name);
 
@@ -393,12 +399,16 @@ fn release_under(
 pub fn pr_facts(common: &Path, target: Option<&str>, cwd: &Path) -> Option<PrFacts> {
     let wt = slots::resolve_target(common, target, cwd).ok()?;
     let branch = slots::checked_out_branch(&wt.path)?;
-    let mut prs = crate::github::list_prs_for_branches(&wt.path, std::slice::from_ref(&branch))
+    lookup_branch_pr(&wt.path, &branch)
+}
+
+pub fn lookup_branch_pr(path: &Path, branch: &str) -> Option<PrFacts> {
+    let mut fetch = crate::github::list_prs_for_branches(path, &[branch.to_owned()])
         .map_err(|e| tracing::debug!("PR lookup for {branch} failed: {e:#}"))
         .ok()?;
-    let pr = prs.prs.remove(&branch)?;
+    let pr = fetch.prs.remove(branch)?;
     Some(PrFacts {
-        branch,
+        branch: branch.to_owned(),
         state: pr.state,
         head_oid: pr.head_oid.and_then(|o| o.parse().ok()),
     })

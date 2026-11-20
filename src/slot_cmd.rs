@@ -184,19 +184,19 @@ pub async fn alloc(
             other => Err(reply_error(other)),
         };
     }
+    let warning = slots::prepare_alloc(common, &branch, offline).await?;
     let common = common.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let cfg = config::slots_config(&common)?;
-        let opts = AllocOptions {
-            fetch: !offline,
-            ..AllocOptions::pool(cfg.pool_size)
-        };
+        let opts = AllocOptions::pool(cfg.pool_size);
         let hooks = if no_hooks {
             &[][..]
         } else {
             &cfg.hooks.post_alloc[..]
         };
-        slot_service::alloc_with_status_file(&common, &branch, &opts, hooks)
+        let mut allocation = slot_service::alloc_with_status_file(&common, &branch, &opts, hooks)?;
+        allocation.warnings.extend(warning);
+        Ok(allocation)
     })
     .await?
 }
@@ -236,11 +236,12 @@ pub async fn release(
             other => Err(reply_error(other)),
         };
     }
+    let expected = slots::prepare_release(common, target.as_deref(), &cwd, offline).await?;
     let common = common.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let opts = ReleaseOptions {
             force,
-            fetch: !offline,
+            expected: Some(expected),
             pr,
         };
         let cfg = config::slots_config(&common)?;

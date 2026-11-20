@@ -766,6 +766,8 @@ impl Daemon {
         offline: bool,
         no_hooks: bool,
     ) -> Result<crate::worktree::slots::Allocation> {
+        let warning =
+            crate::worktree::slots::prepare_alloc(&self.common_dir, branch, offline).await?;
         let _repo = self.repo_ops.lock().await;
         let common = self.common_dir.clone();
         let pr = self
@@ -780,11 +782,10 @@ impl Daemon {
                 head_oid: p.head_oid.as_ref().and_then(|oid| oid.parse().ok()),
             });
         let branch = branch.to_string();
-        let (allocation, changes) = tokio::task::spawn_blocking(move || {
+        let (mut allocation, changes) = tokio::task::spawn_blocking(move || {
             let cfg = crate::config::slots_config(&common)?;
             let opts = crate::worktree::slots::AllocOptions {
                 pool_size: cfg.pool_size,
-                fetch: !offline,
                 base,
             };
             let hooks = if no_hooks {
@@ -796,6 +797,7 @@ impl Daemon {
         })
         .await
         .context("slot alloc task")??;
+        allocation.warnings.extend(warning);
         tracing::info!(
             worktree = %allocation.name,
             branch = %allocation.branch,
@@ -820,31 +822,43 @@ impl Daemon {
         no_hooks: bool,
         pr: Option<crate::worktree::slots::PrFacts>,
     ) -> Result<crate::worktree::slots::Release> {
-        let _repo = self.repo_ops.lock().await;
-        let (agents, prs) = {
-            let s = self.state.read().await;
-            (s.agents.clone(), s.pr_state_for_verdicts().cloned())
+        let expected = crate::worktree::slots::prepare_release(
+            &self.common_dir,
+            target.as_deref(),
+            &cwd,
+            offline,
+        )
+        .await?;
+        let pr = if pr.is_some() {
+            pr
+        } else {
+            let state = self.state.read().await;
+            state
+                .pr_state_for_verdicts()
+                .and_then(|prs| prs.get(&expected.branch))
+                .map(|summary| crate::worktree::slots::PrFacts {
+                    branch: expected.branch.clone(),
+                    state: summary.state.clone(),
+                    head_oid: summary.head_oid.as_ref().and_then(|oid| oid.parse().ok()),
+                })
         };
+        let pr = match pr {
+            None if !offline => {
+                let wt = expected.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::slot_service::lookup_branch_pr(&wt.path, &wt.branch)
+                })
+                .await?
+            }
+            pr => pr,
+        };
+        let _repo = self.repo_ops.lock().await;
+        let agents = self.state.read().await.agents.clone();
         let common = self.common_dir.clone();
         let (release, changes) = tokio::task::spawn_blocking(move || {
-            let pr = pr.or_else(|| {
-                let wt = crate::worktree::slots::resolve_target(&common, target.as_deref(), &cwd)
-                    .ok()?;
-                let branch = crate::worktree::slots::checked_out_branch(&wt.path)?;
-                let summary = prs?.remove(&branch)?;
-                Some(crate::worktree::slots::PrFacts {
-                    branch,
-                    state: summary.state,
-                    head_oid: summary.head_oid.and_then(|o| o.parse().ok()),
-                })
-            });
-            let pr = match pr {
-                None if !offline => crate::slot_service::pr_facts(&common, target.as_deref(), &cwd),
-                pr => pr,
-            };
             let opts = crate::worktree::slots::ReleaseOptions {
                 force,
-                fetch: !offline,
+                expected: Some(expected),
                 pr,
             };
             let cfg = crate::config::slots_config(&common)?;

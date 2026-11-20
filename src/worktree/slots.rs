@@ -27,7 +27,8 @@ use git2::{BranchType, Oid, Repository, RepositoryState};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::time::Duration;
 
 const SLOT_PREFIX: &str = "work";
 
@@ -246,8 +247,6 @@ pub fn list_pool(common: &Path, pool_size: u32) -> Result<Vec<PoolEntry>> {
 #[derive(Debug, Clone, Default)]
 pub struct AllocOptions {
     pub pool_size: u32,
-    /// Fetch the default remote before allocating (best effort).
-    pub fetch: bool,
     /// Create the branch from this base (a branch, `origin/<base>`, tag, or
     /// SHA) instead of the default branch. The branch must not exist yet.
     pub base: Option<String>,
@@ -296,16 +295,9 @@ pub fn alloc_locked(
     opts: &AllocOptions,
 ) -> Result<Allocation> {
     let branch = sanitize_branch_name(requested)?;
-    let mut warnings = Vec::new();
 
     let repo =
         Repository::open(common).with_context(|| format!("open repo at {}", common.display()))?;
-    if opts.fetch
-        && let Some(remote) = default_remote(&repo)
-        && let Err(e) = git_subprocess(common, &["fetch", "--quiet", &remote])
-    {
-        warnings.push(format!("fetch {remote} failed ({e:#}); using cached refs"));
-    }
     let default = default_branch_name(&repo).unwrap_or_default();
     let worktrees = list_worktrees(common)?;
 
@@ -321,7 +313,7 @@ pub fn alloc_locked(
             branch,
             existing: true,
             created_branch: false,
-            warnings,
+            warnings: Vec::new(),
             hooks: Vec::new(),
         });
     }
@@ -338,7 +330,7 @@ pub fn alloc_locked(
             branch,
             existing: false,
             created_branch,
-            warnings,
+            warnings: Vec::new(),
             hooks: Vec::new(),
         }),
         Err(e) => {
@@ -528,8 +520,8 @@ mod oid_opt {
 #[derive(Debug, Clone, Default)]
 pub struct ReleaseOptions {
     pub force: bool,
-    /// Fetch the branch from the default remote first (best effort).
-    pub fetch: bool,
+    /// Revalidate the checkout inspected before acquiring the mutation locks.
+    pub expected: Option<Worktree>,
     pub pr: Option<PrFacts>,
 }
 
@@ -727,14 +719,6 @@ pub fn release_locked(
     };
 
     let remote = default_remote(&common_repo);
-    if opts.fetch
-        && let Some(remote) = &remote
-    {
-        let spec = format!("refs/heads/{branch_name}:refs/remotes/{remote}/{branch_name}");
-        // Missing on the remote is normal for a never-pushed branch.
-        let _ = git_subprocess(common, &["fetch", "--quiet", remote, &spec]);
-    }
-
     let check = |original_tip: Option<Oid>| -> Result<(Oid, bool)> {
         // Open afresh so hooks cannot leave us using cached HEAD/index state.
         let slot_repo = Repository::open(&wt.path)
@@ -852,27 +836,79 @@ fn find_slot(common: &Path, slot: &str) -> Result<Worktree> {
         .with_context(|| format!("slot {slot} does not exist"))
 }
 
-/// Run `git --git-dir <common> <args>` with stdout sent to stderr. Stdout is
-/// reserved for the path that alloc prints.
-fn git_subprocess(common: &Path, args: &[&str]) -> Result<()> {
-    let out = Command::new("git")
+/// Fetch before taking either mutation lock. Allocation and release reopen
+/// the repository and inspect the updated refs once they acquire the lock.
+async fn fetch(common: &Path, branch: Option<&str>) -> Result<()> {
+    let Some(remote) = default_remote(&Repository::open(common)?) else {
+        return Ok(());
+    };
+    let mut command = tokio::process::Command::new("git");
+    command
         .arg("--git-dir")
         .arg(common)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(std::io::stderr())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
-    if !out.status.success() {
-        bail!(
-            "git {} exited {}: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        .args(["fetch", "--quiet", "--", &remote]);
+    if let Some(branch) = branch {
+        command.arg(format!(
+            "refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+        ));
     }
-    Ok(())
+    wait_for_fetch(command, Duration::from_secs(60))
+        .await
+        .with_context(|| format!("fetch {remote}"))
+}
+
+async fn wait_for_fetch(mut command: tokio::process::Command, deadline: Duration) -> Result<()> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()?;
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(result) => {
+            let status = result?;
+            anyhow::ensure!(status.success(), "git fetch exited {status}");
+            Ok(())
+        }
+        Err(_) => {
+            if let Some(pid) = child.id() {
+                // The unreaped child leads its own group, including SSH helpers.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            let _ = child.wait().await;
+            bail!("git fetch timed out after {}s", deadline.as_secs());
+        }
+    }
+}
+
+pub async fn prepare_alloc(common: &Path, branch: &str, offline: bool) -> Result<Option<String>> {
+    sanitize_branch_name(branch)?;
+    if offline {
+        return Ok(None);
+    }
+    Ok(fetch(common, None)
+        .await
+        .err()
+        .map(|e| format!("{e:#}; using cached refs")))
+}
+
+pub async fn prepare_release(
+    common: &Path,
+    target: Option<&str>,
+    cwd: &Path,
+    offline: bool,
+) -> Result<Worktree> {
+    let wt = resolve_target(common, target, cwd)?;
+    if !offline
+        && slot_number(&wt.name()).is_some()
+        && let Some(branch) = checked_out_branch(&wt.path)
+    {
+        // A never-pushed branch is expected to have no remote ref.
+        if let Err(error) = fetch(common, Some(&branch)).await {
+            tracing::debug!(%error, "using cached refs for slot release");
+        }
+    }
+    Ok(wt)
 }
 
 #[cfg(test)]
@@ -880,6 +916,23 @@ mod tests {
     use super::*;
     use crate::worktree::clone_repo;
     use crate::worktree::test_support::{git_available, run, setup};
+
+    #[tokio::test]
+    async fn fetch_timeout_stops_the_transport_helper() {
+        let dir = temp_dir("fetch-timeout");
+        let marker = dir.join("survived");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .current_dir(&dir)
+            .args(["-c", "(sleep 0.4; touch survived) & wait"]);
+        let error = wait_for_fetch(command, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn opts() -> AllocOptions {
         AllocOptions::pool(5)
