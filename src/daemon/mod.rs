@@ -719,16 +719,11 @@ impl Daemon {
         // configured, which would make `@{u}` fail with "no upstream
         // configured".
         let common = self.common_dir.clone();
-        let (wt, branch) = tokio::task::spawn_blocking(move || {
-            (
-                crate::worktree::default_worktree_path(&common),
-                crate::worktree::default_branch(&common),
-            )
-        })
-        .await
-        .context("locate default worktree")?;
-        if let Some(path) = wt {
-            let remote_ref = format!("origin/{branch}");
+        let target =
+            tokio::task::spawn_blocking(move || crate::worktree::default_update_target(&common))
+                .await
+                .context("locate default worktree")??;
+        if let Some((path, remote_ref)) = target {
             let merge_child = tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&path)
@@ -750,9 +745,9 @@ impl Daemon {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            tracing::info!(worktree = %wt_name, branch = %branch, "fast-forwarded default branch");
+            tracing::info!(worktree = %wt_name, refname = %remote_ref, "fast-forwarded default branch");
         } else {
-            tracing::debug!(branch = %branch, "default branch not checked out; nothing to fast-forward");
+            tracing::debug!("default branch not checked out; nothing to fast-forward");
         }
 
         self.refresh_all_unlocked().await
