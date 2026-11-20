@@ -353,6 +353,17 @@ impl Default for DaemonState {
     }
 }
 
+impl WorktreeRow {
+    fn apply_agent(&mut self, rec: &AgentRecord) {
+        self.agent = rec.status;
+        self.agent_ts = rec.ts;
+        self.activity_id.clone_from(&rec.activity_id);
+        self.completion_id.clone_from(&rec.completion_id);
+        self.session_name.clone_from(&rec.session_name);
+        self.harness = rec.harness;
+    }
+}
+
 impl DaemonState {
     /// An idle parent may still own a running subagent. Treat that worktree
     /// as active for automatic cleanup, including while hooks are running.
@@ -426,6 +437,11 @@ impl DaemonState {
             self.drop_subagents(name);
         }
         self.rows = new_rows;
+        for (name, row) in &mut self.rows {
+            if let Some(agent) = self.agents.get(name) {
+                row.apply_agent(agent);
+            }
+        }
     }
 
     /// Record an agent status ping. Returns `true` when the record changed in
@@ -459,14 +475,10 @@ impl DaemonState {
     }
 
     fn store_agent_record(&mut self, wt_name: &str, rec: AgentRecord) {
-        self.agents.insert(wt_name.to_string(), rec.clone());
         if let Some(row) = self.rows.get_mut(wt_name) {
-            row.agent = rec.status;
-            row.agent_ts = rec.ts;
-            row.activity_id = rec.activity_id.clone();
-            row.completion_id = rec.completion_id.clone();
-            row.session_name = rec.session_name;
+            row.apply_agent(&rec);
         }
+        self.agents.insert(wt_name.to_owned(), rec);
     }
 
     /// Record a hook that may carry a subagent event. Returns `true` when subscribers can observe the change, with the
@@ -813,7 +825,6 @@ async fn load_agents(common_dir: &Path) -> HashMap<String, AgentRecord> {
 /// [`DaemonState::pr_state_for_verdicts`]).
 pub fn scan_worktrees(
     common_dir: &Path,
-    agents: &HashMap<String, AgentRecord>,
     default_branch: &str,
 ) -> Result<HashMap<String, WorktreeRow>> {
     let wts = worktree::list_worktrees(common_dir)?;
@@ -851,11 +862,10 @@ pub fn scan_worktrees(
                         }
                     };
                     let name = wt.name();
-                    let agent = agents.get(&name).cloned().unwrap_or_default();
                     let pin =
                         slots::slot_number(&name).and_then(|_| slots::read_pin(common_dir, &name));
                     let openspec = titles::openspec_change(common_dir, &wt.path, default_tip);
-                    let row = build_row(wt, &info, &agent, default_branch, pin, openspec);
+                    let row = build_row(wt, &info, default_branch, pin, openspec);
                     tracing::trace!(
                         worktree = %name,
                         branch = %row.branch,
@@ -876,7 +886,6 @@ pub fn scan_worktrees(
 fn build_row(
     wt: &Worktree,
     info: &GitInfo,
-    agent: &AgentRecord,
     default_branch: &str,
     pin: Option<String>,
     openspec_change: Option<String>,
@@ -909,13 +918,13 @@ fn build_row(
         untracked: info.untracked,
         conflict: info.conflict,
         rebase: info.rebase,
-        agent: agent.status,
-        agent_ts: agent.ts,
-        activity_id: agent.activity_id.clone(),
-        completion_id: agent.completion_id.clone(),
-        session_name: agent.session_name.clone(),
+        agent: AgentStatus::Idle,
+        agent_ts: 0,
+        activity_id: None,
+        completion_id: None,
+        session_name: None,
         head_ts: info.head_ts,
-        harness: agent.harness,
+        harness: None,
         is_default,
         removal_block: None,
         // Projected from `DaemonState::deleting` by `snapshot()`, not known
@@ -1026,20 +1035,11 @@ mod tests {
     /// leaves every other row unflagged.
     #[test]
     fn build_row_flags_default_branch() {
-        let agent = AgentRecord::default();
-
         let info_main = GitInfo {
             branch: "main".into(),
             ..Default::default()
         };
-        let main = build_row(
-            &worktree("main", "main"),
-            &info_main,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let main = build_row(&worktree("main", "main"), &info_main, "main", None, None);
         assert!(main.is_default, "the default branch row must be flagged");
 
         let info_feat = GitInfo {
@@ -1049,7 +1049,6 @@ mod tests {
         let feat = build_row(
             &worktree("feature-x", "feature/x"),
             &info_feat,
-            &agent,
             "main",
             None,
             None,
@@ -1061,12 +1060,11 @@ mod tests {
     /// even a worktree literally named/branched `main`.
     #[test]
     fn build_row_no_default_when_undetectable() {
-        let agent = AgentRecord::default();
         let info = GitInfo {
             branch: "main".into(),
             ..Default::default()
         };
-        let row = build_row(&worktree("main", "main"), &info, &agent, "", None, None);
+        let row = build_row(&worktree("main", "main"), &info, "", None, None);
         assert!(
             !row.is_default,
             "no row may be flagged when the default branch is unknown"
@@ -1105,7 +1103,7 @@ mod tests {
         let dirty = create_worktree(&bare, "feature").unwrap();
         std::fs::write(dirty.path.join("scratch.txt"), "wip").unwrap();
 
-        let rows = scan_worktrees(&bare, &HashMap::new(), "").unwrap();
+        let rows = scan_worktrees(&bare, "").unwrap();
 
         assert_eq!(
             rows.get("feature").unwrap().removal_block,
@@ -1201,7 +1199,6 @@ mod tests {
     /// Slot rows carry their kind and state; a pin turns a free slot pinned.
     #[test]
     fn build_row_reports_slot_state() {
-        let agent = AgentRecord::default();
         let detached = GitInfo {
             branch: "(detached)".into(),
             ..Default::default()
@@ -1209,7 +1206,6 @@ mod tests {
         let free = build_row(
             &worktree("work2", "detached@abc1234"),
             &detached,
-            &agent,
             "main",
             None,
             None,
@@ -1220,7 +1216,6 @@ mod tests {
         let pinned = build_row(
             &worktree("work3", "detached@abc1234"),
             &detached,
-            &agent,
             "main",
             Some("review #172".into()),
             None,
@@ -1232,24 +1227,10 @@ mod tests {
             branch: "fix-ci".into(),
             ..Default::default()
         };
-        let busy = build_row(
-            &worktree("work1", "fix-ci"),
-            &on_branch,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let busy = build_row(&worktree("work1", "fix-ci"), &on_branch, "main", None, None);
         assert_eq!(busy.slot_state, Some(SlotState::Busy));
 
-        let overflow = build_row(
-            &worktree("spike", "spike"),
-            &on_branch,
-            &agent,
-            "main",
-            None,
-            None,
-        );
+        let overflow = build_row(&worktree("spike", "spike"), &on_branch, "main", None, None);
         assert_eq!(overflow.kind, WorktreeKind::Overflow);
         assert_eq!(overflow.slot_state, None);
     }
@@ -2055,6 +2036,18 @@ mod tests {
         state.remove_row("main");
         state.rows.insert("main".into(), make_row("main"));
         assert!(subs(&state).is_empty());
+    }
+
+    #[test]
+    fn publishing_scan_keeps_completion_received_during_scan() {
+        let mut state = state_with_main();
+        let scanned = HashMap::from([("main".into(), make_row("main"))]);
+        state.apply_codex_completion("main", "turn-17");
+        state.set_harness("main", Harness::Codex);
+        state.apply_scanned_rows(scanned);
+        let row = &state.rows["main"];
+        assert_eq!(row.completion_id.as_deref(), Some("codex:turn-17"));
+        assert_eq!(row.harness, Some(Harness::Codex));
     }
 
     #[test]

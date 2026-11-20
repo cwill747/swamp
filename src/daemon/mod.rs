@@ -613,23 +613,12 @@ impl Daemon {
             Ok(changes) => self.apply_agent_changes(&changes).await?,
             Err(e) => tracing::warn!("autoclean skipped: {e:#}"),
         }
-        // Clone out the agents map and default branch under a read lock so the git
-        // scan (which can take seconds on large repos) runs completely off the
-        // runtime via spawn_blocking, without blocking any async task or
-        // holding any lock.
-        let (agents, default_branch) = {
-            let s = self.state.read().await;
-            (s.agents.clone(), s.default_branch.clone())
-        };
-
-        // `scan_worktrees` fans the per-worktree git status out across a bounded
-        // pool of scoped threads internally, so a single `spawn_blocking` keeps
-        // the whole concurrent scan off the async runtime. No async lock is held
-        // across this await — `agents` was cloned out above under a read
-        // lock.
+        // Agent hooks may arrive during the scan. Join their live state when
+        // publishing the rows under the write lock.
+        let default_branch = self.state.read().await.default_branch.clone();
         let common = self.common_dir.clone();
         let (new_rows, titles) = tokio::task::spawn_blocking(move || {
-            let rows = crate::daemon::state::scan_worktrees(&common, &agents, &default_branch)?;
+            let rows = crate::daemon::state::scan_worktrees(&common, &default_branch)?;
             anyhow::Ok((rows, crate::slot_service::user_titles(&common)))
         })
         .await
