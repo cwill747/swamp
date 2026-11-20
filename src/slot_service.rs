@@ -396,7 +396,7 @@ pub fn pr_facts(common: &Path, target: Option<&str>, cwd: &Path) -> Option<PrFac
     let mut prs = crate::github::list_prs_for_branches(&wt.path, std::slice::from_ref(&branch))
         .map_err(|e| tracing::debug!("PR lookup for {branch} failed: {e:#}"))
         .ok()?;
-    let pr = prs.remove(&branch)?;
+    let pr = prs.prs.remove(&branch)?;
     Some(PrFacts {
         branch,
         state: pr.state,

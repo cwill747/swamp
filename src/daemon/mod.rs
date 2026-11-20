@@ -323,7 +323,7 @@ pub async fn serve(dir: Option<PathBuf>, foreground: bool) -> Result<()> {
                                 .collect::<Vec<_>>()
                         };
                         let before = titles(&s.snapshot());
-                        s.update_prs(prs);
+                        s.update_prs(prs.prs, prs.failed);
                         let pr_snap = s.pr_snapshot();
                         // Row titles can come from PR titles, so a PR change
                         // can retitle rows: send the new rows at once rather
@@ -1803,7 +1803,7 @@ mod tests {
                 reviews_partial: false,
             },
         );
-        daemon.state.write().await.update_prs(prs);
+        daemon.state.write().await.update_prs(prs, vec![]);
         daemon.check_worktree_removal("feature").await.unwrap();
 
         daemon

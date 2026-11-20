@@ -6,7 +6,7 @@ use crate::worktree::slots;
 use crate::worktree::{self, GitInfo, RemoveRefusedReason, SlotState, Worktree, WorktreeKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -301,6 +301,8 @@ pub struct DaemonState {
     pub rows: HashMap<String, WorktreeRow>,
     pub agents: HashMap<String, AgentRecord>,
     pub prs: HashMap<String, PrSummary>,
+    // Display-only cache for branches whose individual lookup failed.
+    stale_prs: BTreeMap<String, Option<PrSummary>>,
     /// Unix timestamp of the last successful PR fetch (mirrors `PrSnapshot::fetched_at`).
     pr_fetched_at: Option<u64>,
     /// Last PR fetch error, if any (mirrors `PrSnapshot::error`).
@@ -340,6 +342,7 @@ impl Default for DaemonState {
             rows: HashMap::new(),
             agents: HashMap::new(),
             prs: HashMap::new(),
+            stale_prs: BTreeMap::new(),
             pr_fetched_at: None,
             pr_error: None,
             // No PR fetch has happened yet, so a fresh daemon reports loading.
@@ -708,7 +711,11 @@ impl DaemonState {
                         .then(a.id.cmp(&b.id))
                 });
                 let pr = (!row.is_default)
-                    .then(|| self.prs.get(&row.branch))
+                    .then(|| {
+                        self.prs
+                            .get(&row.branch)
+                            .or_else(|| self.stale_prs.get(&row.branch)?.as_ref())
+                    })
                     .flatten()
                     .map(|p| p.title.as_str());
                 let (title, source) = titles::resolve(TitleInputs {
@@ -742,7 +749,17 @@ impl DaemonState {
     ///
     /// Replaces the PR map, records `fetched_at`, and clears any previous
     /// error.  The daemon's PR poller calls this on the `Ok(Ok(prs))` arm.
-    pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>) {
+    pub fn update_prs(&mut self, prs: HashMap<String, PrSummary>, failed: Vec<String>) {
+        self.stale_prs = failed
+            .into_iter()
+            .map(|branch| {
+                let previous = self
+                    .prs
+                    .remove(&branch)
+                    .or_else(|| self.stale_prs.remove(&branch).flatten());
+                (branch, previous)
+            })
+            .collect();
         self.prs = prs;
         self.pr_fetched_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -769,10 +786,27 @@ impl DaemonState {
     }
 
     pub fn pr_snapshot(&self) -> PrSnapshot {
+        let mut prs = self.prs.clone();
+        prs.extend(
+            self.stale_prs
+                .iter()
+                .filter_map(|(branch, pr)| Some((branch.clone(), pr.clone()?))),
+        );
         PrSnapshot {
-            prs: self.prs.clone(),
+            prs,
             fetched_at: self.pr_fetched_at,
-            error: self.pr_error.clone(),
+            error: self.pr_error.clone().or_else(|| {
+                (!self.stale_prs.is_empty()).then(|| {
+                    format!(
+                        "PR lookup failed for {}",
+                        self.stale_prs
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            }),
             loading: self.pr_loading,
         }
     }
@@ -1597,7 +1631,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(42));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
 
         assert_eq!(state.prs.len(), 1);
         assert!(state.pr_error.is_none());
@@ -1609,6 +1643,34 @@ mod tests {
         assert!(snap.fetched_at.is_some());
     }
 
+    #[test]
+    fn partial_poll_retains_only_failed_branches_for_display() {
+        let mut state = DaemonState::default();
+        state.update_prs(
+            HashMap::from([
+                ("feature".into(), make_pr(1)),
+                ("closed".into(), make_pr(2)),
+            ]),
+            vec![],
+        );
+        for _ in 0..2 {
+            state.update_prs(
+                HashMap::from([("fresh".into(), make_pr(3))]),
+                vec!["feature".into()],
+            );
+            let snapshot = state.pr_snapshot();
+            assert_eq!(snapshot.prs.len(), 2);
+            assert_eq!(snapshot.prs["feature"].number, 1);
+            assert!(snapshot.error.unwrap().contains("feature"));
+            let trusted = state.pr_state_for_verdicts().unwrap();
+            assert!(!trusted.contains_key("feature"));
+            assert!(trusted.contains_key("fresh"));
+        }
+        state.update_prs(HashMap::new(), vec![]);
+        assert!(state.pr_snapshot().prs.is_empty());
+        assert!(state.pr_snapshot().error.is_none());
+    }
+
     /// A PR fetch error keeps the previous map and records the error message.
     #[test]
     fn record_pr_error_preserves_previous_map() {
@@ -1617,7 +1679,7 @@ mod tests {
         // Seed a successful fetch first.
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(7));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(state.pr_fetched_at.is_some());
 
         // Now a transient failure must NOT wipe the map.
@@ -1652,7 +1714,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("main".into(), make_pr(1));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(state.pr_error.is_none());
     }
 
@@ -1675,7 +1737,7 @@ mod tests {
 
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(9));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
 
         assert!(
             !state.pr_snapshot().loading,
@@ -1707,7 +1769,7 @@ mod tests {
         // Seed a prior success so we can confirm the map is preserved on error.
         let mut prs = HashMap::new();
         prs.insert("feat".into(), make_pr(3));
-        state.update_prs(prs);
+        state.update_prs(prs, vec![]);
         assert!(!state.pr_snapshot().loading);
 
         state.record_pr_error("network timeout".into());
